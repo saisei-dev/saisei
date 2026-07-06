@@ -1,0 +1,10 @@
+# Core runtime dependencies (also declared in pyproject.toml).
+# Preferred install is the packaged, editable form, which also gives you the
+# `saisei` command and drops the PYTHONPATH requirement:
+#
+#     pip install -e .          # core
+#     pip install -e ".[dev]"   # + pytest, flake8, pillow (to hack on the pipeline)
+#
+# This plain list is kept for environments that just want the libraries.
+capstone
+networkx

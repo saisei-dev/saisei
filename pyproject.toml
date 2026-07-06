@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "saisei"
+version = "0.1.0"
+description = "A JIT binary recompiler that turns DOS MZ executables into native C and runs them."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Nikita Leonov" }]
+
+# Core runtime dependencies — the minimum needed to build and run a program.
+# The `saisei` command and the JIT both need only these (plus a system `clang`
+# and SDL2, which are not pip-installable and are documented in the README).
+dependencies = [
+    "capstone",
+    "networkx",
+]
+
+[project.optional-dependencies]
+# Everything needed to hack on the pipeline itself: run the test suite, lint,
+# and use the peripheral image tools. Not required to run a program.
+#   pip install -e ".[dev]"
+dev = [
+    "pytest",
+    "flake8",
+    "pillow",   # tools/zoom.py only
+]
+
+[project.scripts]
+# One entry point, subcommands: build / run / play / copy-runtime / new-game.
+saisei = "tools.game:_cli"
+
+# Flat layout: `compiler` and `tools` are the only importable Python packages.
+# `runtime/` (C sources) and `games/` (bundles) are data reached by filesystem
+# path relative to the repo root, so they are deliberately not listed here.
+[tool.setuptools]
+packages = ["compiler", "compiler.patterns", "tools"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

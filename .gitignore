@@ -1,0 +1,16 @@
+.DS_Store
+__pycache__/
+build/
+# Python packaging / editable-install metadata and local virtualenvs.
+*.egg-info/
+.eggs/
+.venv/
+venv/
+images/freedos.img
+autoheal.log
+save_restore.log
+# Runtime crash bundles emitted by the shim layer at run time.
+crashes/
+# Generated call-graph (regenerated per run); curated annotation metadata
+# (aliases/regions/vars/enums.json) IS tracked.
+games/*/callgraph.json
