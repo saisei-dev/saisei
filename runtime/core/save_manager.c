@@ -52,7 +52,7 @@ static const char SAVES_ROOT[] = "saves";
 static const char SR_LOG[] = "save_restore.log";
 
 /* Human-readable activity log. Appended from save_manager (save events,
- * rotations), snapshot.c (restore events), and game.py (binary
+ * rotations), snapshot.c (restore events), and the source (binary
  * start/exit lines). One file at runtime_dir/save_restore.log;
  * readable by `tail -f`. Each line: ISO-timestamp + event + key=value
  * details. */

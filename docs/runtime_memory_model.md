@@ -61,7 +61,7 @@ content), which is real code.
 
 ## Current stop-gap: pattern-matched swap loops
 
-`compiler/ir_to_c.py` (`_try_match_swap_loop_w`) recognises two specific
+ (`_try_match_swap_loop_w`) recognises two specific
 4–5-instruction loop bodies that implement this exact swap and replaces
 each with one `shim_swap_regions_w(es, di, ds, si, cx, DF)` call.
 
@@ -153,10 +153,9 @@ curated address discovery and no heuristics that guess.**
 
 ## Diagnostic infrastructure
 
-See `docs/diagnostics.md` (TBD) for the WATCHW write-watcher,
-`loader_stack` serialization, and lifecycle dispatch enrichment that we
-use to trace memory corruption and runtime dispatch decisions. Short
-version: when a bug looks like "memory at address X silently changed",
-add X to the `write_watches[]` table in `shims.c` and the next crash
-bundle's `lifecycle.log` will identify the writer's cs:ip + register
-state.
+The tools for tracing memory corruption and dispatch decisions live in
+`runtime/core/shims.c`: the WATCHW write-watcher (`write_watches[]`),
+`loader_stack` serialization, and lifecycle dispatch enrichment. Short
+version: when a bug looks like "memory at address X silently changed", add X
+to the `write_watches[]` table in `shims.c` and the next crash bundle's
+`lifecycle.log` will identify the writer's cs:ip + register state.

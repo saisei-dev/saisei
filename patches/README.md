@@ -99,7 +99,7 @@ The runtime loads bundles at startup and registers them into one patch registry
   needs no rebuild of the game or the runtime.
 
 Because bundles ride the same JIT dispatch, run the game binary with the JIT
-environment `tools/game.py` normally sets (`SAISEI_REPO_ROOT`, `SAISEI_PYTHON`,
+environment  normally sets (`SAISEI_REPO_ROOT`, `SAISEI_PYTHON`,
 `SAISEI_JIT_DIR`) so first-reached code still compiles on demand.
 
 ## How it fits the whole

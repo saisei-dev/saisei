@@ -1,6 +1,6 @@
 /* Resident Control Block field layout. Hand-maintained single source of
  * truth for the RCB: compiled into the runtime (shims.c) and parsed by
- * scripts/ir_to_c.py to name RCB accesses in generated code. Edit here. */
+ * scripts/the source to name RCB accesses in generated code. Edit here. */
 #ifndef RCB_FIELDS_H
 #define RCB_FIELDS_H
 

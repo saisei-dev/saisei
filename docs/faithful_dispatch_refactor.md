@@ -63,7 +63,7 @@ void <mod>_dispatch(int pc) {
 }
 ```
 
-**Emission rules (`ir_to_c.py`), same-segment stays in-loop, cross-segment exits:**
+**Emission rules (), same-segment stays in-loop, cross-segment exits:**
 
 | op | faithful emit |
 |---|---|
@@ -91,7 +91,7 @@ on the same flat loop.
 
 Pick a packed/overlay program `<name>` as the regression gate — it exercises
 cross-chunk + ISR transfers heavily. Run after every step:
-`PYTHONPATH=$PWD SAISEI_SCREENSHOT_SECS=3 python3 tools/game.py run <name> --headless` (expect exit 124, no `Unhandled pc`/abort, screenshots).
+`saisei run <name> --headless --screenshot-secs 3` (expect exit 124, no `Unhandled pc`/abort, screenshots).
 
 1. **Scaffold top-level loop + chunk-exit `default:`** alongside the existing
    path (gated), so resolve_chunk + the for-loop exit protocol exist and are
@@ -106,7 +106,7 @@ cross-chunk + ISR transfers heavily. Run after every step:
    faithful `iret`. Delete the isr drift asserts. Test the regression program.
 5. **Delete dead machinery**: `lcall_return_env`, `irq_return_env`,
    `lcall_depth`/`expected_*` arrays, `shim_check_stack_drift`,
-   `dispatch_depth_guard`. Test the regression program + run the pytest suite.
+   `dispatch_depth_guard`. Test the regression program + run the cargo test suite.
 6. **Validate a config/setup program's device-selection path** writes its
    output file (the bug this unblocks): the config descriptor should now
    survive load→parse because the stack is faithful.

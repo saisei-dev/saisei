@@ -256,8 +256,8 @@ uint8_t dos_print_string_impl(const char *str, const char *file,
   if (len > 0) {
     /* This is the GAME's console output (AH=09h), not diagnostic tracing --
      * write it straight to stdout like dos_write_char does. Routing it through
-     * shim_log_stdout would let --silent (which mutes the trace/log channel)
-     * wrongly swallow the program's own text. */
+     * shim_log_stdout would let the verbosity gate (off by default) wrongly
+     * swallow the program's own text. */
     fwrite(str, 1, len, stdout);
     fflush(stdout);
   }

@@ -1,0 +1,25 @@
+# Patched fork of capstone-sys 0.16.0 (bindings only, no vendored C).
+#
+# Upstream capstone-sys 0.16.0 compiles a bundled capstone 5.0-rc2, which
+# disagrees with the reference's capstone 5.0.7 on some operand-access flags
+# (e.g. `test [mem], imm` -> readwrite vs read), and that flag feeds ir_to_c's
+# flag-liveness analysis. This fork keeps the (ABI-stable across 5.0.x)
+# pre-generated bindings but LINKS AN EXTERNAL libcapstone chosen via
+# SAISEI_CAPSTONE_LIB_DIR, so Rust and the oracle decode identically. Reproducible
+# and committed; for distribution, point the env var at a vendored libcapstone.
+[package]
+name = "capstone-sys"
+version = "0.16.0"
+edition = "2018"
+build = "build.rs"
+links = "capstone"
+description = "Patched capstone-sys: links an external libcapstone instead of the vendored rc2 source."
+license = "MIT"
+
+[dependencies.libc]
+version = "0.2"
+default-features = false
+
+[features]
+default = ["full"]
+full = []

@@ -11,7 +11,7 @@ two modes differ only in whether the program also accepts SDL keyboard events.
 
 Throughout, `<name>` is the bundle name under `games/<name>/`; its build output
 (and runtime working directory) is `build/<name>/`. Examples use
-`python3 tools/game.py run <name>`; where the `saisei` wrapper is installed,
+`saisei run <name>`; where the `saisei` wrapper is installed,
 `saisei run <name>` is the equivalent shorthand.
 
 ## Starting the program with a control FIFO
@@ -24,7 +24,7 @@ and re-opens the pipe:
 rm -f /tmp/saisei_fifo
 mkfifo /tmp/saisei_fifo
 (exec 9<>/tmp/saisei_fifo;
- PYTHONPATH=$PWD python3 tools/game.py run <name> --headless --silent <&9 \
+ saisei run <name> --headless <&9 \
    > /tmp/saisei_stdout.log 2>&1) &
 ```
 
@@ -33,8 +33,9 @@ Flags worth knowing:
 - `--headless` — no SDL window. Useful for batch runs / CI / parallel
   experiments. Without this flag the SDL window opens and SDL also delivers
   keystrokes alongside the FIFO.
-- `--silent` — suppresses shim stdout logging. Stderr (including `[TAP]`
-  trace lines, `[BUG]` reports, and crash banners) is unaffected.
+- `--verbose` — prints the shim trace/diagnostic log (including `[TAP]` /
+  `[VCLOCK]` lines) to stdout. Runs are silent by default; crash/exit banners
+  and errors always print regardless.
 - `--speedup N` — multiplies emulation speed (game logic runs N× as fast).
 
 Run from the repo root so the pipeline can find the bundle under
@@ -90,7 +91,7 @@ The control CLI wraps this as `tap` (see below). To hit it directly, write the
 
 ```bash
 # press Right and release it after 100 BIOS ticks (~5.5 s of game time)
-python3 -c "open('/tmp/saisei_fifo','wb',buffering=0).write(bytes([0x12,0x4D,100,0]))"
+saisei control raw 12 4D 64 00
 ```
 
 Each tap logs to stderr:
@@ -104,10 +105,9 @@ The delta between deadline and release fire is normally microseconds.
 
 ## Screenshots
 
-Auto-screenshots are off by default (`SCREENSHOT_INTERVAL_SECS` in
-`runtime/core/shims.c` defaults to 0). Set `SAISEI_SCREENSHOT_SECS=N` in the
-environment before launching to dump a PNG every N seconds — handy for
-unattended headless validation. On demand, the triggers are:
+Auto-screenshots are off by default. Pass `--screenshot-secs N` to a headless
+run to dump a PNG every N seconds — handy for unattended validation. On demand,
+the triggers are:
 
 1. `\x14` from stdin (Ctrl+T).
 2. The SDL window's screenshot hotkey (windowed mode only).
@@ -179,7 +179,7 @@ To add a new watch: append a `{lo, hi, "name"}` entry to `write_watches[]`.
 Watches add a few comparisons per byte/word write — keep the list short
 (<20 entries).
 
-## Driver CLI: `tools/control.py`
+## Driver CLI: `saisei control`
 
 Program-agnostic wrapper around the stdin protocol. Attaches to whatever
 process owns the FIFO — it does **not** start, stop, or rebuild the
@@ -190,18 +190,18 @@ launches.
 # Launch the program (any way; here, background with FIFO-redirected stdin)
 mkfifo /tmp/saisei_fifo
 (exec 9<>/tmp/saisei_fifo;
- PYTHONPATH=$PWD python3 tools/game.py run <name> --headless --speedup 1.0 <&9 \
+ saisei run <name> --headless --speedup 1.0 <&9 \
    > /tmp/saisei_stdout.log 2> /tmp/saisei_stderr.log) &
 
 # Drive it
-python3 tools/control.py shot                # capture frame; prints PNG path
-python3 tools/control.py space 5             # 5 Space taps
-python3 tools/control.py tap right 30        # right-arrow held for 30 BIOS ticks
-python3 tools/control.py press up            # held key (no auto-release)
-python3 tools/control.py release up
-python3 tools/control.py enter 3             # 3 Enters (auto-paired make/break)
-python3 tools/control.py raw 12 4D 14 00     # raw protocol bytes (escape hatch)
-python3 tools/control.py status              # FIFO + latest screenshot path
+saisei control shot                # capture frame; prints PNG path
+saisei control space 5             # 5 Space taps
+saisei control tap right 30        # right-arrow held for 30 BIOS ticks
+saisei control press up            # held key (no auto-release)
+saisei control release up
+saisei control enter 3             # 3 Enters (auto-paired make/break)
+saisei control raw 12 4D 14 00     # raw protocol bytes (escape hatch)
+saisei control status              # FIFO + latest screenshot path
 ```
 
 Keys accepted by `tap`/`press`/`release`: `up down left right space
@@ -209,14 +209,14 @@ enter esc tab backspace`, lowercase letters `a..z`, digits `0..9`, or
 raw `0xHH`.
 
 Configuration:
-- `--fifo PATH` / `$SAISEI_CONTROL_FIFO` — defaults to `/tmp/saisei_fifo`.
-- `--shots-dir PATH` / `$SAISEI_CONTROL_SHOTS` — defaults to the
-  `screenshots/` directory derived from the FIFO's runtime directory.
+- `--fifo PATH` — defaults to `/tmp/saisei_fifo`.
+- `--shots-dir PATH` — defaults to the `screenshots/` directory derived
+  from the FIFO's runtime directory.
 
 The CLI is the durable contract for driving. The byte protocol (press/release/
 tap opcodes, `\x14` screenshot, `\r` Enter) is the underlying contract;
-`tools/control.py` is just a friendly skin over it. If you need something the
-CLI doesn't expose, `control.py raw …` writes arbitrary hex.
+`saisei control` is just a friendly skin over it. If you need something the
+CLI doesn't expose, `saisei control raw …` writes arbitrary hex.
 
 ## Closed-loop driving via the virtual clock
 
@@ -233,7 +233,7 @@ Together with the read (`\x18 <addr_4B> <len_1B>`) and snapshot (`\x1A`)
 opcodes, this turns the program into a turn-by-turn engine: `step → read →
 decide → step → …`. Driver latency drops out of the program's perception of
 time because the world only advances when a step says so. CLI wrappers
-in `control.py`: `halt`, `resume`, `step <ticks>`, `read <addr> [len]`,
+in `saisei control`: `halt`, `resume`, `step <ticks>`, `read <addr> [len]`,
 `snapshot [--out PATH]`.
 
 The same primitives also make `--speedup` the single knob that sets
@@ -242,7 +242,7 @@ fixed ratio regardless of host capacity.
 
 ## Inspecting program state (no symbols required)
 
-`control.py read <addr> [len]` and `control.py snapshot` dump live RAM (to
+`saisei control read <addr> [len]` and `saisei control snapshot` dump live RAM (to
 `build/<name>/snapshots/`) without pausing or rebuilding. A common loop for
 locating a state variable with no symbols: halt, snapshot, perform a known
 input, halt, snapshot again, and diff the two dumps — bytes that changed only
@@ -256,7 +256,7 @@ coordinate must be (a) identical across all idle ticks and (b) responsive to
 held input at the tick scale. Coarser-step comparisons phase-lock onto
 animation cycles and mis-identify them as state.
 
-`tools/zoom.py SRC COL ROW` crops a fixed 4×4 grid cell (80×50 pixels) out of a
+`saisei zoom SRC COL ROW` crops a fixed 4×4 grid cell (80×50 pixels) out of a
 screenshot when you need to inspect a region more closely than the full 320×200
 frame allows.
 
@@ -265,17 +265,17 @@ frame allows.
 `tap right N` schedules the release at "virtual-now when the tap opcode was
 processed + N ticks". A following `step N` schedules its own halt at
 "virtual-now when the step opcode was processed + N ticks". Those two
-`virtual_now()` reads happen at slightly different moments (control.py issues
+`virtual_now()` reads happen at slightly different moments (saisei control issues
 them as two separate FIFO writes), so the release deadline can land just before
 or just after the step's halt. When it lands after, the key stays "pressed" past
 the end of the step, and the next action behaves as if the previous direction is
 still held. Workaround between actions:
 
 ```bash
-python3 tools/control.py release left
-python3 tools/control.py release right
-python3 tools/control.py release up
-python3 tools/control.py step 3       # let the releases land
+saisei control release left
+saisei control release right
+saisei control release up
+saisei control step 3       # let the releases land
 ```
 
 The proper fix is a fused press-step-release opcode that does all three inside
@@ -294,7 +294,7 @@ one safepoint pass; the workaround is fine for now.
   `0x12` handler busy-loops up to 1000 times to assemble the 3-byte payload.
   If you see `[TAP] short read got=N` lines, the writer isn't using unbuffered
   writes. Atomic 4-byte writes via
-  `python3 -c "open(fifo,'wb',buffering=0).write(bytes(...))"` always succeed.
+  `saisei control raw …` (arbitrary hex) always succeed.
 - **Unhandled pc lands at a chunk-swap region** → check whether the
   `[BUG]` report diagnoses `overlapping mappings at same linear`. If yes,
   the upstream bug is stale ret-target attribution — the chunk that owned

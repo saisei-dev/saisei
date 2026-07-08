@@ -1,26 +1,22 @@
 #!/usr/bin/env bash
-# Pre-commit hook: flake8 must pass before any commit is allowed.
+# Pre-commit hook: the Rust workspace must be formatted before any commit is
+# allowed.
 #
-# Enable once per clone:   make hooks
-#   (equivalently: git config core.hooksPath .githooks)
+# Enable once per clone:   git config core.hooksPath .githooks
 #
-# Rules live in .flake8 and are the same ones CI enforces, so a green commit
-# here means a green CI. This is intentionally strict: lint is never optional.
+# A green commit here means a green CI.
 set -euo pipefail
 
-if command -v flake8 >/dev/null 2>&1; then
-    FLAKE8=(flake8)
-elif python3 -c 'import flake8' >/dev/null 2>&1; then
-    FLAKE8=(python3 -m flake8)
-else
-    echo "pre-commit: flake8 not installed — run: pip install -e \".[dev]\"" >&2
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "pre-commit: cargo not found — install Rust (https://rustup.rs)." >&2
     exit 1
 fi
 
-echo "pre-commit: running flake8..."
-if ! "${FLAKE8[@]}"; then
+cd "$(git rev-parse --show-toplevel)"
+
+echo "pre-commit: cargo fmt --check..."
+if ! cargo fmt --all --check; then
     echo >&2
-    echo "pre-commit: flake8 found violations (above). Commit aborted." >&2
-    echo "pre-commit: fix them, then commit again ('make lint' shows the full list)." >&2
+    echo "pre-commit: unformatted code (above). Run 'cargo fmt --all' and re-commit." >&2
     exit 1
 fi

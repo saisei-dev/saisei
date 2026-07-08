@@ -53,7 +53,7 @@ void vclock_service(void) {
   if (virtual >= vclock_step_deadline_virtual_ns) {
     vclock_frozen_virtual_ns = vclock_step_deadline_virtual_ns;
     vclock_state = VCLOCK_HALTED;
-    fprintf(stderr, "[VCLOCK] step complete, halted virtual_ns=%llu\n",
+    shim_log_stdout("[VCLOCK] step complete, halted virtual_ns=%llu\n",
             (unsigned long long)vclock_frozen_virtual_ns);
   }
 }
@@ -62,7 +62,7 @@ void vclock_halt(void) {
   if (vclock_state == VCLOCK_HALTED) return;
   vclock_frozen_virtual_ns = shim_virtual_now_ns();
   vclock_state = VCLOCK_HALTED;
-  fprintf(stderr, "[VCLOCK] halted virtual_ns=%llu wall_ns=%llu\n",
+  shim_log_stdout("[VCLOCK] halted virtual_ns=%llu wall_ns=%llu\n",
           (unsigned long long)vclock_frozen_virtual_ns,
           (unsigned long long)shim_host_monotonic_ns());
 }
@@ -78,7 +78,7 @@ void vclock_resume(void) {
                         : vclock_step_deadline_virtual_ns;
   vclock_paused_offset_ns = wall - anchor;
   vclock_state = VCLOCK_RUNNING;
-  fprintf(stderr, "[VCLOCK] resumed virtual_ns=%llu wall_ns=%llu\n",
+  shim_log_stdout("[VCLOCK] resumed virtual_ns=%llu wall_ns=%llu\n",
           (unsigned long long)anchor, (unsigned long long)wall);
 }
 
@@ -96,7 +96,7 @@ void vclock_step(uint32_t ticks) {
   }
   vclock_step_deadline_virtual_ns = base_virtual + ns;
   vclock_state = VCLOCK_STEPPING;
-  fprintf(stderr, "[VCLOCK] step ticks=%u deadline_virtual_ns=%llu\n",
+  shim_log_stdout("[VCLOCK] step ticks=%u deadline_virtual_ns=%llu\n",
           (unsigned)ticks,
           (unsigned long long)vclock_step_deadline_virtual_ns);
 }

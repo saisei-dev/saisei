@@ -1,0 +1,11 @@
+# Saisei's Rust toolchain: `saisei-jitc` (the JIT translator, a Rust port of the
+# former compiler/*.py — validated byte-identical against it) and `saisei` (the
+# launcher). This is the whole toolchain; there is no the reference in the repo.
+[workspace]
+members = ["saisei-jitc", "saisei"]
+resolver = "2"
+
+# Link the external libcapstone the oracle uses (5.0.7) instead of capstone-sys's
+# vendored 5.0-rc2. See vendor/capstone-sys. Requires SAISEI_CAPSTONE_LIB_DIR.
+[patch.crates-io]
+capstone-sys = { path = "vendor/capstone-sys" }

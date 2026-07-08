@@ -69,7 +69,10 @@ __attribute__((weak)) void virtual_display_configure(int width, int height) {
   (void)height;
 }
 
-static int shim_stdout_enabled = 1;
+/* Trace/diagnostic stdout is OFF by default; `saisei run --verbose` (which sets
+ * SAISEI_VERBOSE, read in the constructor below) turns it on. Crash/exit
+ * diagnostics and real errors bypass this gate and always print. */
+static int shim_stdout_enabled = 0;
 
 
 /*
@@ -354,9 +357,9 @@ void shim_check_stack_drift(const char *site, uint16_t expected_sp,
 
 static void init_shim_logs(void) __attribute__((constructor));
 static void init_shim_logs(void) {
-  const char *silent = getenv("RUN_SILENT");
-  if (silent && silent[0] != '\0') {
-    shim_stdout_enabled = 0;
+  const char *verbose = getenv("SAISEI_VERBOSE");
+  if (verbose && verbose[0] != '\0') {
+    shim_stdout_enabled = 1;
   }
   /* Disable buffering so traces are written immediately even if the process
    * terminates abnormally before stdio has a chance to flush. */
@@ -690,7 +693,7 @@ void shim_log_stdout(const char *fmt, ...) {
 void shim_log_crash(const char *fmt, ...) {
   /* Crash diagnostics are written to stdout so they land in the same
    * stream as the traces above; a single `> debug.txt` redirect captures
-   * the whole story.  We bypass the RUN_SILENT gate that suppresses
+   * the whole story.  We bypass the verbosity gate that suppresses
    * normal traces because a crash is always worth reporting.  ferror
    * fallback to stderr handles the case where the program closed stdout. */
   va_list args;
@@ -1001,7 +1004,7 @@ uint64_t dd_inc_overlay_first, dd_dec_overlay_first;
 
 /* Stack of currently-executing binaries. Each translated _impl wrapper
  * pushes its binary's basename on entry and pops on exit (see
- * ir_to_c.py emission). save_manager refuses captures whenever this is
+ * the source emission). save_manager refuses captures whenever this is
  * empty (we're outside any game-binary execution — shim setup, idle
  * boot, etc.). snapshot saves the top of the stack so restore can route
  * back into the right binary's dispatch instead of relying on cs:ip
@@ -1102,7 +1105,7 @@ static void record_binary_cs(uint32_t addr, uint16_t seg);
  * (`sessions/session.log` in cwd, overwritten per launch) with the
  * virtual_ns at read time. The log is the input track of the run; paired
  * with a known starting state (fresh launch + matching --speedup) it is
- * sufficient to deterministically replay the run via scripts/replay.py.
+ * sufficient to deterministically replay the run via scripts/the source.
  *
  * On crash/bug bundle, the session log is copied into the bundle dir
  * via the bundle_extra_writer hook so the inputs are preserved with
@@ -1120,18 +1123,18 @@ static void session_log_init(void) {
   if (session_log_fp) return;
   const char *dir = "sessions";
   if (mkdir(dir, 0755) && errno != EEXIST) {
-    fprintf(stderr, "[SESSION] mkdir sessions: %s\n", strerror(errno));
+    shim_log_stdout("[SESSION] mkdir sessions: %s\n", strerror(errno));
     return;
   }
   snprintf(session_log_path, sizeof(session_log_path), "%s/session.log", dir);
   session_log_fp = fopen(session_log_path, "w");
   if (!session_log_fp) {
-    fprintf(stderr, "[SESSION] fopen %s: %s\n", session_log_path, strerror(errno));
+    shim_log_stdout("[SESSION] fopen %s: %s\n", session_log_path, strerror(errno));
     return;
   }
   setvbuf(session_log_fp, NULL, _IOLBF, 0);
   fprintf(session_log_fp, "# session log, speedup=%g\n", emulation_speedup);
-  fprintf(stderr, "[SESSION] logging stdin to %s\n", session_log_path);
+  shim_log_stdout("[SESSION] logging stdin to %s\n", session_log_path);
 }
 
 static void session_log_bytes(const uint8_t *buf, size_t n) {
@@ -1319,7 +1322,7 @@ static void pending_release_tick(void) {
     if (pending_release_deadline_ns[i] && now >= pending_release_deadline_ns[i]) {
       pending_release_deadline_ns[i] = 0;
       shim_keyboard_enqueue_scancode_release((uint8_t)i);
-      fprintf(stderr, "[TAP] release sc=0x%02X fired virtual_ns=%llu\n",
+      shim_log_stdout("[TAP] release sc=0x%02X fired virtual_ns=%llu\n",
               i, (unsigned long long)now);
     }
   }
@@ -1347,7 +1350,7 @@ static void init_keyboard(void) {
   if (getenv("SAISEI_REPLAY")) {
     vclock_state = VCLOCK_HALTED;
     vclock_frozen_virtual_ns = 0;
-    fprintf(stderr, "[VCLOCK] SAISEI_REPLAY: initial halt at virtual_ns=0\n");
+    shim_log_stdout("[VCLOCK] SAISEI_REPLAY: initial halt at virtual_ns=0\n");
   }
   keyboard_fd = STDIN_FILENO;
   if (tcgetattr(keyboard_fd, &orig_termios) != 0) {
@@ -1399,13 +1402,6 @@ void shim_set_timer_isr(uint16_t segment, uint16_t offset) {
 void schedule_interrupt_impl(uint8_t int_no, const char *file, const char *func,
                              int line) {
   shim_log(__func__, file, func, line, NULL);
-  if (int_no == 0x60) {
-    static int irq60_log_count;
-    if (irq60_log_count < 10) {
-      fprintf(stderr, "schedule_interrupt(0x60)\n");
-      ++irq60_log_count;
-    }
-  }
   irq_pending[int_no] = 1;
 }
 
@@ -1833,7 +1829,7 @@ void safe_point_impl(const char *file, const char *func, int line) {
           uint16_t ticks = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
           vclock_step((uint32_t)ticks);
         } else {
-          fprintf(stderr, "[VCLOCK] step short read got=%zu\n", got);
+          shim_log_stdout("[VCLOCK] step short read got=%zu\n", got);
         }
         continue;
       }
@@ -1853,7 +1849,7 @@ void safe_point_impl(const char *file, const char *func, int line) {
           uint8_t len = buf[4];
           shim_read_memory_to_sidecar(addr, len);
         } else {
-          fprintf(stderr, "[READ] short read got=%zu\n", got);
+          shim_log_stdout("[READ] short read got=%zu\n", got);
         }
         continue;
       }
@@ -1876,10 +1872,10 @@ void safe_point_impl(const char *file, const char *func, int line) {
           for (int i = 0; i < 8; i++) vns |= ((uint64_t)buf[i]) << (8 * i);
           vclock_frozen_virtual_ns = vns;
           vclock_state = VCLOCK_HALTED;
-          fprintf(stderr, "[VCLOCK] set_virtual_clock vns=%llu\n",
+          shim_log_stdout("[VCLOCK] set_virtual_clock vns=%llu\n",
                   (unsigned long long)vns);
         } else {
-          fprintf(stderr, "[VCLOCK] set_vc short read got=%zu\n", got);
+          shim_log_stdout("[VCLOCK] set_vc short read got=%zu\n", got);
         }
         continue;
       }
@@ -1942,11 +1938,11 @@ void safe_point_impl(const char *file, const char *func, int line) {
           uint64_t now_v = shim_virtual_now_ns();
           pending_release_deadline_ns[sc] =
               now_v + (uint64_t)ticks * ns_per_tick;
-          fprintf(stderr, "[TAP] sc=0x%02X ticks=%u virtual_ns=%llu deadline=%llu\n",
+          shim_log_stdout("[TAP] sc=0x%02X ticks=%u virtual_ns=%llu deadline=%llu\n",
                   sc, (unsigned)ticks, (unsigned long long)now_v,
                   (unsigned long long)pending_release_deadline_ns[sc]);
         } else {
-          fprintf(stderr, "[TAP] short read got=%zu buf=%02X%02X%02X\n",
+          shim_log_stdout("[TAP] short read got=%zu buf=%02X%02X%02X\n",
                   got, buf[0], buf[1], buf[2]);
         }
         continue;
@@ -1966,7 +1962,7 @@ void safe_point_impl(const char *file, const char *func, int line) {
           int16_t mx = (int16_t)((uint16_t)mb[0] | ((uint16_t)mb[1] << 8));
           int16_t my = (int16_t)((uint16_t)mb[2] | ((uint16_t)mb[3] << 8));
           mouse_host_inject(mx, my, mb[4]);
-          fprintf(stderr, "[MOUSE] inject x=%d y=%d buttons=0x%02X\n", mx, my,
+          shim_log_stdout("[MOUSE] inject x=%d y=%d buttons=0x%02X\n", mx, my,
                   mb[4]);
         }
         continue;
@@ -2724,8 +2720,9 @@ static void lifecycle_log_dispatch(const char *kind, uint32_t addr) {
   if (alias) render_alias_with_args(alias, disp, sizeof(disp));  /* "name(arg=LABEL,..)" */
   /* Live flow view: echo call-like transfers to the trace stream so a RUNNING
    * session shows the call flow in the assigned names (an empty alias renders
-   * the bare stable identity, already clearer than nothing). Respects --silent
-   * via shim_log_stdout; the ring line below keeps the full register detail for
+   * the bare stable identity, already clearer than nothing). Honors the
+   * --verbose gate via shim_log_stdout; the ring line below keeps the full
+   * register detail for
    * the post-mortem lifecycle.log. */
   if (call_like) {
     cg_record(((uint32_t)cs << 4) + ip, addr);  /* persistent call-graph edge */
@@ -2785,8 +2782,8 @@ static int  aliasreg_loaded;   /* 0 until first load attempt */
 static char aliasreg_path[1024];
 
 /* Annotation files (aliases/regions/vars.json) are durable METADATA, not build
- * artifacts -- they live in the committed games/<key>/ bundle (survives
- * `make clean`, can be checked in), with a build/<key>/ fallback if that dir is
+ * artifacts -- they live in the committed games/<key>/ bundle (survives a
+ * `build/` wipe, can be checked in), with a build/<key>/ fallback if that dir is
  * absent. Path = <SAISEI_REPO_ROOT>/games/<key>/<name>, where <key> is parsed
  * from SAISEI_JIT_DIR (".../build/<key>/jit"). Used for both read and auto-save,
  * so seeds accumulate in the committed bundle. */
@@ -4155,7 +4152,7 @@ void shim_protected_slots_check(void) { /* legacy no-op for callers */ }
  * F9 (or shim_bookend_start) snapshots full RAM + opens a filtered write
  * log. F10 (or shim_bookend_stop) snapshots again and closes the log.
  * Filter: skip seg==ss (stack churn) and skip VGA pages (0xA0000-0xBFFFF).
- * Post-mortem: zbookend_diff.py against the two snapshots names the
+ * Post-mortem: the source against the two snapshots names the
  * changed addresses; grep the log for those addresses to find the writer. */
 static volatile int bookend_active;
 static FILE *bookend_log_fp;
@@ -4215,7 +4212,7 @@ void shim_bookend_stop(void) {
     bookend_log_fp = NULL;
   }
   shim_log_stdout("Bookend: STOP  logged=%llu skipped=%llu\n"
-                  "  diff: python3 scripts/zbookend_diff.py "
+                  "  diff: saisei zbookend-diff "
                   "/tmp/zbookend_snap1.bin /tmp/zbookend_snap2.bin\n"
                   "  log:  /tmp/zbookend.log\n",
                   (unsigned long long)bookend_writes_logged,
@@ -4304,15 +4301,6 @@ void memw_write_impl(uint16_t seg, uint16_t off, uint16_t value,
     rcb_write16_impl(field, value, file, func, line);
     return;
   }
-  if (seg == 0xA000 && off == 0) {
-    uint16_t src = memw_raw_read(ds, si);
-    if (src == value) {
-      fprintf(stderr, "VGA copy from %04X:%04X\n", ds, si);
-    } else {
-      fprintf(stderr, "VGA write %04X (src %04X) from %04X:%04X\n",
-              value, src, ds, si);
-    }
-  }
   bookend_log_write(seg, off, addr, 2, value, file, func, line);
   write_watch_log(addr, 2, value, file, func, line);
   warn_on_mutation(addr, 2, file, func, line);
@@ -4337,16 +4325,12 @@ uint8_t memb_read_impl(uint16_t seg, uint16_t off, const char *file,
 
 void memb_write_impl(uint16_t seg, uint16_t off, uint8_t value,
                      const char *file, const char *func, int line) {
-  static uint64_t cnt_vga, cnt_b0, cnt_b1;
   uint32_t addr = linear_addr(seg, off);
   uint32_t rcb_base = linear_addr(es, 0xFF00);
   if (seg == es && addr >= rcb_base && addr < rcb_base + 0x100) {
     RCBField field = (RCBField)(0xFF00 + (addr - rcb_base));
     rcb_write8_impl(field, value, file, func, line);
     return;
-  }
-  if (seg == 0xA000 && off == 0) {
-    fprintf(stderr, "VGA write from %04X:%04X\n", ds, si);
   }
   bookend_log_write(seg, off, addr, 1, value, file, func, line);
   write_watch_log(addr, 1, value, file, func, line);
@@ -6133,13 +6117,13 @@ void shim_set_bundle_extra_writer(void (*fn)(const char *dir)) {
  * self-contained. */
 /* Build/runtime version, stamped into every crash bundle so a submitted
  * report maps to an exact code revision. Overridden at compile time with
- * -DRUNTIME_VERSION=\"<git sha>\" (see the Makefile / tools/game.py). */
+ * -DRUNTIME_VERSION=\"<git sha>\" (see the source). */
 #ifndef RUNTIME_VERSION
 #define RUNTIME_VERSION "unknown"
 #endif
 
 /* Machine-readable bundle header for triage / user-submitted reports. Keep it
- * small, stable, and JSON so tools/triage.py (and future tooling) can classify
+ * small, stable, and JSON so the source (and future tooling) can classify
  * a bundle without parsing the human-readable crash.txt. */
 static void crash_bundle_write_manifest(const char *dir, const char *kind,
                                         uint32_t addr) {
@@ -6665,8 +6649,8 @@ static const BinaryDispatch *find_binary_for_addr(uint32_t addr,
  * modified -- the JIT decodes the REAL in-memory bytes, compiles them to a .so,
  * dlopen()s it, and dispatches into it, all without restarting. Registered
  * chunks take precedence in dispatch_via_binary for their decoded ranges. It
- * requires the launcher to export SAISEI_REPO_ROOT + SAISEI_PYTHON (tools/game.py
- * does). The static dispatch-by-binary path (find_binary_for_addr /
+ * requires the launcher to export SAISEI_REPO_ROOT + SAISEI_JITC (the `saisei`
+ * launcher does). The static dispatch-by-binary path (find_binary_for_addr /
  * GameConfig.binary_dispatch) is retained NULL-but-shaped for a future "freeze
  * the chunks into a static native build"; today it is empty and every address
  * routes through here. */
@@ -6717,7 +6701,7 @@ static int jit_chunk_has_key(const JitChunk *c, uint32_t off) {
 }
 
 /* Load the chunk's case-keys sidecar (<so without .so>.keys): <uint32 count>
- * then count*uint32 sorted keys (same format as tools/game.py case_keys), and
+ * then count*uint32 sorted keys (same format as the source case_keys), and
  * the exact code-byte-coverage sidecar (.code): <uint32 count> then
  * count*(uint32 start, uint32 end) merged, sorted intervals. */
 static void jit_load_keys(JitChunk *c, const char *so_path) {
@@ -6883,8 +6867,10 @@ static JitChunk *jit_compile_or_get(uint16_t seg, uint16_t off) {
    * code afresh at our own seg_base. */
   if (existing && existing->seg_base == seg_base) return existing;
   const char *repo = getenv("SAISEI_REPO_ROOT");
-  const char *py = getenv("SAISEI_PYTHON");
-  if (!repo || !py || jit_chunk_count >= MAX_JIT_CHUNKS) return NULL;
+  /* The Rust translator (SAISEI_JITC) is the only JIT backend; the runtime needs
+   * no the reference at all. */
+  if (!repo || !getenv("SAISEI_JITC") || jit_chunk_count >= MAX_JIT_CHUNKS)
+    return NULL;
   if (seg_base + 0x10000u > MEMORY_SIZE) return NULL;
 
   vclock_halt();
@@ -6911,10 +6897,14 @@ static JitChunk *jit_compile_or_get(uint16_t seg, uint16_t off) {
   if (fp) {
     fwrite(virtual_memory + seg_base, 1, 0x10000u, fp);
     fclose(fp);
+    /* The JIT translator is the Rust `saisei-jitc jit-compile` (SAISEI_JITC). It
+     * speaks the SO/SYM/RANGE stdout protocol + .keys/.code sidecars the loader
+     * below parses. */
+    const char *jitc = getenv("SAISEI_JITC");
     snprintf(cmd, sizeof(cmd),
-             "'%s' '%s/compiler/jit_compile.py' --mem '%s' --entry 0x%X "
+             "'%s' jit-compile --mem '%s' --entry 0x%X "
              "--name jit_%05x_%04x --image-base 0x%X --outdir '%s' 2>&1",
-             py, repo, dump, off, seg_base, off, seg_base, dir);
+             jitc, dump, off, seg_base, off, seg_base, dir);
     FILE *pp = popen(cmd, "r");
     if (pp) {
       char so[1024] = "", sym[256] = "", line[1200];
@@ -7009,8 +6999,8 @@ static JitChunk *jit_compile_or_get(uint16_t seg, uint16_t off) {
         "self-contained: jit_translate.log has the translator FATAL "
         "(mnemonic / file-offset / reached-from function), jit_segment.bin is "
         "the exact 64KB this decode saw, and the manifest carries cs:ip -- "
-        "re-run compiler/jit_compile.py --mem jit_segment.bin --entry 0x%X "
-        "--image-base 0x%X to reproduce.",
+        "re-run 'saisei-jitc jit-compile --mem jit_segment.bin --entry 0x%X "
+        "--image-base 0x%X --outdir .' to reproduce.",
         seg, off, seg_base + off, dir, off, seg_base);
     fprintf(stderr,
         "\n[FATAL] %s\n  Halting at the JIT failure (prime directive: a failed "
@@ -7282,7 +7272,7 @@ int shim_exec_child_terminate(int status) {
  * dispatcher resolves addresses to — so one patch works for static-dispatch and JIT code
  * and across cs-aliases. They are registered at startup, either from the
  * built-in game_config.patches table or, separately deliverable, from bundle
- * .so's loaded via patch_load_bundle (see tools/game.py --patch). Interception
+ * .so's loaded via patch_load_bundle (see the source --patch). Interception
  * happens at the codegen hook (shim_patch_check, emitted at each function entry)
  * and the dispatch arms below; both consult this one registry. */
 #define NO_ACTIVE_PATCH 0xFFFFFFFFu
@@ -7773,7 +7763,7 @@ static void shim_dump_ram_snapshot(void) {
     off += (size_t)w;
   }
   close(fd);
-  fprintf(stderr, "[SNAP] ram → %s (%zu bytes, counter=%d)\n", path, off,
+  shim_log_stdout("[SNAP] ram → %s (%zu bytes, counter=%d)\n", path, off,
           ram_snapshot_counter);
   ram_snapshot_counter++;
 }
@@ -7781,7 +7771,7 @@ static void shim_dump_ram_snapshot(void) {
 /* Stable path — overwrites each call. Caller polls/reads it immediately. */
 static void shim_read_memory_to_sidecar(uint32_t addr, uint8_t len) {
   if ((size_t)addr + (size_t)len > SHIM_MEMORY_SIZE) {
-    fprintf(stderr, "[READ] out of bounds addr=0x%X len=%u\n", addr, len);
+    shim_log_stdout("[READ] out of bounds addr=0x%X len=%u\n", addr, len);
     return;
   }
   const char *dir = "snapshots";
@@ -7798,7 +7788,7 @@ static void shim_read_memory_to_sidecar(uint32_t addr, uint8_t len) {
   }
   ssize_t w = write(fd, virtual_memory + addr, len);
   close(fd);
-  fprintf(stderr, "[READ] addr=0x%X len=%u wrote=%zd → %s\n", addr, len, w, path);
+  shim_log_stdout("[READ] addr=0x%X len=%u wrote=%zd → %s\n", addr, len, w, path);
 }
 
 void shim_save_video_memory(void) {

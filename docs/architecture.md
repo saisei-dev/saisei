@@ -3,115 +3,146 @@
 This document captures the intent, goals and technical design of Saisei so new
 contributors can build on top of it with confidence.
 
-## Purpose and goals
+## What Saisei is
 
-- **Reproduce classic DOS titles** by transforming MZ executables and binary
-  overlays into readable, compilable C code.
-- **Preserve behaviour** by emitting a lossless JSON intermediate
-  representation (IR) plus metadata that records every segment, relocation and
-  entry point discovered during disassembly.
-- **Enable iteration** so that newly recovered insights can be folded back into
-  the pipeline without rerunning manual steps. Regenerating artefacts should be
-  deterministic and safe.
-- **Support live experimentation** via runtime shims that allow the generated C
-  to be compiled and executed with tracing and instrumentation hooks.
+A **JIT binary recompiler** for DOS MZ executables. The runtime loads a
+program image, takes the entry `cs:ip` from its MZ header, and — the first time
+control reaches any code segment — dumps the live 64 KB, decodes it to a
+lossless JSON IR, structures that into C, compiles it with clang, and `dlopen`s
+the result. The translated C *is* the program.
 
-## High-level pipeline
+There is **no interpreter, no external emulator, and no ahead-of-time
+whole-image decode**. Code is discovered and compiled on demand as the program
+executes, which is exactly what makes packed / overlay / self-modifying
+programs run with no special-casing: whatever bytes are live at a `cs:ip` when
+control reaches it are the bytes that get compiled.
 
-The workflow is split across two primary stages that exchange data through the
-IR files stored under `build/disassemble/<name>/`.
+## The run loop (compile-on-demand)
 
-### Stage 1 – Binary intake and analysis (`compiler/disassemble.py`)
+The runtime's top-level loop is `run_machine` → `resolve_and_run_chunk`
+(`runtime/core/shims.c`):
 
-`disassemble.py` processes a DOS executable or raw binary in three passes:
+1. Resolve the live `cs:ip` to the JIT chunk that owns it.
+2. If no chunk covers it, dump the live 64 KB segment (based at `cs<<4`) to
+   `SAISEI_JIT_DIR/seg_<base>.bin` and translate + compile it (below) — no
+   restart. The new `.so` is `dlopen`ed and registered.
+3. Dispatch into the chunk; it runs until control leaves its `pc`-space, then
+   returns to the loop, which re-resolves the new `cs:ip`.
 
-1. **Stage 1:** Load the binary, emit header metadata, relocation tables and
-   segment dumps, and record hashes in `manifest.json` for reproducibility.
-2. **Stage 2:** Decode machine code with Capstone, identify entry points (both
-   the implicit reset vector and any supplied with `--entry`) and capture flow
-   metadata such as cross references.
-3. **Stage 3:** Combine the gathered information into `program.ir.json`, a
-   structured representation of instructions and operands that remains faithful
-   to the source binary.
+Cross-binary and indirect transfers route through `dispatch_via_binary`. Which
+bytes belong to which chunk is answered by the **runtime memory model** — every
+linear byte has an origin `(file, file_offset)` tracked in `file_mappings[]` —
+described in [runtime_memory_model.md](runtime_memory_model.md).
 
-Throughout these passes the tool records side artefacts including
-`header.json`, `reloc.json`, and `xrefs.json`, ensuring every decision made by
-later stages can be traced back to the original bytes.
+Chunks are cached on disk at
+`build/<name>/jit/jit_<segbase>_<offset>_<contentsha>.{c,so,sha,...}`, keyed on
+the **segment bytes' SHA plus a toolchain hash**. The same `seg:ip` decoding
+*different* bytes (an overlay reshuffle, a decompressed payload) therefore gets
+a distinct chunk, and identical bytes reuse one.
 
-### Stage 2 – IR to C translation (`compiler/ir_to_c.py`)
+## The translator (`compiler/`)
 
-`ir_to_c.py` consumes `program.ir.json` along with the source binary to
-structure control flow and emit C code:
+The same translator runs on every JIT compile. Given a byte image it produces
+one `<name>.c` exporting `<name>_dispatch`:
 
-- IR instructions are grouped into basic blocks (`BasicBlock`) and assembled
-  into a control-flow graph using `networkx` utilities from `compiler/cfg.py`.
-- Dominator and post-dominator analysis guide an iterative region-reduction
-  pass implemented in `compiler/patterns/`, recognising `if`/`else`, `switch`
-  statements and loops. These constructs are represented by the AST nodes in
-  `compiler/ast_nodes.py` before being rendered back into C.
-- Memory references are rewritten through helper macros such as `memw` and
-  `memb` provided by `runtime/include/shims.h`, preserving instrumentation
-  points like `SAFEPOINT()` while keeping the generated code compilable.
-- DOS interrupt preparations are coalesced into descriptive helper calls and
-  optional metadata files (passed with `--metadata`) inform naming of resident
-  control block fields.
+- **** — Capstone-decodes the image into `program.ir.json` plus
+  header/reloc/xref metadata. Computes each operand's default segment
+  (`BP`/`SP` → `SS`, else `DS`), entry points, and basic-block boundaries. A
+  `--max-insns` cap bounds runaway decodes; `--image-base` maps a single
+  segment's far targets to dump offsets; `--cs-base` sets the IP at file
+  offset 0.
+- **** — the translator proper. IR → basic blocks
+  () → CFG () → structured regions
+  (`patterns/`, ) → C. Memory operands become `memb`/`memw`
+  helper calls; instrumentation points (`SAFEPOINT()`) are preserved. **This is
+  where most translation bugs live.** An instruction the translator can't
+  emit **hard-fails loudly** (`[ir_to_c FATAL]`, exit non-zero) rather than
+  being silently dropped or stubbed — a failed translate means the decoder
+  walked into data (a wrong entry / bad transfer target), which is a bug to fix,
+  not to paper over.
+- **** — runs  then  on one
+  input, threading per-segment parameters (entries, `cs_base`, `image_base`,
+  `max_insns`) it reads from a `.json` sidecar. The JIT calls exactly this on
+  each live segment.
+- **** — the JIT's entry into the translator: writes the segment
+  dump + its sidecar and invokes .
+- **** — invoked by the runtime: runs , then
+  `clang` to build the `.so`, with the content-keyed cross-run cache.
+- **** — emits the per-program `GameConfig` C (image
+  path, PSP load segment, protected slots) from the one `<name>.json`. It
+  carries no dispatch table and no entry symbol — the runtime takes the entry
+  `cs:ip` from the MZ header and JITs from there.
 
-The translator prioritises correctness: unsupported instructions remain in the
-output as comments so the generated program mirrors the original behaviour even
-when manual follow-up is required.
+## The runtime (`runtime/`), layered
 
-## Key architecture decisions
+- **`core/`** — `shims.c` (the big integration surface: `memb`/`memw` writes,
+  `file_mappings`, the JIT registry + `dispatch_via_binary`, WATCHW
+  write-watchpoints, crash bundles, the function-patch registry, the trace/log
+  channel), `snapshot.c`, `save_manager.c`.
+- **`os/`** — `dos.c` (INT 21h: file I/O, memory alloc, console), `bios.c`
+  (INT 10h/16h, …), `mouse.c` (INT 33h).
+- **`hw/`** — device emulation split out of the shims: `io_bus.c`, `audio.c`,
+  `video.c`, `keyboard.c`, `timer.c`.
+- **`display/virtual_display_sdl.c`**, and the headers `include/shims.h` (the
+  helper macros the generated C calls) and `include/game_config.h`.
 
-- **JSON IR as the contract.** By emitting `program.ir.json` plus manifest and
-  cross-reference files, the disassembler decouples binary decoding from higher
-  level structuring. Subsequent improvements to the translator can reuse the
-  same IR without repeating the expensive Capstone pass.
-- **Graph-driven structuring.** Using `networkx` for dominator analysis and loop
-  detection allows the translator to make algorithmic decisions instead of
-  relying on brittle pattern heuristics.
-- **Runtime shims with logging hooks.** The generated C expects the helpers in
-  `runtime/include/shims.h` and `runtime/core/shims.c`. These wrappers centralise
-  DOS environment emulation, log memory accesses, and gate safe points so new
-  experiments can observe behaviour without modifying the lifted code.
-- **Manifest-guided automation.** `compiler/build_pipeline.py` batches work for
-  multiple binaries, reads `.json` sidecars for extra entry points, and enforces
-  timeouts so the pipeline remains usable in CI and local development.
-- **Comprehensive regression suite.** The `tests/` directory focuses on
-  individual translator capabilities (flag handling, loop formation, metadata
-  usage, etc.) and disassembler edge cases, catching regressions quickly.
+The generated C only ever calls into the fixed runtime ABI declared in
+`runtime/include/runtime_abi.h`; a contract test
+(`tests/the source`) fails if the translator emits a call to
+anything outside it.
 
-## Implementation map
+## Key design decisions
 
-The repository is organised so responsibilities stay focused:
+- **JIT-only, compile-on-demand.** No byte is decoded until control reaches it
+  with the bytes that are actually live there. This is what makes packed /
+  overlay / self-modifying code work without special-casing.
+- **Faithful emulation, no heuristic harnesses.** The JIT and shims model real
+  x86 / BIOS / hardware / DOS behaviour *exactly*; a wrong transfer/return/value
+  is a bug in our model to fix, not something to recover from with a guess. See
+  the working principles in `CLAUDE.md` and the in-progress
+  [faithful_dispatch_refactor.md](faithful_dispatch_refactor.md).
+- **Lossless JSON IR as the contract.** `program.ir.json` plus manifest and
+  cross-reference files decouple decoding from structuring, so translator
+  improvements reuse the same IR without repeating the Capstone pass.
+- **Graph-driven structuring.** `the DiGraph` dominator/post-dominator analysis
+  drives region reduction into `if`/`else`, `switch` and loops, rather than
+  brittle textual pattern matching.
 
-- `compiler/disassemble.py` – orchestrates the three analysis stages and writes
-  all artefacts needed for later steps.
-- `compiler/ir_to_c.py` – performs CFG construction, structuring, instruction
-  rendering and metadata integration when producing C output.
-- `compiler/cfg.py` – `networkx` backed helpers for CFG assembly, dominator
-  computation and loop detection.
-- `compiler/ast_nodes.py` – typed AST nodes (`BasicBlockNode`, `LoopNode`,
-  `ForLoopNode`, etc.) that render structured control flow.
-- `compiler/patterns/` – pattern detectors for loops, conditionals and switch
-  statements used during region reduction.
-- `runtime/include/shims.h`, `runtime/core/shims.c`,
-  `runtime/display/virtual_display_sdl.c` – runtime surface exposing hardware
-  abstractions, logging helpers and SDL output so the generated C can run.
-- `compiler/build_pipeline.py` – batch front-end that mirrors CI behaviour.
-- `tests/` – pytest suite covering both disassembly and translation logic.
+## Freezing (future)
+
+The end goal is to collect the JIT-discovered chunks and link them into a fully
+static native build with no runtime the reference or clang. The runtime dispatch tables
+(`GameConfig.binary_dispatch`, the `DispatchFn` ABI in
+`runtime/include/game_config.h`) are retained NULL-but-shaped for that freeze to
+populate; today they are empty and every address routes through the JIT.
+
+## Where things live
+
+The toolchain is Rust (ported from the former `compiler/*.py`,
+validated byte-identical). The `saisei-jitc` crate is the translator + JIT; the
+`saisei` crate is the launcher.
+
+- `saisei-jitc/src/disassemble.rs` – byte image → IR + metadata.
+- `saisei-jitc/src/ir_to_c.rs` – IR → CFG → structured C.
+- `saisei-jitc/src/cfg.rs` + `graph.rs` – insertion-ordered DiGraph helpers for CFG assembly and dominators.
+- `saisei-jitc/src/ast.rs` – typed AST nodes that render structured control flow.
+- `saisei-jitc/src/patterns.rs` – region detectors (loops, conditionals, switch).
+- `saisei-jitc` subcommands `disasm` / `emit-c` / `jit-compile` – the JIT's translate → compile path.
+- `saisei/` – the `saisei` launcher (build/run/play/new-game/…) + `generate_game_config`.
+- `runtime/` – the C runtime (`core/`, `os/`, `hw/`, `display/`, `include/`).
+- `saisei-jitc/tests/` + `saisei/tests/` – `cargo test` over the
+  translator and the runtime shims (the latter compiled per-test and driven via
+  dlopen/FFI).
 
 ## Building on the pipeline
 
-- **Adding new analysis:** Extend `compiler/disassemble.py` to emit additional
-  metadata and expose it through `program.ir.json`. Downstream consumers will
-  automatically pick up the new fields.
-- **Improving translation quality:** Introduce new structuring patterns in
-  `compiler/patterns/` or new AST node renderers to produce cleaner C without
-  sacrificing fidelity.
-- **Augmenting runtime behaviour:** Update the shim implementations to log more
-  state, inject debugging hooks or emulate additional hardware features. Because
-  generated programs call into these helpers, enhancements remain isolated from
-  the lifted code.
-
-This separation between decoding, structuring and runtime support keeps the
-system adaptable while ensuring regenerated artefacts remain reproducible.
+- **Adding translation coverage:** implement the missing instruction/handler in
+   (an unsupported op hard-fails with the exact
+  mnemonic + address), or add a structuring pattern under `compiler/patterns/`.
+- **Extending the runtime:** implement the missing DOS/BIOS/hardware behaviour
+  in `runtime/os/` or `runtime/hw/`; the next run re-JITs affected chunks
+  automatically (the toolchain hash invalidates stale ones).
+- **Diagnosing corruption:** add an address to `write_watches[]` in `shims.c`
+  and the next crash bundle's `lifecycle.log` names the writer's `cs:ip` +
+  registers. A change is validated by the real program reaching its known scene
+  — screenshot it (`--screenshot-secs N`), don't rely on unit tests alone.

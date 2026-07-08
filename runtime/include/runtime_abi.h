@@ -2,7 +2,7 @@
 /* ===========================================================================
  * runtime_abi.h — the CONTRACT between generated code and the runtime.
  *
- * The translator (scripts/ir_to_c.py) lowers each DOS binary to C under
+ * The translator lowers each DOS binary to C under
  * the artifacts tree. That generated code is only allowed to call into the
  * hand-written runtime (scripts/shims.c) through the fixed surface listed
  * below. Keeping that surface explicit is what lets the two sides evolve
@@ -19,7 +19,7 @@
  * shims.h (which #includes this file); physically relocating them here is a
  * follow-up. What is authoritative TODAY is the machine-readable symbol
  * manifest below: it is the single source of truth for "what may generated
- * code call", and it is enforced by tests/test_runtime_abi_contract.py, which
+ * code call", and it is enforced by tests/the source, which
  * fails if the translator emits a call to anything not listed here.
  *
  * To add a runtime entry point for generated code: declare it in shims.h AND

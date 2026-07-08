@@ -1,0 +1,22 @@
+[package]
+name = "saisei"
+version = "0.0.0"
+edition = "2021"
+description = "Saisei launcher CLI ( + the source + the source + the source)."
+
+[lib]
+name = "saisei"
+path = "src/lib.rs"
+
+[[bin]]
+name = "saisei"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
+# 's crash-bundle dir-name / dos_open failure regexes.
+regex = "1"
+# forkpty/select for the source port.
+libc = "0.2"
+# the image crate for the source's screenshot crop/upscale.
+image = { version = "0.25", default-features = false, features = ["png"] }

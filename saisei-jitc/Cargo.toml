@@ -1,0 +1,33 @@
+[package]
+name = "saisei-jitc"
+version = "0.0.0"
+edition = "2021"
+description = "Saisei JIT translator (Rust port of compiler/). Decodes an in-memory x86 region to the lossless JSON IR and, eventually, to C."
+
+[[bin]]
+name = "saisei-jitc"
+path = "src/main.rs"
+
+[dependencies]
+# Same libcapstone as the reference capstone 5.0.7 — verified byte-identical decode.
+capstone = "0.12"
+# Pinned to the version `capstone` 0.12 links, so cargo unifies the crate and we
+# can read the raw cs_x86.eflags union (not exposed by the high-level API).
+capstone-sys = "=0.16.0"
+# preserve_order => IndexMap-backed objects => byte-identical to json.dumps(indent=2).
+serde_json = { version = "1", features = ["preserve_order"] }
+base64 = "0.22"
+# Exact 's _parse_imm / jump-table regexes.
+regex = "1"
+# Content-sha cache keys for the JIT orchestrator (the source port).
+sha2 = "0.10"
+# Insertion-ordered maps/sets: a insertion-ordered DiGraph for the structured
+# renderer (the source / patterns/) needs deterministic adjacency iteration order.
+indexmap = "2"
+
+[dev-dependencies]
+# dlopen the freshly-built runtime shim .so for the ported C-shim tests
+# (Rust equivalents of tests/the source, previously FFI-driven).
+libloading = "0.8"
+# fd-level stdout capture (SAISEI_VERBOSE log assertions) + C types.
+libc = "0.2"

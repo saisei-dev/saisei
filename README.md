@@ -1,110 +1,68 @@
 # Saisei
 
-*Saisei* (再生 — "regeneration / playback") is a JIT binary recompiler for DOS MZ
-executables. The runtime loads a program image, takes the entry point from its
-MZ header, and — as control reaches each code segment — decodes the live bytes
-to a lossless IR, translates that to C, compiles it with clang, and dlopens it.
-Nothing is decoded ahead of time; the translated C *is* the program, and
-packed / overlay / self-modifying code just works because it is compiled on
-demand as it executes.
+**再生 — "rebirth."** Take a DOS game you loved, and bring it back to life as real, native code.
 
-## Bring your own program
+The classics you grew up with are frozen in old binaries — playable only through an emulator, and a black box even then. Saisei thaws them out. As a game runs, Saisei decompiles it into readable C, compiles that with clang, and runs *it*. The translated C **is** the game. No emulator sits in the middle — and nothing stays a black box.
 
-No programs are bundled with this repository. Point Saisei at any DOS MZ
-executable you have the right to use — bootstrap a bundle from a URL, `.zip`, or
-local directory:
+So a game stops being a sealed artifact and becomes something you can open up:
 
-```bash
-saisei new-game <archive-url-or-path> --exe YOURGAME.EXE
-```
+- ▶️ **Play** — run the classics as fast, native programs.
+- 🔍 **Explore** — read the C Saisei generates and finally see how your favorite game actually works.
+- 🎨 **Remake** *(WIP)* — swap the art, remix the music, rewrite the gameplay, and ship your own cut.
 
-This creates `games/<name>/` with a `<name>.json` config. See
-[Driving a program](docs/playing.md) for details.
+Packed, overlay-swapped, and self-modifying games all just work, because Saisei only ever compiles the bytes that are about to run. Old games don't have to stay frozen — give them a second life.
 
-## Licensing
+## Start playing
 
-This repository is released under the MIT License. See [LICENSE](LICENSE). The
-license covers the recompiler and runtime only — the DOS programs you run
-through it are yours and are never included here.
-
-## Prerequisites
-
-System packages (not pip-installable):
-
-- Python 3.10 or later
-- `clang` — the runtime compiles generated C, at build time and on the fly (JIT)
-- **SDL2** (dev headers) — the runtime links against it for the viewer window
+Set up once. You'll need the reference 3.10+, `clang`, and SDL2:
 
 ```bash
-# Debian/Ubuntu
-sudo apt install python3-venv clang libsdl2-dev pkg-config
-# macOS (Homebrew)
-brew install llvm sdl2 pkg-config
+# Debian/Ubuntu:  sudo apt install clang libsdl2-dev libcapstone-dev pkg-config
+# macOS:          brew install llvm sdl2 capstone pkg-config
+# Rust:           https://rustup.rs
+
+# Build the toolchain (the `saisei` + `saisei-jitc` binaries):
+cargo build --release
+# Put it on your PATH (or invoke target/release/saisei directly):
+export PATH="$PWD/target/release:$PATH"
 ```
 
-## Install
-
-Create a virtual environment and install the project editable. This gives you
-the `saisei` command and puts the packages on the path, so you no longer need to
-`export PYTHONPATH` or invoke `tools/game.py` by file:
+Then bring a game. Grab one from an abandonware archive like [My Abandonware](https://www.myabandonware.com/) and hand Saisei the link:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .            # core (capstone, networkx)
-pip install -e ".[dev]"     # + pytest, flake8, pillow — to work on the pipeline
-make hooks                  # enable the flake8 pre-commit hook (contributors)
+saisei new-game "https://.../coolgame.zip"
+saisei play coolgame
 ```
 
-## Linting
+`new-game` unpacks the archive — and asks which executable to run if there's more than one. `play` opens the game in a window, compiling each part to native code the moment control reaches it. No config files, no flags to weigh.
 
-`flake8` is required and enforced — CI fails the build on any violation, and
-`make hooks` installs a pre-commit hook that blocks commits that don't lint.
-Rules live in [`.flake8`](.flake8) (max line length 100). Run it any time with:
+Two more commands for when you need them: `saisei run <name> --headless` runs without a window (for scripting and CI), and `saisei build <name>` compiles without running. To drive a game from a script — keystrokes, screenshots, deterministic replay — see [Driving a program](docs/playing.md).
+
+## Where Saisei is going
+
+Playing is the front door. The point is to make these games **open to tinker with** again — that's the direction:
+
+- 🤖 **Explore a game with an AI agent** *(WIP)* — turn the generated C into a map of how a game works. *(guide coming soon)*
+- 🩹 **Write patches** *(WIP)* — small, shareable mods that hook a game's own functions with no source changes. → [patch bundles](patches/README.md)
+- 🎨 **Replace art, music, and gameplay** *(WIP)* — swap a game's resources and behavior while it runs. *(coming soon)*
+- ❄️ **Freeze to a standalone binary** *(WIP)* — collect the compiled pieces into one native executable for the target of your choice: desktop (Linux, macOS, Windows) and eventually mobile (Android, iOS), with no the reference or clang required to run it. Your childhood DOS game, native on your phone. *(coming soon)*
+
+*(WIP = work in progress. These are the direction, not promises with dates — links land here as each one ships.)*
+
+## How it works
+
+At run time Saisei loads the program image, takes the entry point from the MZ header, and JIT-compiles each code segment the first time control reaches it: decode → lossless IR → C → clang → `dlopen`. Nothing is decoded ahead of time, and compiled chunks are keyed by the bytes that are actually live — so a decompressed or overlaid region is recompiled from whatever is really there. The full design is in the [architecture overview](docs/architecture.md).
+
+## Contributing
+
+Saisei is early and there's plenty to build. Set up the dev tooling once:
 
 ```bash
-make lint
+git config core.hooksPath .githooks   # runs `cargo fmt --check` before each commit
 ```
 
-## Using the toolchain
+Run `cargo fmt` and `cargo test` (with `SAISEI_CAPSTONE_LIB_DIR` set to your Capstone lib dir) before you push. Start with the [architecture overview](docs/architecture.md) and the [runtime memory model](docs/runtime_memory_model.md).
 
-Bundles live under `games/<name>/` with a `<name>.json` config. The `saisei`
-command has one entry point with subcommands:
+## License
 
-```bash
-saisei new-game <archive> --exe FOO.EXE   # bootstrap a bundle
-saisei build <name>                       # emit the config + link the runtime
-saisei run   <name> --headless            # build + run (headless = no window)
-saisei play  <name>                       # build + run in the SDL window
-saisei run   <name> --program setup       # multi-program bundles
-```
-
-The unpackaged form still works without installing — `export PYTHONPATH=$PWD`
-then `python3 tools/game.py <command>` — and the `Makefile` targets below need
-no install at all.
-
-`build` does not decode anything ahead of time — it emits the per-program config
-and links the runtime. All program code is JIT-compiled at run time into
-`build/<name>/jit/` (cached by segment-bytes SHA + toolchain hash). Useful `run`
-flags: `--silent`, `--trace-file <path>`, `--lifecycle-file <path>`. Set
-`SAISEI_SCREENSHOT_SECS=N` to auto-dump PNG screenshots to
-`build/<name>/screenshots/`.
-
-## Make targets
-
-The `Makefile` is a thin JIT-only wrapper over `tools/game.py`. Pass the bundle
-name with `GAME=<name>`:
-
-```bash
-make new-game ARGS="<archive-url> --exe FOO.EXE"   # bootstrap a bundle
-make build GAME=<name>       # build
-make run   GAME=<name>       # build + run headless
-make play  GAME=<name>       # SDL viewer
-```
-
-## Further reading
-
-- [Architecture and implementation overview](docs/architecture.md)
-- [Runtime memory model](docs/runtime_memory_model.md)
-- [Driving a program programmatically](docs/playing.md)
-- [Writing patch bundles](patches/README.md)
+Saisei is released under the MIT License — see [LICENSE](LICENSE). The license covers the recompiler and runtime only. The DOS games you run through it are yours; you are responsible for having the right to use them, and none are ever included here.
