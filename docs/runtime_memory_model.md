@@ -113,7 +113,7 @@ The principled solution. Maintain a `mem_tags[MEMORY_SIZE]` shadow array
 where each byte stores its source `(file_id, file_offset)`. Augment every
 register with a shadow `r_tag_<reg>` that records "this value came from
 linear address X". Generate `memw_tagged_read(seg, off, &r_tag_dst)` and
-`memw_write_tagged(seg, off, val, r_tag_src)` from ir_to_c so the tag
+`memw_write_tagged(seg, off, val, r_tag_src)` from the chunk emitter so the tag
 propagates through every register-mediated copy. Arithmetic ops clear
 the tag. `dispatch_via_binary` queries `mem_tags[addr]` instead of
 `find_file_mapping(addr)`.
@@ -123,7 +123,7 @@ manual swap, decryptor loops, byte-at-a-time writes — anything that
 flows a value from one address to another through a register). No
 pattern matching needed.
 
-Cons: invasive ir_to_c change (every emitted `memw()` / `memw_write()`
+Cons: invasive codegen change (every emitted `memw()` / `memw_write()`
 call site must thread the tag); ~8 MB shadow memory for 2 MB virtual
 memory; care needed for arithmetic-on-pointers cases where the tag
 "should" propagate but the value technically went through ALU.

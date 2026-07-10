@@ -337,7 +337,7 @@ pub fn main(root: &Path, args: &[String]) -> ! {
     }
     println!("\nprobe: building bundle '{name}' (emit config + link runtime)...");
     let game = crate::load_game_definition(root, &name, None);
-    crate::build(root, &game); // dies on clang failure
+    crate::build(root, &game); // dies on build failure
     println!("\nprobe: OK -- bundle '{name}' builds.\n  next: saisei run {name} --headless   to see it boot.");
     exit(0);
 }

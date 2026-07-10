@@ -8,8 +8,8 @@ contributors can build on top of it with confidence.
 A **JIT binary recompiler** for DOS MZ executables. The runtime loads a
 program image, takes the entry `cs:ip` from its MZ header, and — the first time
 control reaches any code segment — dumps the live 64 KB, decodes it to a
-lossless JSON IR, structures that into C, compiles it with clang, and `dlopen`s
-the result. The translated C *is* the program.
+lossless JSON IR, emits it as Rust, compiles it with rustc, and `dlopen`s
+the result. The translated Rust *is* the program.
 
 There is **no interpreter, no external emulator, and no ahead-of-time
 whole-image decode**. Code is discovered and compiled on demand as the program
@@ -20,7 +20,7 @@ control reaches it are the bytes that get compiled.
 ## The run loop (compile-on-demand)
 
 The runtime's top-level loop is `run_machine` → `resolve_and_run_chunk`
-(`runtime/core/shims.c`):
+(`runtime/src/shims.rs`):
 
 1. Resolve the live `cs:ip` to the JIT chunk that owns it.
 2. If no chunk covers it, dump the live 64 KB segment (based at `cs<<4`) to
@@ -35,61 +35,74 @@ linear byte has an origin `(file, file_offset)` tracked in `file_mappings[]` —
 described in [runtime_memory_model.md](runtime_memory_model.md).
 
 Chunks are cached on disk at
-`build/<name>/jit/jit_<segbase>_<offset>_<contentsha>.{c,so,sha,...}`, keyed on
+`build/<name>/jit/jit_<segbase>_<offset>_<contentsha>.{rs,so,sha,...}`, keyed on
 the **segment bytes' SHA plus a toolchain hash**. The same `seg:ip` decoding
 *different* bytes (an overlay reshuffle, a decompressed payload) therefore gets
 a distinct chunk, and identical bytes reuse one.
 
-## The translator (`compiler/`)
+## The translator (`saisei-jitc/`)
 
 The same translator runs on every JIT compile. Given a byte image it produces
-one `<name>.c` exporting `<name>_dispatch`:
+one chunk `.rs` exporting `<name>_dispatch`:
 
-- **** — Capstone-decodes the image into `program.ir.json` plus
+- **`disassemble.rs`** — Capstone-decodes the image into `program.ir.json` plus
   header/reloc/xref metadata. Computes each operand's default segment
   (`BP`/`SP` → `SS`, else `DS`), entry points, and basic-block boundaries. A
   `--max-insns` cap bounds runaway decodes; `--image-base` maps a single
   segment's far targets to dump offsets; `--cs-base` sets the IP at file
   offset 0.
-- **** — the translator proper. IR → basic blocks
-  () → CFG () → structured regions
-  (`patterns/`, ) → C. Memory operands become `memb`/`memw`
-  helper calls; instrumentation points (`SAFEPOINT()`) are preserved. **This is
-  where most translation bugs live.** An instruction the translator can't
-  emit **hard-fails loudly** (`[ir_to_c FATAL]`, exit non-zero) rather than
-  being silently dropped or stubbed — a failed translate means the decoder
-  walked into data (a wrong entry / bad transfer target), which is a bug to fix,
-  not to paper over.
-- **** — runs  then  on one
-  input, threading per-segment parameters (entries, `cs_base`, `image_base`,
-  `max_insns`) it reads from a `.json` sidecar. The JIT calls exactly this on
-  each live segment.
-- **** — the JIT's entry into the translator: writes the segment
-  dump + its sidecar and invokes .
-- **** — invoked by the runtime: runs , then
-  `clang` to build the `.so`, with the content-keyed cross-run cache.
-- **** — emits the per-program `GameConfig` C (image
-  path, PSP load segment, protected slots) from the one `<name>.json`. It
+- **`translate.rs`** — the shared translation front-half: IR instruction
+  utilities, operand rewriting (memory operands become `memb`/`memw` accessor
+  calls; RCB and exec_params fields get their names; `[bp±N]` becomes stack
+  vars), flag normalization, basic blocks and CFG successors.
+- **`codegen.rs`** — the chunk emitter. IR → a flat pc-state-machine
+  (`loop { match pc { … } }`, one match arm per basic block; every instruction
+  is preceded by `set_ip(…)` + `SAFEPOINT()`), plus a `#[no_mangle]` `_impl`
+  wrapper per function. **This is where most translation bugs live.** An
+  instruction the emitter can't express **hard-fails loudly** (`Unsupported`,
+  a fatal JIT error) rather than being silently dropped or stubbed — a failed
+  translate means either a missing handler (extend `codegen.rs`) or the decoder
+  walked into data (a wrong entry / bad transfer target), a bug to fix, not to
+  paper over.
+- **`jit-compile` subcommand** — invoked by the runtime: disassembles the
+  segment dump, emits the chunk Rust, drops the `saisei_rt.rs` prelude beside
+  it, and compiles the `.so` with rustc, with the content-keyed cross-run
+  cache. (`disasm` and `emit` run the two halves standalone.)
+- **`generate_game_config`** (in `saisei/`) — emits the per-program
+  `GameConfig` Rust data file (image path, PSP load segment, protected slots)
+  from the one `<name>.json`; the `saisei-game` bin crate `include!`s it. It
   carries no dispatch table and no entry symbol — the runtime takes the entry
   `cs:ip` from the MZ header and JITs from there.
 
-## The runtime (`runtime/`), layered
+Every chunk `include!`s the prelude **`saisei-jitc/rt/saisei_rt.rs`** — the
+Rust view of the runtime ABI: it binds the shared `cpu` global, the
+`memb`/`memw`/shim call surface, and faithful inline helpers (`parity8`,
+`xor8`/`xor16`, `linear_addr`). The prelude's `#[repr(C)]` layouts and the
+runtime's struct definitions must be edited together; the prelude is embedded
+in the `saisei-jitc` binary, so the toolchain hash covers it.
 
-- **`core/`** — `shims.c` (the big integration surface: `memb`/`memw` writes,
-  `file_mappings`, the JIT registry + `dispatch_via_binary`, WATCHW
-  write-watchpoints, crash bundles, the function-patch registry, the trace/log
-  channel), `snapshot.c`, `save_manager.c`.
-- **`os/`** — `dos.c` (INT 21h: file I/O, memory alloc, console), `bios.c`
-  (INT 10h/16h, …), `mouse.c` (INT 33h).
-- **`hw/`** — device emulation split out of the shims: `io_bus.c`, `audio.c`,
-  `video.c`, `keyboard.c`, `timer.c`.
-- **`display/virtual_display_sdl.c`**, and the headers `include/shims.h` (the
-  helper macros the generated C calls) and `include/game_config.h`.
+## The runtime (`runtime/`, crate `saisei-runtime`)
 
-The generated C only ever calls into the fixed runtime ABI declared in
-`runtime/include/runtime_abi.h`; a contract test
-(`tests/the source`) fails if the translator emits a call to
-anything outside it.
+- **`shims.rs`** — the big integration surface: the machine loop, `memb`/`memw`
+  writes, `file_mappings`, the JIT registry + `dispatch_via_binary`, IRQ
+  delivery, WATCHW write-watchpoints, crash bundles, the function-patch
+  registry, the trace/log channel. Entry point `saisei_main` (the `saisei-game`
+  bin's Rust `main` calls it with C argv).
+- **`dos.rs`** (INT 21h: file I/O, memory alloc, console), **`bios.rs`**
+  (INT 10h/16h, …), **`mouse.rs`** (INT 33h).
+- Device emulation: **`io_bus.rs`**, **`audio.rs`**, **`video.rs`**,
+  **`keyboard.rs`**, **`timer.rs`**; display: **`sdl.rs`**; persistence:
+  **`snapshot.rs`**, **`save_manager.rs`** (their `#[repr(C)]` layouts are
+  frozen — snapshots serialize them byte-for-byte).
+- Built as an rlib (linked into the `saisei-game` binary, `-rdynamic` so chunk
+  `.so`s resolve shims from the host) and as a cdylib (`libsaisei_runtime.so`,
+  dlopen'd in isolated copies by the shim unit tests). Port history and
+  deliberate deviations from the original C runtime:
+  [runtime_port_notes.md](runtime_port_notes.md).
+
+The generated Rust only ever calls the fixed runtime ABI the prelude declares;
+a contract test (`saisei-jitc/tests/ported_base_e.rs`, `runtime_abi_contract`)
+fails if the emitter produces a call to anything outside it.
 
 ## Key design decisions
 
@@ -102,47 +115,48 @@ anything outside it.
   the working principles in `CLAUDE.md` and the in-progress
   [faithful_dispatch_refactor.md](faithful_dispatch_refactor.md).
 - **Lossless JSON IR as the contract.** `program.ir.json` plus manifest and
-  cross-reference files decouple decoding from structuring, so translator
+  cross-reference files decouple decoding from emission, so translator
   improvements reuse the same IR without repeating the Capstone pass.
-- **Graph-driven structuring.** `the DiGraph` dominator/post-dominator analysis
-  drives region reduction into `if`/`else`, `switch` and loops, rather than
-  brittle textual pattern matching.
+- **Flat pc-state-machine chunks.** Each basic block is a match arm keyed on
+  its cs-relative address; control flow is explicit `pc = …; continue;`
+  transfers. No structuring pass sits between the IR and the emitted code, so
+  the chunk's control flow is exactly the program's.
 
 ## Freezing (future)
 
 The end goal is to collect the JIT-discovered chunks and link them into a fully
-static native build with no runtime the reference or clang. The runtime dispatch tables
-(`GameConfig.binary_dispatch`, the `DispatchFn` ABI in
-`runtime/include/game_config.h`) are retained NULL-but-shaped for that freeze to
-populate; today they are empty and every address routes through the JIT.
+static native build with no runtime compiler at all. The runtime dispatch
+tables (`GameConfig.binary_dispatch`, the `DispatchFn` ABI) are retained
+NULL-but-shaped for that freeze to populate; today they are empty and every
+address routes through the JIT.
 
 ## Where things live
 
-The toolchain is Rust (ported from the former `compiler/*.py`,
-validated byte-identical). The `saisei-jitc` crate is the translator + JIT; the
-`saisei` crate is the launcher.
+Everything is Rust (nightly, pinned by `rust-toolchain.toml`); the only C in
+the tree is the vendored capstone disassembler (`vendor/capstone-sys`, built
+statically inside cargo).
 
 - `saisei-jitc/src/disassemble.rs` – byte image → IR + metadata.
-- `saisei-jitc/src/ir_to_c.rs` – IR → CFG → structured C.
-- `saisei-jitc/src/cfg.rs` + `graph.rs` – insertion-ordered DiGraph helpers for CFG assembly and dominators.
-- `saisei-jitc/src/ast.rs` – typed AST nodes that render structured control flow.
-- `saisei-jitc/src/patterns.rs` – region detectors (loops, conditionals, switch).
-- `saisei-jitc` subcommands `disasm` / `emit-c` / `jit-compile` – the JIT's translate → compile path.
+- `saisei-jitc/src/translate.rs` – the shared translation front-half.
+- `saisei-jitc/src/codegen.rs` – IR → chunk Rust (the pc-state-machine emitter).
+- `saisei-jitc/rt/saisei_rt.rs` – the chunk prelude (runtime ABI + `cpu` binding).
+- `saisei-jitc` subcommands `disasm` / `emit` / `jit-compile` – the JIT's translate → compile path.
 - `saisei/` – the `saisei` launcher (build/run/play/new-game/…) + `generate_game_config`.
-- `runtime/` – the C runtime (`core/`, `os/`, `hw/`, `display/`, `include/`).
-- `saisei-jitc/tests/` + `saisei/tests/` – `cargo test` over the
-  translator and the runtime shims (the latter compiled per-test and driven via
-  dlopen/FFI).
+- `saisei-game/` – the thin per-game bin crate (runtime rlib + generated config).
+- `runtime/` – the runtime crate (`saisei-runtime`).
+- `saisei-jitc/tests/` + `saisei/tests/` – `cargo test` over the translator and
+  the runtime shims (the latter driven via dlopen/FFI on the runtime cdylib).
 
 ## Building on the pipeline
 
-- **Adding translation coverage:** implement the missing instruction/handler in
-   (an unsupported op hard-fails with the exact
-  mnemonic + address), or add a structuring pattern under `compiler/patterns/`.
+- **Adding translation coverage:** implement the missing instruction handler in
+  `saisei-jitc/src/codegen.rs` (an unsupported op hard-fails with the exact
+  mnemonic; reproduce offline with `saisei-jitc emit` or the `gap_sweep` test).
 - **Extending the runtime:** implement the missing DOS/BIOS/hardware behaviour
-  in `runtime/os/` or `runtime/hw/`; the next run re-JITs affected chunks
-  automatically (the toolchain hash invalidates stale ones).
-- **Diagnosing corruption:** add an address to `write_watches[]` in `shims.c`
-  and the next crash bundle's `lifecycle.log` names the writer's `cs:ip` +
-  registers. A change is validated by the real program reaching its known scene
-  — screenshot it (`--screenshot-secs N`), don't rely on unit tests alone.
+  in `runtime/src/`; the next run re-JITs affected chunks automatically (the
+  toolchain hash invalidates stale ones).
+- **Diagnosing corruption:** add an address to `write_watches[]` in
+  `runtime/src/shims.rs` and the next crash bundle's `lifecycle.log` names the
+  writer's `cs:ip` + registers. A change is validated by the real program
+  reaching its known scene — screenshot it (`--screenshot-secs N`), don't rely
+  on unit tests alone.

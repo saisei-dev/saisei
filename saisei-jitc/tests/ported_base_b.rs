@@ -1,10 +1,36 @@
+#![allow(non_snake_case)]
 //! Ported from tests/test_*.py — df_steps, dispatch_helper, distinct_mem_refs,
 //! div, dos_api, dx_in_branch, empty_header_loop, enter_leave,
 //! extra_instructions, flag_reset, flag_setting, for_loop, inc_dec_flags,
 //! inc_dec_jcc_memory, io, iret, jcc_memory_operand.
+//!
+//! PORT DISPOSITIONS (C backend deleted):
+//!   ported:    38 tests — C-text assertions rewritten against the Rust chunk
+//!              backend (`render_rs`); purely C-structural assertions
+//!              (for/while/do-while shape, if-body nesting, extra_func_blocks,
+//!              renderer() pokes) dropped from otherwise-ported tests:
+//!              dispatch_helper__preserves_multiple_statements (semantic core
+//!              kept: 0x0200 arm + mov/inc bodies; extra_func_blocks machinery
+//!              dropped), dx_in_branch (if-nesting -> arm containment),
+//!              empty_header_loop (while(1) -> pc back-edges),
+//!              flag_setting__* (do-while -> CF write + branch + back-edge),
+//!              for_loop__* (for(...) headers -> arithmetic blocks, branch
+//!              conditions, pc back-edges).
+//!   collapsed: dos_api__dos_write_char_passes_argument,
+//!              dos_api__dos_close_file_passes_bx,
+//!              dos_api__dos_exit_preserves_ah_after_al_write
+//!              — the Rust backend does not specialize int 21h per AH (every
+//!              int 21h emits `dos_api();`, registers are written immediately
+//!              beforehand); family represented by the two kept tests
+//!              (dos_direct_console_io_uses_dl, dos_string_pointer_...).
+//!   deleted:   (none)
+//!   unchanged: distinct_mem_refs__do_not_clobber_condition,
+//!              flag_reset__readwrite_mem_access_clobbers_cmp_before_jcc
+//!              — they test translate::normalize_flags directly (the shared
+//!              front-half), not C text.
 mod common;
 use common::*;
-use saisei_jitc::ir_to_c;
+use saisei_jitc::translate;
 use serde_json::{json, Value};
 
 /// Wrap a single instruction (at 0x0000) followed by a ret at 0x0010 — mirrors
@@ -19,8 +45,21 @@ fn wrap(mnemonic: &str, op_str: &str, bytes: &str) -> Value {
 }
 
 /// Convert a json object Value into an `Insn` (serde_json Map) for normalize_flags.
-fn to_insn(v: Value) -> ir_to_c::Insn {
+fn to_insn(v: Value) -> translate::Insn {
     v.as_object().expect("insn must be a JSON object").clone()
+}
+
+/// Slice out one dispatch-match arm (`0xNNNN => { ... }`) from a chunk text.
+/// Arms close with a brace at 12-space indent; inner blocks are deeper.
+fn arm(src: &str, addr: i64) -> String {
+    let key = format!("0x{addr:04X} => {{");
+    src.split(&key)
+        .nth(1)
+        .unwrap_or_else(|| panic!("arm {key} must exist in:\n{src}"))
+        .split("\n            }")
+        .next()
+        .unwrap()
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -36,10 +75,16 @@ fn df_steps__lodsb_decrements_si_when_df_set() {
             {"address": 0x0002, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-    let src = render_c(&func, &[], "");
-    assert!(src.contains("DF = 1;"), "{src}");
-    assert!(src.contains("int delta = DF ? -1 : 1;"), "{src}");
-    assert!(src.contains("si = (si + delta) & 0xFFFF;"), "{src}");
+    let src = render_rs(&func, &[], "");
+    assert!(src.contains("set_DF(1);"), "{src}");
+    assert!(
+        src.contains("let delta: i32 = if DF() != 0 { -1 } else { 1 };"),
+        "{src}"
+    );
+    assert!(
+        src.contains("set_si(((si() as i32 + delta) & 0xFFFF) as u16);"),
+        "{src}"
+    );
 }
 
 #[test]
@@ -53,11 +98,24 @@ fn df_steps__movsb_decrements_regs_when_df_set() {
             {"address": 0x0002, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-    let src = render_c(&func, &[], "");
-    assert!(src.contains("DF = 1;"), "{src}");
-    assert!(src.contains("int delta = DF ? -1 : 1;"), "{src}");
-    assert!(src.contains("si = (si + delta) & 0xFFFF;"), "{src}");
-    assert!(src.contains("di = (di + delta) & 0xFFFF;"), "{src}");
+    let src = render_rs(&func, &[], "");
+    assert!(src.contains("set_DF(1);"), "{src}");
+    assert!(
+        src.contains("let delta: i32 = if DF() != 0 { -1 } else { 1 };"),
+        "{src}"
+    );
+    assert!(
+        src.contains("memb_write(es(), di(), memb(ds(), si()));"),
+        "{src}"
+    );
+    assert!(
+        src.contains("set_si(((si() as i32 + delta) & 0xFFFF) as u16);"),
+        "{src}"
+    );
+    assert!(
+        src.contains("set_di(((di() as i32 + delta) & 0xFFFF) as u16);"),
+        "{src}"
+    );
 }
 
 #[test]
@@ -71,11 +129,11 @@ fn df_steps__rep_movsw_decrements_regs_when_df_set() {
             {"address": 0x0003, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-    let src = render_c(&func, &[], "");
+    let src = render_rs(&func, &[], "");
     // std still sets DF; the rep movsw itself is emitted as a call to the
     // rep_movsw_block shim, which reads DF for its step direction.
-    assert!(src.contains("DF = 1;"), "{src}");
-    assert!(src.contains("rep_movsw_block(es, ds);"), "{src}");
+    assert!(src.contains("set_DF(1);"), "{src}");
+    assert!(src.contains("rep_movsw_block(es(), ds());"), "{src}");
 }
 
 // ---------------------------------------------------------------------------
@@ -83,44 +141,32 @@ fn df_steps__rep_movsw_decrements_regs_when_df_set() {
 
 #[test]
 fn dispatch_helper__preserves_multiple_statements() {
+    // The jmp hands control to the 0x0200 block; all statements of that block
+    // (mov, the full inc flag block, the near-ret epilogue) live in its arm.
     let func = json!({
         "start": 0x0100,
         "instructions": [
-            {"address": 0x0100, "mnemonic": "jmp", "op_str": "0200", "bytes": "E9FD01"},
+            {"address": 0x0100, "mnemonic": "jmp", "op_str": "0200",
+             "target": 0x0200, "bytes": "E9FD01"},
             {"address": 0x0200, "mnemonic": "mov", "op_str": "ax, bx", "bytes": "89D8"},
             {"address": 0x0203, "mnemonic": "inc", "op_str": "ax", "bytes": "40"},
             {"address": 0x0204, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-
-    let mut r = renderer("");
-    r.func_names.insert(0x0200, "label_0200".into());
-    r.render_function_c(&func, &known(&[0x0100]));
-
-    let helper_lines = r
-        .extra_func_blocks
-        .get(&0x0200)
-        .expect("extra_func_blocks[0x0200] must exist");
-    assert_eq!(helper_lines[0], "    ip = 0x0200;");
+    let src = render_rs(&func, &[], "");
+    // the entry block transfers to 0x0200
+    assert!(src.contains("pc = 0x0200;"), "{src}");
+    let body = arm(&src, 0x0200);
+    assert!(body.contains("set_ax(bx());"), "{body}");
+    // the inc-ax flag block is preserved in full
+    assert!(body.contains("let old: u32 = (ax()) as u32;"), "{body}");
     assert!(
-        helper_lines.iter().any(|l| l == "    ax = bx;"),
-        "{helper_lines:?}"
+        body.contains("set_ax((old.wrapping_add(1) & 0xFFFF) as u16);"),
+        "{body}"
     );
-    assert!(
-        helper_lines
-            .iter()
-            .any(|l| l == "        ax = (ax + 1) & 0xFFFF;"),
-        "{helper_lines:?}"
-    );
-    // The ret now lowers to the near_ret_tail epilogue block, whose closing
-    // brace is the final line of the helper.
-    assert!(
-        helper_lines
-            .iter()
-            .any(|l| l == "        near_ret_tail(popped_ip, expected_retip);"),
-        "{helper_lines:?}"
-    );
-    assert_eq!(helper_lines[helper_lines.len() - 1], "    }");
+    assert!(body.contains("set_OF((old == 0x7FFF) as u8);"), "{body}");
+    // the ret lowers to the popped-ip epilogue inside the same arm
+    assert!(body.contains("let popped_ip = memw(ss(), sp());"), "{body}");
 }
 
 // ---------------------------------------------------------------------------
@@ -164,7 +210,7 @@ fn distinct_mem_refs__do_not_clobber_condition() {
             "bytes": "",
         })),
     ];
-    let result = ir_to_c::normalize_flags(&instrs);
+    let result = translate::normalize_flags(&instrs);
     assert_eq!(
         result[2]
             .get("cond_prev")
@@ -187,11 +233,17 @@ fn div__div_cl_generates_code_without_todo() {
             {"address": 0x0002, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-    let src = render_c(&func, &[], "");
-    assert!(src.contains("al = (tmp / divisor) & 0xFF;"), "{src}");
-    assert!(src.contains("ah = (tmp % divisor) & 0xFF;"), "{src}");
-    assert!(!src.contains("ZF = ax == 0;"), "{src}");
-    assert!(!src.contains("// TODO ASM: div cl"), "{src}");
+    let src = render_rs(&func, &[], "");
+    assert!(src.contains("let tmp: u16 = ax();"), "{src}");
+    assert!(src.contains("let divisor = (cl()) as u16;"), "{src}");
+    assert!(
+        src.contains("set_al((q & 0xFF) as u8); set_ah(((tmp % divisor) & 0xFF) as u8);"),
+        "{src}"
+    );
+    // #DE on zero divisor / quotient overflow — never a truncated result
+    assert!(src.contains("run_interrupt(0x00);"), "{src}");
+    // div writes no defined flags
+    assert!(!src.contains("set_ZF"), "{src}");
 }
 
 #[test]
@@ -204,15 +256,16 @@ fn div__div_cx_generates_quotient_and_remainder_without_flag_writes() {
             {"address": 0x0002, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-    let src = render_c(&func, &[], "");
+    let src = render_rs(&func, &[], "");
     assert!(
-        src.contains("uint32_t tmp = ((uint32_t)dx << 16) | ax;"),
+        src.contains("let tmp: u32 = ((dx() as u32) << 16) | (ax() as u32);"),
         "{src}"
     );
-    assert!(src.contains("ax = (tmp / divisor) & 0xFFFF;"), "{src}");
-    assert!(src.contains("dx = (tmp % divisor) & 0xFFFF;"), "{src}");
-    assert!(!src.contains("ZF ="), "{src}");
-    assert!(!src.contains("// TODO ASM: div cx"), "{src}");
+    assert!(
+        src.contains("set_ax((q & 0xFFFF) as u16); set_dx(((tmp % divisor) & 0xFFFF) as u16);"),
+        "{src}"
+    );
+    assert!(!src.contains("set_ZF"), "{src}");
 }
 
 #[test]
@@ -225,39 +278,26 @@ fn div__idiv_cx_does_not_emit_flag_updates() {
             {"address": 0x0002, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-    let src = render_c(&func, &[], "");
+    let src = render_rs(&func, &[], "");
     assert!(
-        src.contains("int32_t dividend = ((int32_t)(int16_t)dx << 16) | ax;"),
+        src.contains("let dividend: i32 = ((dx() as i16 as i32) << 16) | (ax() as i32);"),
         "{src}"
     );
     assert!(
-        src.contains("ax = (uint16_t)(dividend / divisor);"),
+        src.contains("set_ax(q as u16); set_dx((dividend % divisor) as u16);"),
         "{src}"
     );
-    assert!(
-        src.contains("dx = (uint16_t)(dividend % divisor);"),
-        "{src}"
-    );
-    assert!(!src.contains("ZF ="), "{src}");
+    assert!(!src.contains("set_ZF"), "{src}");
 }
 
 // ---------------------------------------------------------------------------
+// The Rust backend does not specialize int 21h per AH — every int 21h emits
+// `dos_api();` after the register writes have already executed (Rust movs
+// write cpu state immediately). The per-AH C tests (dos_write_char,
+// dos_close_file, dos_exit-via-4C) collapse into the two representatives
+// below, which pin (a) register args are written before the call and (b) the
+// call itself is emitted.
 // ---------------------------------------------------------------------------
-
-#[test]
-fn dos_api__dos_write_char_passes_argument() {
-    let func = json!({
-        "start": 0x0000,
-        "instructions": [
-            {"address": 0x0000, "mnemonic": "mov", "op_str": "dl, 0x41", "bytes": "B241"},
-            {"address": 0x0002, "mnemonic": "mov", "op_str": "ah, 0x02", "bytes": "B402"},
-            {"address": 0x0004, "mnemonic": "int", "op_str": "0x21", "bytes": "CD21"},
-            {"address": 0x0006, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
-        ],
-    });
-    let src = render_c(&func, &[], "");
-    assert!(src.contains("CF = dos_write_char(0x41);"), "{src}");
-}
 
 #[test]
 fn dos_api__dos_direct_console_io_uses_dl() {
@@ -270,43 +310,18 @@ fn dos_api__dos_direct_console_io_uses_dl() {
             {"address": 0x0006, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-    let src = render_c(&func, &[], "");
-    assert!(src.contains("dl = 0x41;"), "{src}");
-    assert!(src.contains("dos_direct_console_io(dl);"), "{src}");
-}
-
-#[test]
-fn dos_api__dos_close_file_passes_bx() {
-    let func = json!({
-        "start": 0x0000,
-        "instructions": [
-            {"address": 0x0000, "mnemonic": "mov", "op_str": "bx, 0x0005", "bytes": "BB0500"},
-            {"address": 0x0003, "mnemonic": "mov", "op_str": "ah, 0x3E", "bytes": "B43E"},
-            {"address": 0x0005, "mnemonic": "int", "op_str": "0x21", "bytes": "CD21"},
-            {"address": 0x0007, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
-        ],
-    });
-    let src = render_c(&func, &[], "");
-    assert!(src.contains("CF = dos_close_file(0x0005);"), "{src}");
-}
-
-#[test]
-fn dos_api__dos_exit_preserves_ah_after_al_write() {
-    let func = json!({
-        "start": 0x0000,
-        "instructions": [
-            {"address": 0x0000, "mnemonic": "mov", "op_str": "ah, 0x4C", "bytes": "B44C"},
-            {"address": 0x0002, "mnemonic": "mov", "op_str": "al, 0x00", "bytes": "B000"},
-            {"address": 0x0004, "mnemonic": "int", "op_str": "0x21", "bytes": "CD21"},
-            {"address": 0x0006, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
-        ],
-    });
-    let src = render_c(&func, &[], "");
-    assert!(src.contains("dos_exit();"), "{src}");
+    let src = render_rs(&func, &[], "");
+    assert!(src.contains("set_dl(0x41);"), "{src}");
+    assert!(src.contains("dos_api();"), "{src}");
 }
 
 #[test]
 fn dos_api__dos_string_pointer_does_not_use_stale_dx_after_dl_write() {
+    // The C backend reconstructed the DS:DX string pointer and had a staleness
+    // hazard (dx vs a captured immediate). In the Rust backend registers are
+    // written immediately, so dos_api() always reads live dx — keep this as a
+    // regression that the register writes ARE emitted, in program order,
+    // before the call.
     let func = json!({
         "start": 0x0000,
         "instructions": [
@@ -317,17 +332,14 @@ fn dos_api__dos_string_pointer_does_not_use_stale_dx_after_dl_write() {
             {"address": 0x0009, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-    let src = render_c(&func, &[], "");
-    assert!(src.contains("dx = 0x1200;"), "{src}");
-    assert!(src.contains("dl = 0x41;"), "{src}");
-    assert!(
-        src.contains("CF = dos_print_string((const char *)seg_off(ds, dx));"),
-        "{src}"
-    );
-    assert!(
-        !src.contains("CF = dos_print_string((const char *)seg_off(ds, 0x1200));"),
-        "{src}"
-    );
+    let src = render_rs(&func, &[], "");
+    let dx = src
+        .find("set_dx(0x1200);")
+        .unwrap_or_else(|| panic!("{src}"));
+    let dl = src.find("set_dl(0x41);").unwrap_or_else(|| panic!("{src}"));
+    let call = src.find("dos_api();").unwrap_or_else(|| panic!("{src}"));
+    assert!(dx < dl, "dx write must precede dl write:\n{src}");
+    assert!(dl < call, "dl write must precede dos_api():\n{src}");
 }
 
 // ---------------------------------------------------------------------------
@@ -345,11 +357,17 @@ fn dx_in_branch__dx_assignment_inside_if() {
             {"address": 0x000b, "mnemonic": "ret", "op_str": "", "bytes": "c3"},
         ],
     });
-    let src = render_c(&func, &[], "");
-    assert!(src.contains("if (ZF != 1) {"), "{src}");
-    let body = src.split("if (ZF != 1) {").nth(1).unwrap();
-    let body = body.split("}\n").next().unwrap();
-    assert!(body.contains("dx = 0xffff;"), "{body}");
+    let src = render_rs(&func, &[], "");
+    // the test writes ZF off the cs-relative byte, the je branches on it
+    assert!(
+        src.contains("let left_val: u32 = (memb(cs(), 0xFF77)) as u32;"),
+        "{src}"
+    );
+    assert!(src.contains("if ZF() == 1 {"), "{src}");
+    assert!(src.contains("pc = 0x000B;"), "{src}");
+    // the not-taken arm (0x0008) carries the dx assignment
+    let body = arm(&src, 0x0008);
+    assert!(body.contains("set_dx(0xFFFF);"), "{body}");
 }
 
 // ---------------------------------------------------------------------------
@@ -366,9 +384,15 @@ fn empty_header_loop__loop_with_header_only_jump() {
             {"address": 0x0005, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-    let src = render_c(&func, &[], "");
-    assert!(src.contains("while (1)"), "{src}");
-    assert!(!src.contains("// TODO ASM: nop"), "{src}");
+    let src = render_rs(&func, &[], "");
+    // the loop lowers to pc back-edges: header -> body -> (jmp block) -> header.
+    // The jmp@0 fallthrough (0x0003) is its own block leader, so the nop block
+    // (0x0002) falls through to it and IT carries the back edge.
+    assert!(src.contains("pc = 0x0002;"), "{src}");
+    let body = arm(&src, 0x0003);
+    assert!(body.contains("pc = 0x0000;"), "{body}");
+    // nop emits no statements
+    assert!(!src.contains("nop"), "{src}");
 }
 
 // ---------------------------------------------------------------------------
@@ -377,56 +401,80 @@ fn empty_header_loop__loop_with_header_only_jump() {
 #[test]
 fn enter_leave__leave_is_mov_sp_bp_then_pop_bp() {
     // LEAVE (0xC9): SP <- BP; BP <- pop(). Common epilogue instruction.
-    let src = render_c(&wrap("leave", "", "C9"), &[], "");
-    let body = &src[src.find("sp = bp;").unwrap()..];
-    assert!(body.contains("sp = bp;"), "{body}");
-    assert!(body.contains("bp = memw(ss, sp);"), "{body}");
-    assert!(body.contains("sp = (sp + 2) & 0xFFFF;"), "{body}");
-    // order matters: SP is set from BP *before* the pop reads [SS:SP].
-    assert!(body.find("sp = bp;").unwrap() < body.find("bp = memw(ss, sp);").unwrap());
+    let src = render_rs(&wrap("leave", "", "C9"), &[], "");
+    let body = &src[src.find("set_sp(bp());").unwrap_or_else(|| panic!("{src}"))..];
+    assert!(body.contains("set_sp(bp());"), "{body}");
+    assert!(body.contains("set_bp(memw(ss(), sp()));"), "{body}");
     assert!(
-        body.find("bp = memw(ss, sp);").unwrap() < body.find("sp = (sp + 2) & 0xFFFF;").unwrap()
+        body.contains("set_sp((sp().wrapping_add(2)) & 0xFFFF);"),
+        "{body}"
+    );
+    // order matters: SP is set from BP *before* the pop reads [SS:SP].
+    assert!(body.find("set_sp(bp());").unwrap() < body.find("set_bp(memw(ss(), sp()));").unwrap());
+    assert!(
+        body.find("set_bp(memw(ss(), sp()));").unwrap()
+            < body
+                .find("set_sp((sp().wrapping_add(2)) & 0xFFFF);")
+                .unwrap()
     );
 }
 
 #[test]
 fn enter_leave__enter_level0_pushes_bp_sets_frame_and_allocs() {
     // ENTER 0x10, 0: push bp; bp = sp; sp -= 0x10 (no frame-pointer copies).
-    let src = render_c(&wrap("enter", "0x10, 0", "C81000"), &[], "");
-    assert!(src.contains("sp = (sp - 2) & 0xFFFF;"), "{src}");
-    assert!(src.contains("memw_write(ss, sp, bp);"), "{src}");
-    assert!(src.contains("bp = frame_temp;"), "{src}");
-    assert!(src.contains("sp = (sp - 0x10) & 0xFFFF;"), "{src}");
+    let src = render_rs(&wrap("enter", "0x10, 0", "C81000"), &[], "");
+    assert!(
+        src.contains("set_sp((sp().wrapping_sub(2)) & 0xFFFF);"),
+        "{src}"
+    );
+    assert!(src.contains("memw_write(ss(), sp(), bp());"), "{src}");
+    assert!(src.contains("set_bp(frame_temp);"), "{src}");
+    assert!(
+        src.contains("set_sp((sp().wrapping_sub(0x10)) & 0xFFFF);"),
+        "{src}"
+    );
     // level 0 copies no enclosing frame pointers
-    assert!(!src.contains("memw_write(ss, sp, memw(ss, bp));"), "{src}");
+    assert!(
+        !src.contains("memw_write(ss(), sp(), memw(ss(), bp()));"),
+        "{src}"
+    );
 }
 
 #[test]
 fn enter_leave__enter_zero_alloc_emits_no_sub() {
     // ENTER 0, 0: push bp; bp = sp (alloc 0 => no SP subtraction).
-    let src = render_c(&wrap("enter", "0, 0", "C80000"), &[], "");
-    assert!(src.contains("memw_write(ss, sp, bp);"), "{src}");
-    assert!(src.contains("bp = frame_temp;"), "{src}");
-    assert!(!src.contains("(sp - 0x0)"), "{src}");
+    let src = render_rs(&wrap("enter", "0, 0", "C80000"), &[], "");
+    assert!(src.contains("memw_write(ss(), sp(), bp());"), "{src}");
+    assert!(src.contains("set_bp(frame_temp);"), "{src}");
+    assert!(!src.contains("wrapping_sub(0x0)"), "{src}");
 }
 
 #[test]
 fn enter_leave__enter_level1_pushes_frame_temp() {
     // ENTER 8, 1: nesting level 1 pushes the just-saved FrameTemp once.
-    let src = render_c(&wrap("enter", "8, 1", "C80800"), &[], "");
-    assert!(src.contains("uint16_t frame_temp = sp;"), "{src}");
-    assert!(src.contains("memw_write(ss, sp, frame_temp);"), "{src}");
+    let src = render_rs(&wrap("enter", "8, 1", "C80800"), &[], "");
+    assert!(src.contains("let frame_temp: u16 = sp();"), "{src}");
+    assert!(src.contains("memw_write(ss(), sp(), frame_temp);"), "{src}");
     // level 1 has no interior bp-walk copies (that starts at level 2)
-    assert!(!src.contains("memw_write(ss, sp, memw(ss, bp));"), "{src}");
+    assert!(
+        !src.contains("memw_write(ss(), sp(), memw(ss(), bp()));"),
+        "{src}"
+    );
 }
 
 #[test]
 fn enter_leave__enter_level2_copies_one_enclosing_pointer() {
     // ENTER 0, 2: level 2 walks bp once and copies one enclosing frame pointer.
-    let src = render_c(&wrap("enter", "0, 2", "C80002"), &[], "");
-    assert!(src.contains("bp = (bp - 2) & 0xFFFF;"), "{src}");
-    assert!(src.contains("memw_write(ss, sp, memw(ss, bp));"), "{src}");
-    assert!(src.contains("memw_write(ss, sp, frame_temp);"), "{src}");
+    let src = render_rs(&wrap("enter", "0, 2", "C80002"), &[], "");
+    assert!(
+        src.contains("set_bp((bp().wrapping_sub(2)) & 0xFFFF);"),
+        "{src}"
+    );
+    assert!(
+        src.contains("memw_write(ss(), sp(), memw(ss(), bp()));"),
+        "{src}"
+    );
+    assert!(src.contains("memw_write(ss(), sp(), frame_temp);"), "{src}");
 }
 
 // ---------------------------------------------------------------------------
@@ -442,12 +490,21 @@ fn extra_instructions__lodsw_stosw() {
             {"address": 0x0002, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-    let src = render_c(&func, &[], "");
-    assert!(src.contains("int delta = DF ? -2 : 2;"), "{src}");
-    assert!(src.contains("ax = memw(ds, si);"), "{src}");
-    assert!(src.contains("si = (si + delta) & 0xFFFF;"), "{src}");
-    assert!(src.contains("memw_write(es, di, ax);"), "{src}");
-    assert!(src.contains("di = (di + delta) & 0xFFFF;"), "{src}");
+    let src = render_rs(&func, &[], "");
+    assert!(
+        src.contains("let delta: i32 = if DF() != 0 { -2 } else { 2 };"),
+        "{src}"
+    );
+    assert!(src.contains("set_ax(memw(ds(), si()));"), "{src}");
+    assert!(
+        src.contains("set_si(((si() as i32 + delta) & 0xFFFF) as u16);"),
+        "{src}"
+    );
+    assert!(src.contains("memw_write(es(), di(), ax());"), "{src}");
+    assert!(
+        src.contains("set_di(((di() as i32 + delta) & 0xFFFF) as u16);"),
+        "{src}"
+    );
 }
 
 #[test]
@@ -459,10 +516,10 @@ fn extra_instructions__xchg() {
             {"address": 0x0001, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-    let src = render_c(&func, &[], "");
-    assert!(src.contains("uint16_t tmp = ax;"), "{src}");
-    assert!(src.contains("ax = cx;"), "{src}");
-    assert!(src.contains("cx = tmp;"), "{src}");
+    let src = render_rs(&func, &[], "");
+    assert!(src.contains("let tmp: u16 = ax();"), "{src}");
+    assert!(src.contains("set_ax(cx());"), "{src}");
+    assert!(src.contains("set_cx(tmp);"), "{src}");
 }
 
 #[test]
@@ -475,20 +532,24 @@ fn extra_instructions__pushf_popf() {
             {"address": 0x0002, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-    let src = render_c(&func, &[], "");
+    let src = render_rs(&func, &[], "");
     assert!(
         src.contains(
-            "memw_write(ss, sp, (uint16_t)(0x0002u | CF | (PF << 2) | (ZF << 6) | \
-             (SF << 7) | (IF << 9) | (DF << 10) | (OF << 11)));"
+            "memw_write(ss(), sp(), 0x0002u16 | CF() as u16 | ((PF() as u16) << 2) | \
+             ((ZF() as u16) << 6) | ((SF() as u16) << 7) | ((IF() as u16) << 9) | \
+             ((DF() as u16) << 10) | ((OF() as u16) << 11));"
         ),
         "{src}"
     );
-    assert!(src.contains("uint16_t oldIF = IF;"), "{src}");
-    assert!(src.contains("uint16_t flags = memw(ss, sp);"), "{src}");
-    assert!(src.contains("CF = flags & 0x0001;"), "{src}");
-    assert!(src.contains("PF = (flags >> 2) & 1;"), "{src}");
-    assert!(src.contains("IF = (flags >> 9) & 1;"), "{src}");
-    assert!(src.contains("sp = (sp + 2) & 0xFFFF;"), "{src}");
+    assert!(src.contains("let old_if = IF();"), "{src}");
+    assert!(src.contains("let flags = memw(ss(), sp());"), "{src}");
+    assert!(src.contains("set_CF((flags & 0x0001) as u8);"), "{src}");
+    assert!(src.contains("set_PF(((flags >> 2) & 1) as u8);"), "{src}");
+    assert!(src.contains("set_IF(((flags >> 9) & 1) as u8);"), "{src}");
+    assert!(
+        src.contains("set_sp((sp().wrapping_add(2)) & 0xFFFF);"),
+        "{src}"
+    );
 }
 
 #[test]
@@ -500,7 +561,7 @@ fn extra_instructions__int_16() {
             {"address": 0x0001, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-    let src = render_c(&func, &[], "");
+    let src = render_rs(&func, &[], "");
     assert!(src.contains("bios_keyboard();"), "{src}");
 }
 
@@ -509,6 +570,8 @@ fn extra_instructions__int_16() {
 
 #[test]
 fn flag_reset__or_not_skipped_after_popf() {
+    // The or's result write must survive even though popf overwrites the flags
+    // right after (no dead-flag elimination may drop the register write).
     let func = json!({
         "start": 0x0000,
         "instructions": [
@@ -519,8 +582,12 @@ fn flag_reset__or_not_skipped_after_popf() {
             {"address": 0x0010, "mnemonic": "loop", "op_str": "0x0010", "bytes": "E2FE"},
         ],
     });
-    let src = render_c(&func, &[], "");
-    assert!(src.contains("ax = (ax | bx) & 0xFFFF;"), "{src}");
+    let src = render_rs(&func, &[], "");
+    assert!(
+        src.contains("let tmp: u16 = (((ax()) as u32 | (bx()) as u32) & 0xFFFF) as u16;"),
+        "{src}"
+    );
+    assert!(src.contains("set_ax(tmp);"), "{src}");
 }
 
 #[test]
@@ -557,7 +624,7 @@ fn flag_reset__readwrite_mem_access_clobbers_cmp_before_jcc() {
             "bytes": "750A",
         })),
     ];
-    let normalized = ir_to_c::normalize_flags(&instrs);
+    let normalized = translate::normalize_flags(&instrs);
     assert!(!normalized.last().unwrap().contains_key("cond_prev"));
 }
 
@@ -575,9 +642,11 @@ fn flag_setting__stc_followed_by_jb_checks_carry_flag() {
             {"address": 0x0003, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-    let src = render_c(&func, &[], "");
-    assert!(src.contains("do {"), "{src}");
-    assert!(src.contains("while (CF == 1)"), "{src}");
+    let src = render_rs(&func, &[], "");
+    assert!(src.contains("set_CF(1);"), "{src}");
+    // the jb branches on CF and loops back to the block start
+    assert!(src.contains("if CF() == 1 {"), "{src}");
+    assert!(src.contains("pc = 0x0000;"), "{src}");
 }
 
 // (Fixed) parse_imm("0000") now returns 0, matching the original.
@@ -591,9 +660,10 @@ fn flag_setting__clc_followed_by_jnb_checks_carry_flag() {
             {"address": 0x0003, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-    let src = render_c(&func, &[], "");
-    assert!(src.contains("do {"), "{src}");
-    assert!(src.contains("while (CF == 0)"), "{src}");
+    let src = render_rs(&func, &[], "");
+    assert!(src.contains("set_CF(0);"), "{src}");
+    assert!(src.contains("if CF() == 0 {"), "{src}");
+    assert!(src.contains("pc = 0x0000;"), "{src}");
 }
 
 // ---------------------------------------------------------------------------
@@ -611,10 +681,16 @@ fn for_loop__loop_with_jcxz_is_structured_as_for_loop() {
             {"address": 0x0009, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-    let src = render_c(&func, &[], "");
-    assert!(src.contains("for (cx = 3; cx != 0; cx--)"), "{src}");
-    assert!(src.contains("cx--"), "{src}");
-    assert!(!src.contains("while"), "{src}");
+    let src = render_rs(&func, &[], "");
+    assert!(src.contains("set_cx(0x3);"), "{src}");
+    // jcxz guards entry to the body
+    assert!(src.contains("if cx() == 0 {"), "{src}");
+    assert!(src.contains("pc = 0x0009;"), "{src}");
+    // the body and the loop back-edge with the cx decrement
+    assert!(src.contains("run_interrupt(0x10);"), "{src}");
+    assert!(src.contains("set_cx(cx().wrapping_sub(1));"), "{src}");
+    assert!(src.contains("if cx() != 0 {"), "{src}");
+    assert!(src.contains("pc = 0x0005;"), "{src}");
 }
 
 #[test]
@@ -631,10 +707,20 @@ fn for_loop__simple_for_loop_is_structured() {
             {"address": 0x0012, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-    let src = render_c(&func, &[0x0000, 0x1000], "g_");
-    assert!(src.contains("for (cx = 0; ZF != 0; cx++)"), "{src}");
-    assert!(!src.contains("while ("), "{src}");
+    let src = render_rs(&func, &[0x0000, 0x1000], "g_");
+    assert!(src.contains("set_cx(0x0);"), "{src}");
+    // the loop-exit branch
+    assert!(src.contains("if ZF() == 0 {"), "{src}");
+    assert!(src.contains("pc = 0x0012;"), "{src}");
+    // the known-sibling call renders as an intra-chunk transfer
     assert!(src.contains("pc = 0x1000;"), "{src}");
+    // the increment step and the back-edge to the loop header
+    assert!(src.contains("let old: u32 = (cx()) as u32;"), "{src}");
+    assert!(
+        src.contains("set_cx((old.wrapping_add(1) & 0xFFFF) as u16);"),
+        "{src}"
+    );
+    assert!(src.contains("pc = 0x0006;"), "{src}");
 }
 
 #[test]
@@ -651,19 +737,30 @@ fn for_loop__basic_arithmetic_is_translated_to_c() {
             {"address": 0x000C, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-    let src = render_c(&func, &[], "");
-    assert!(src.contains("ax = bx;"), "{src}");
-    assert!(src.contains("uint32_t old = ax;"), "{src}");
-    assert!(src.contains("uint32_t src = 1;"), "{src}");
-    assert!(src.contains("uint32_t tmp = old + src;"), "{src}");
-    assert!(src.contains("ax = tmp & 0xFFFF;"), "{src}");
-    assert!(src.contains("uint32_t src = 2;"), "{src}");
-    assert!(src.contains("uint32_t tmp = old - src;"), "{src}");
-    assert!(src.contains("CF = old < src;"), "{src}");
-    assert!(src.contains("ax = (ax + 1) & 0xFFFF;"), "{src}");
-    assert!(src.contains("ax = (ax - 1) & 0xFFFF;"), "{src}");
-    assert!(src.contains("xor16(&ax, ax);"), "{src}");
-    assert!(!src.contains("// TODO ASM: mov ax, bx"), "{src}");
+    let src = render_rs(&func, &[], "");
+    assert!(src.contains("set_ax(bx());"), "{src}");
+    assert!(src.contains("let old: u32 = (ax()) as u32;"), "{src}");
+    assert!(src.contains("let src: u32 = (0x1) as u32;"), "{src}");
+    assert!(
+        src.contains("let tmp: u32 = old.wrapping_add(src);"),
+        "{src}"
+    );
+    assert!(src.contains("set_ax((tmp & 0xFFFF) as u16);"), "{src}");
+    assert!(src.contains("let src: u32 = (0x2) as u32;"), "{src}");
+    assert!(
+        src.contains("let tmp: u32 = old.wrapping_sub(src);"),
+        "{src}"
+    );
+    assert!(src.contains("set_CF((old < src) as u8);"), "{src}");
+    assert!(
+        src.contains("set_ax((old.wrapping_add(1) & 0xFFFF) as u16);"),
+        "{src}"
+    );
+    assert!(
+        src.contains("set_ax((old.wrapping_sub(1) & 0xFFFF) as u16);"),
+        "{src}"
+    );
+    assert!(src.contains("xor16(ax_ptr(), ax());"), "{src}");
 }
 
 #[test]
@@ -677,8 +774,10 @@ fn for_loop__cmp_followed_by_jcc_uses_high_level_condition() {
             {"address": 0x0006, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-    let src = render_c(&func, &[], "");
-    assert!(src.contains("if (CF == 0)"), "{src}");
+    let src = render_rs(&func, &[], "");
+    assert!(src.contains("let left_val: u32 = (al()) as u32;"), "{src}");
+    assert!(src.contains("let right_val: u32 = (0x2) as u32;"), "{src}");
+    assert!(src.contains("if CF() == 0 {"), "{src}");
     assert!(src.contains("dos_exit();"), "{src}");
 }
 
@@ -695,9 +794,11 @@ fn for_loop__dos_call_before_conditional_jump_is_preserved() {
             {"address": 0x000C, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-    let src = render_c(&func, &[], "");
-    assert!(src.contains("CF = dos_open_file("), "{src}");
-    assert!(src.contains("if (CF == 0)"), "{src}");
+    let src = render_rs(&func, &[], "");
+    assert!(src.contains("set_dx(0x7E2);"), "{src}");
+    assert!(src.contains("set_ax(0x3D00);"), "{src}");
+    assert!(src.contains("dos_api();"), "{src}");
+    assert!(src.contains("if CF() == 0 {"), "{src}");
 }
 
 #[test]
@@ -715,9 +816,19 @@ fn for_loop__for_loop_with_cmp_condition() {
             {"address": 0x0015, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-    let src = render_c(&func, &[], "");
-    assert!(src.contains("for (cx = 0; SF != OF; cx++)"), "{src}");
-    assert!(src.contains("ax = bx;"), "{src}");
+    let src = render_rs(&func, &[], "");
+    // the cmp writes flags, the jge exits on SF == OF
+    assert!(src.contains("let left_val: u32 = (cx()) as u32;"), "{src}");
+    assert!(src.contains("let right_val: u32 = (0x3) as u32;"), "{src}");
+    assert!(src.contains("if SF() == OF() {"), "{src}");
+    assert!(src.contains("pc = 0x0015;"), "{src}");
+    // the loop body, increment, and back-edge to the cmp header
+    assert!(src.contains("set_ax(bx());"), "{src}");
+    assert!(
+        src.contains("set_cx((old.wrapping_add(1) & 0xFFFF) as u16);"),
+        "{src}"
+    );
+    assert!(src.contains("pc = 0x0008;"), "{src}");
 }
 
 #[test]
@@ -738,19 +849,18 @@ fn for_loop__loop_with_memory_step_rendered_as_while() {
             {"address": 0x0009, "mnemonic": "ret", "op_str": "", "bytes": "00"},
         ],
     });
-    let src = render_c(&func, &[0x1000], "g_");
-    assert!(!src.contains("for ("), "{src}");
-    assert!(src.contains("while ("), "{src}");
+    let src = render_rs(&func, &[0x1000], "g_");
+    // the memory step: read-modify-write of es:[di+4] with the full add block
+    assert!(src.contains("let old: u32 = (memw(es(), "), "{src}");
+    assert!(src.contains("let src: u32 = (di()) as u32;"), "{src}");
     assert!(
-        src.contains("uint32_t old = memw(es, (di+4) & 0xFFFF);"),
+        src.contains("let tmp: u32 = old.wrapping_add(src);"),
         "{src}"
     );
-    assert!(src.contains("uint32_t src = di;"), "{src}");
-    assert!(src.contains("uint32_t tmp = old + src;"), "{src}");
-    assert!(
-        src.contains("memw_write(es, (di+4) & 0xFFFF, tmp & 0xFFFF);"),
-        "{src}"
-    );
+    assert!(src.contains("memw_write(es(), "), "{src}");
+    assert!(src.contains("(tmp & 0xFFFF) as u16);"), "{src}");
+    // the loop back-edge to the cmp header
+    assert!(src.contains("pc = 0x0004;"), "{src}");
 }
 
 // ---------------------------------------------------------------------------
@@ -763,22 +873,22 @@ fn for_loop__loop_with_memory_step_rendered_as_while() {
 
 #[test]
 fn inc_dec_flags__inc_sets_sf_and_of() {
-    let src = render_c(&wrap("inc", "al", "FE C0"), &[], "");
-    assert!(src.contains("SF = (al >> 7) & 1;"), "{src}");
-    assert!(src.contains("OF = old == 0x7F;"), "{src}");
+    let src = render_rs(&wrap("inc", "al", "FE C0"), &[], "");
+    assert!(src.contains("set_SF((((al()) >> 7) & 1) as u8);"), "{src}");
+    assert!(src.contains("set_OF((old == 0x7F) as u8);"), "{src}");
 }
 
 #[test]
 fn inc_dec_flags__dec_sets_sf_and_of() {
-    let src = render_c(&wrap("dec", "ax", "48"), &[], "");
-    assert!(src.contains("SF = (ax >> 15) & 1;"), "{src}");
-    assert!(src.contains("OF = old == 0x8000;"), "{src}");
+    let src = render_rs(&wrap("dec", "ax", "48"), &[], "");
+    assert!(src.contains("set_SF((((ax()) >> 15) & 1) as u8);"), "{src}");
+    assert!(src.contains("set_OF((old == 0x8000) as u8);"), "{src}");
 }
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 
-fn memory_inc_dec_conditional_jump(mnemonic: &str, jcc: &str, bytes_jcc: &str) {
+fn memory_inc_dec_conditional_jump(mnemonic: &str, jcc: &str, bytes_jcc: &str, cond: &str) {
     let func = json!({
         "start": 0x0000,
         "instructions": [
@@ -790,19 +900,22 @@ fn memory_inc_dec_conditional_jump(mnemonic: &str, jcc: &str, bytes_jcc: &str) {
             {"address": 0x0007, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-    let src = render_c(&func, &[], "");
-    assert!(src.contains("ZF"), "{src}");
+    let src = render_rs(&func, &[], "");
+    // the memory operand is rewritten (bp-based defaults to SS), flags written
+    assert!(src.contains("memb(ss(), "), "{src}");
+    assert!(src.contains("set_ZF"), "{src}");
+    assert!(src.contains(cond), "{src}");
     assert!(!src.contains("byte ptr"), "{src}");
 }
 
 #[test]
 fn inc_dec_jcc_memory__memory_inc_conditional_jump_jz() {
-    memory_inc_dec_conditional_jump("inc", "jz", "7403");
+    memory_inc_dec_conditional_jump("inc", "jz", "7403", "if ZF() == 1 {");
 }
 
 #[test]
 fn inc_dec_jcc_memory__memory_dec_conditional_jump_jnz() {
-    memory_inc_dec_conditional_jump("dec", "jnz", "7503");
+    memory_inc_dec_conditional_jump("dec", "jnz", "7503", "if ZF() == 0 {");
 }
 
 // ---------------------------------------------------------------------------
@@ -817,9 +930,8 @@ fn io__in_instruction_is_rendered() {
             {"address": 0x0002, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-    let src = render_c(&func, &[], "");
-    assert!(src.contains("al = inb(0x60);"), "{src}");
-    assert!(!src.contains("// TODO ASM: in al, 0x60"), "{src}");
+    let src = render_rs(&func, &[], "");
+    assert!(src.contains("set_al(unsafe { inb(0x60) });"), "{src}");
 }
 
 #[test]
@@ -832,9 +944,9 @@ fn io__out_instruction_is_rendered() {
             {"address": 0x0004, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-    let src = render_c(&func, &[], "");
-    assert!(src.contains("outb(0x61, al);"), "{src}");
-    assert!(!src.contains("// TODO ASM: out 0x61, al"), "{src}");
+    let src = render_rs(&func, &[], "");
+    assert!(src.contains("set_al(0x1);"), "{src}");
+    assert!(src.contains("unsafe { outb(0x61, al()); }"), "{src}");
 }
 
 // ---------------------------------------------------------------------------
@@ -848,9 +960,8 @@ fn iret__iret_invokes_helper() {
             {"address": 0x0000, "mnemonic": "iret", "op_str": "", "bytes": "CF"},
         ],
     });
-    let src = render_c(&func, &[], "");
-    assert!(src.contains("iret();"), "{src}");
-    assert!(!src.contains("/* iret */"), "{src}");
+    let src = render_rs(&func, &[], "");
+    assert!(src.contains("iret_();"), "{src}");
 }
 
 // ---------------------------------------------------------------------------
@@ -869,7 +980,7 @@ fn jcc_memory_operand__conditional_jump_rewrites_memory_operand() {
             {"address": 0x0009, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-    let src = render_c(&func, &[], "");
-    assert!(src.contains("memb(cs, 0x8e8)"), "{src}");
-    assert!(!src.contains("byte ptr cs:[0x8e8]"), "{src}");
+    let src = render_rs(&func, &[], "");
+    assert!(src.contains("memb(cs(), 0x8E8)"), "{src}");
+    assert!(!src.contains("byte ptr"), "{src}");
 }

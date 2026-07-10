@@ -1,0 +1,7 @@
+# Nightly is required because the runtime crate DEFINES
+# C-variadic functions (shim_log_stdout/shim_log_crash/... — printf-style logging
+# the whole runtime + JIT chunks call), which needs the `c_variadic` feature.
+# Still rustc, no clang. JIT chunks also compile under this toolchain.
+[toolchain]
+channel = "nightly"
+components = ["rustc", "cargo", "rust-std"]

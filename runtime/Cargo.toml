@@ -1,0 +1,27 @@
+# saisei-runtime — the game runtime: machine loop, JIT registry, DOS/BIOS/HW
+# shims, SDL display. Exports a C ABI the rustc-compiled JIT chunks resolve
+# against at dlopen. Built as: staticlib (the game link), cdylib (the shim
+# unit tests dlopen isolated copies), rlib (crate dependents).
+[package]
+name = "saisei-runtime"
+version = "0.0.0"
+edition = "2021"
+
+[features]
+# Mirrors the C `-DFORCE_EXIT_AFTER_10S` smoke-test define (was injected via
+# CFLAGS). Build with `--features force_exit_after_10s` to reproduce it.
+force_exit_after_10s = []
+
+[dependencies]
+# Pure-Rust libc bindings (no clang) for the OS-layer ports: FILE*/DIR/stat/tm,
+# fopen/fread/opendir/fnmatch/... The DOS file table (handles[]) holds libc
+# FILE* owned by shims.c, so dos.rs must use the same libc FILE type.
+libc = "0.2"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+path = "src/lib.rs"
+# No unit tests here (it links extern C symbols from the rest of the runtime,
+# unavailable at test-link time); validated end-to-end by running the game.
+test = false
+doctest = false

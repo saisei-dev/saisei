@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // Struct globals read by these tests (verified against runtime/ headers).
 // ---------------------------------------------------------------------------
 
-/// runtime/include/audio.h :: Opl2State.
+/// runtime/src/audio.rs :: Opl2State.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Opl2State {
@@ -29,7 +29,7 @@ struct Opl2State {
     timer2_expire_us: u64,
 }
 
-/// runtime/include/timer.h :: PITState.
+/// runtime/src/timer.rs :: PITState.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PitState {
@@ -39,7 +39,7 @@ struct PitState {
     access_mode: u8,
 }
 
-// enum StagePresentBranch (runtime/include/video.h): UNKNOWN=0, TEXT=1, CGA=2.
+// enum StagePresentBranch (runtime/src/video.rs): UNKNOWN=0, TEXT=1, CGA=2.
 const STAGE_BRANCH_TEXT: c_int = 1;
 const STAGE_BRANCH_CGA: c_int = 2;
 

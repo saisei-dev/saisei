@@ -1,3 +1,23 @@
+//! PORT DISPOSITIONS (C backend deleted):
+//!   ported:    28 tests (all of them)
+//!     - 21 disassembler-structural tests assert on the IR JSON only
+//!       (mnemonics, xrefs, functions, extern_labels, no-fallthrough) and
+//!       survive unchanged.
+//!     - 5 render tests (backward__jmp_ignored, call_hex_prefix__generates_
+//!       function_call, cross_func__backward_jmp_no_label, forward__jmp_no_label,
+//!       invalid_opcode__is_noop) re-asserted through the Rust backend
+//!       (render_rs_ir): "no dispatch(/label_XXXX emitted" becomes "the target
+//!       is an in-chunk arm `0xNNNN => {` reached via `pc = 0xNNNN;`, with no
+//!       call_table_"; C register writes (`ax = 0x1234;`) become Rust accessor
+//!       writes (`set_ax(0x1234);`).
+//!     - 2 CFG tests (iret__cfg_no_fallthrough_after_iret,
+//!       ljmp__cfg_no_fallthrough) re-expressed via translate::build_basic_blocks
+//!       + translate::cfg_successors (both survive the C deletion) instead of
+//!       cfg::build_cfg + DiGraph::out_degree; the assertion (terminator block
+//!       has zero successors) is unchanged.
+//!   collapsed: none
+//!   deleted:   none
+//!
 //! Ported from tests/test_*.py — the disassemble-focused unit tests:
 //! test_disassemble_backward_jump_no_label, test_disassemble_call_hex_prefix,
 //! test_disassemble_cross_func_backward_jump_label, test_disassemble_default_segment,
@@ -29,7 +49,7 @@
 #![allow(non_snake_case)]
 mod common;
 use common::*;
-use saisei_jitc::{cfg, disassemble, graph::DiGraph, ir_to_c};
+use saisei_jitc::{disassemble, translate};
 use serde_json::{json, Value};
 
 // ---- local helpers -------------------------------------------------------
@@ -65,7 +85,7 @@ fn has_no_fallthrough(xrefs: &[String]) -> bool {
 }
 
 /// Convert a Vec<Value> of instruction objects into Vec<Insn> (serde Maps).
-fn insns_of(vals: Vec<Value>) -> Vec<ir_to_c::Insn> {
+fn insns_of(vals: Vec<Value>) -> Vec<translate::Insn> {
     vals.into_iter()
         .map(|v| v.as_object().unwrap().clone())
         .collect()
@@ -112,12 +132,13 @@ fn backward__jmp_ignored() {
     let ir = d(&data, &[0x0]);
     let labels = extern_labels(&ir);
     assert!(!labels.contains(&0x0000));
-    let funcs = functions(&ir);
-    let mut r = renderer("");
-    r.extern_labels = labels;
-    let start = as_i(&funcs[0], "start");
-    let src = r.render_function_c(&funcs[0], &known(&[start])).join("\n");
-    assert!(!src.contains("dispatch("), "{src}");
+    // The backward jmp inside the function is an intra-chunk transfer: its
+    // target is an in-chunk dispatch arm reached via a direct `pc = …;`, never
+    // routed through the call table.
+    let src = render_rs_ir(&ir, &[], "").expect("emit (backward jmp)");
+    assert!(src.contains("0x0000 => {"), "{src}");
+    assert!(src.contains("pc = 0x0000;"), "{src}");
+    assert!(!src.contains("call_table_"), "{src}");
 }
 
 // ==========================================================================
@@ -134,20 +155,14 @@ fn call_hex_prefix__generates_function_call() {
     data[0x0CAD] = 0xC3;
     let ir = d(&data, &[]);
     let funcs = functions(&ir);
-    let starts: Vec<i64> = funcs.iter().map(|f| as_i(f, "start")).collect();
-    let k = known(&starts);
-    let mut r = renderer("game_");
-    let mut src = String::new();
-    for f in &funcs {
-        if as_i(f, "start") == 0x0000 {
-            src = r.render_function_c(f, &k).join("\n");
-            break;
-        }
-    }
-    // The call immediate (0x0CAD) is resolved and routed through the in-loop
-    // dispatch: set pc to the target and continue.
+    assert!(funcs.iter().any(|f| as_i(f, "start") == 0x0CAD));
+    // The call immediate (0x0CAD) is resolved to the known sibling and routed
+    // through the in-loop dispatch: push the return IP, set pc to the target,
+    // continue — no call_table_ (and no TODO-ASM-style bailout).
+    let src = render_rs_ir(&ir, &[], "game_").expect("emit (call hex)");
     assert!(src.contains("pc = 0x0CAD;"), "{src}");
-    assert!(!src.contains("// TODO ASM: call 0xcad"), "{src}");
+    assert!(src.contains("0x0CAD => {"), "{src}");
+    assert!(!src.contains("call_table_"), "{src}");
 }
 
 // ==========================================================================
@@ -159,20 +174,13 @@ fn cross_func__backward_jmp_no_label() {
     let ir = d(&data, &[0x0002]);
     let labels = extern_labels(&ir);
     assert!(!labels.contains(&0x0000));
-    let funcs = functions(&ir);
-    let starts: Vec<i64> = funcs.iter().map(|f| as_i(f, "start")).collect();
-    let k = known(&starts);
-    let mut r = renderer("");
-    r.extern_labels = labels;
-    let mut src = String::new();
-    for f in &funcs {
-        let lines = r.render_function_c(f, &k);
-        if as_i(f, "start") == 0x0002 {
-            src = lines.join("\n");
-        }
-    }
-    assert!(!src.contains("label_0000"), "{src}");
-    assert!(!src.contains("dispatch("), "{src}");
+    // The cross-function backward jmp is still an intra-chunk transfer: the
+    // target 0x0000 is an in-chunk arm reached via `pc = 0x0000;`, not a label
+    // and not a dispatch through the call table.
+    let src = render_rs_ir(&ir, &[], "").expect("emit (cross-func jmp)");
+    assert!(src.contains("pc = 0x0000;"), "{src}");
+    assert!(src.contains("0x0000 => {"), "{src}");
+    assert!(!src.contains("call_table_"), "{src}");
 }
 
 // ==========================================================================
@@ -271,13 +279,13 @@ fn forward__jmp_no_label() {
     let ir = d(&data, &[0x0]);
     let labels = extern_labels(&ir);
     assert!(!labels.contains(&0x0004));
-    let funcs = functions(&ir);
-    let mut r = renderer("");
-    r.extern_labels = labels;
-    let start = as_i(&funcs[0], "start");
-    let src = r.render_function_c(&funcs[0], &known(&[start])).join("\n");
-    assert!(!src.contains("dispatch("), "{src}");
-    assert!(!src.contains("label_0004"), "{src}");
+    // A forward jmp inside the function is an intra-chunk transfer: rendered as
+    // a direct `pc = …;` to an in-chunk arm, with no dispatch through the call
+    // table and no label.
+    let src = render_rs_ir(&ir, &[], "").expect("emit (forward jmp)");
+    assert!(src.contains("pc = 0x0004;"), "{src}");
+    assert!(src.contains("0x0004 => {"), "{src}");
+    assert!(!src.contains("call_table_"), "{src}");
 }
 
 // ==========================================================================
@@ -303,19 +311,10 @@ fn invalid_opcode__is_noop() {
     // the translator treats as a noop with no output.
     let data = [0xB8u8, 0x34, 0x12, 0x0F];
     let ir = d(&data, &[]);
-    let funcs = functions(&ir);
-    let mut r = renderer("");
-    let mut src = String::new();
-    for f in &funcs {
-        if as_i(f, "start") == 0x0000 {
-            let starts: Vec<i64> = funcs.iter().map(|g| as_i(g, "start")).collect();
-            src = r.render_function_c(f, &known(&starts)).join("\n");
-            break;
-        }
-    }
-    assert!(!src.contains("// TODO ASM"), "{src}");
-    assert!(!src.contains("0x0f"), "{src}");
-    assert!(src.contains("ax = 0x1234;"), "{src}");
+    let src = render_rs_ir(&ir, &[], "").expect("emit (invalid opcode)");
+    assert!(src.contains("set_ax(0x1234);"), "{src}");
+    // The db byte produces no code at all: its value never appears.
+    assert!(!src.contains("0x0f") && !src.contains("0x0F"), "{src}");
 }
 
 // ==========================================================================
@@ -446,9 +445,9 @@ fn iret__cfg_no_fallthrough_after_iret() {
         json!({"address": 0x0, "mnemonic": "iret", "op_str": "", "bytes": "CF"}),
         json!({"address": 0x1, "mnemonic": "nop", "op_str": "", "bytes": "90"}),
     ]);
-    let blocks = ir_to_c::build_basic_blocks(&instrs, &known(&[]), None);
-    let graph: DiGraph = cfg::build_cfg(&blocks);
-    assert_eq!(graph.out_degree(0x0), 0);
+    let blocks = translate::build_basic_blocks(&instrs, &known(&[]), None);
+    let succ = translate::cfg_successors(&blocks);
+    assert_eq!(succ.get(&0x0).map_or(0, |v| v.len()), 0);
 }
 
 // ==========================================================================
@@ -472,11 +471,11 @@ fn ljmp__cfg_no_fallthrough() {
         json!({"address": 0x0, "mnemonic": "ljmp", "op_str": "0x2000:0x1000", "bytes": "EA00100020"}),
         json!({"address": 0x5, "mnemonic": "nop", "op_str": "", "bytes": "90"}),
     ]);
-    let blocks = ir_to_c::build_basic_blocks(&instrs, &known(&[]), None);
+    let blocks = translate::build_basic_blocks(&instrs, &known(&[]), None);
     let keys: Vec<i64> = blocks.keys().copied().collect();
     assert_eq!(keys, vec![0x0, 0x5]);
-    let graph: DiGraph = cfg::build_cfg(&blocks);
-    assert_eq!(graph.out_degree(0x0), 0);
+    let succ = translate::cfg_successors(&blocks);
+    assert_eq!(succ.get(&0x0).map_or(0, |v| v.len()), 0);
 }
 
 // ==========================================================================

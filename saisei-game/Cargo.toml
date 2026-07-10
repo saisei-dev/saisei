@@ -1,0 +1,21 @@
+# saisei-game — the per-game binary. A thin bin crate over the runtime rlib:
+# its build.rs pulls the generated per-game GameConfig (path in
+# $SAISEI_GAME_CONFIG) into OUT_DIR and adds -rdynamic (JIT chunk .so files
+# resolve shim symbols from the host binary at dlopen). The launcher builds
+# this with `cargo build --release -p saisei-game` and copies the binary to
+# build/<game>/<program>.
+[package]
+name = "saisei-game"
+version = "0.0.0"
+edition = "2021"
+
+[features]
+# Self-terminating smoke runs: `--features saisei-game/force_exit_after_10s`.
+force_exit_after_10s = ["saisei-runtime/force_exit_after_10s"]
+
+[dependencies]
+saisei-runtime = { path = "../runtime" }
+
+[[bin]]
+name = "saisei-game"
+path = "src/main.rs"

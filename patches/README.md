@@ -19,21 +19,33 @@ origin table, so **one patch applies across every `cs`-alias** the same physical
 code is reached under, and across JIT recompiles. You never patch a live linear
 address; you patch a function's identity.
 
-## The ABI (`runtime/include/game_config.h`)
+## The ABI
 
-```c
-typedef int (*PatchFn)(uint16_t expected_retip, const char *file,
-                       const char *func, int line);
+A bundle is a shared object exporting two fixed symbols over the C ABI —
+`bundle_patches` (an array of `GamePatch`) and `bundle_patch_count`. In Rust
+terms (this is the layout the runtime's `game_config` types use):
 
-typedef struct {
-  const char *file;    /* binary basename the patched function lives in */
-  uint32_t    file_off;/* the function's entry offset within that binary */
-  PatchFn     fn;      /* the replacement/augment body */
-  const char *name;    /* human label for logging */
-  int         enabled; /* 0 disables the entry without removing it */
-} GamePatch;
+```rust
+type PatchFn = Option<
+    unsafe extern "C" fn(
+        expected_retip: u16,
+        file: *const c_char,
+        func: *const c_char,
+        line: c_int,
+    ) -> c_int,
+>;
 
-enum { PATCH_DECLINED = 0, PATCH_HANDLED = 1 };
+#[repr(C)]
+pub struct GamePatch {
+    pub file: *const c_char, // binary basename the patched function lives in
+    pub file_off: u32,       // the function's entry offset within that binary
+    pub fn_: PatchFn,        // the replacement/augment body
+    pub name: *const c_char, // human label for logging
+    pub enabled: c_int,      // 0 disables the entry without removing it
+}
+
+pub const PATCH_DECLINED: c_int = 0;
+pub const PATCH_HANDLED: c_int = 1;
 ```
 
 When control reaches a patched function, the codegen interception hook
@@ -44,9 +56,11 @@ When control reaches a patched function, the codegen interception hook
 - return **`PATCH_DECLINED`** to fall through and run the original body
   unchanged (an "augment", e.g. observe-and-continue).
 
-## Author helper API (`runtime/include/shims.h`)
+## Author helper API
 
-Inside a `PatchFn` you can reach back into the game:
+Inside a `PatchFn` you can reach back into the game (declare these
+`extern "C"`; they resolve from the host game binary at dlopen, exactly like a
+JIT chunk's shim calls):
 
 - `patch_call_original()` — run the original function this patch replaced.
 - `patch_call_function(binary, file_off)` — call any game function by identity.
@@ -57,40 +71,51 @@ Inside a `PatchFn` you can reach back into the game:
   `(binary basename, file_off)` identity.
 
 Plus the usual shim surface (`memb`/`memw` reads and writes, register access)
-for reading arguments and writing results.
+for reading arguments and writing results. The JIT chunk prelude
+(`saisei-jitc/rt/saisei_rt.rs`) is the reference for these signatures — a patch
+bundle binds the same ABI.
 
 ## Writing a bundle
 
-Create `patches/<name>/<name>.c`. Export an array of `GamePatch` entries and its
-count under the two fixed symbol names the loader looks up:
+Create `patches/<name>/` as a tiny cdylib crate (or a single `.rs` compiled
+with `rustc --crate-type cdylib`). Export the two fixed symbols the loader
+looks up:
 
-```c
-#include "shims.h"
-#include "game_config.h"
+```rust
+use core::ffi::{c_char, c_int};
 
-static int my_fn(uint16_t expected_retip, const char *f, const char *fn, int l) {
-  (void)f; (void)fn; (void)l;
-  /* ... read args via memb/memw, do work, maybe patch_call_original() ... */
-  return PATCH_HANDLED;     /* or PATCH_DECLINED to run the original */
+unsafe extern "C" fn my_fn(
+    _expected_retip: u16,
+    _file: *const c_char,
+    _func: *const c_char,
+    _line: c_int,
+) -> c_int {
+    // ... read args via memb/memw, do work, maybe patch_call_original() ...
+    1 // PATCH_HANDLED (0 = PATCH_DECLINED to run the original)
 }
 
-const GamePatch bundle_patches[] = {
-  { "game.bin", 0x0984, my_fn, "my_fn", 1 },
-};
-const size_t bundle_patch_count = sizeof(bundle_patches) / sizeof(bundle_patches[0]);
+#[no_mangle]
+pub static bundle_patches: [GamePatch; 1] = [GamePatch {
+    file: c"game.bin".as_ptr(),
+    file_off: 0x0984,
+    fn_: Some(my_fn),
+    name: c"my_fn".as_ptr(),
+    enabled: 1,
+}];
+
+#[no_mangle]
+pub static bundle_patch_count: usize = 1;
 ```
 
-Compile it to a shared object against the runtime headers:
-
 ```bash
-clang -shared -fPIC -O1 patches/<name>/<name>.c \
-      -I runtime/include -o patches/<name>/<name>.so
+rustc --edition 2021 --crate-type cdylib -C panic=abort \
+      -o patches/<name>/<name>.so patches/<name>/<name>.rs
 ```
 
 ## Loading a bundle
 
 The runtime loads bundles at startup and registers them into one patch registry
-(`patch_register` in `runtime/core/shims.c`). Two sources feed that registry:
+(`patch_register` in `runtime/src/shims.rs`). Two sources feed that registry:
 
 - **Built-in:** entries listed in the per-game `GameConfig.patches` table.
 - **Separately delivered:** a `.so` passed to the runtime binary as
@@ -99,7 +124,7 @@ The runtime loads bundles at startup and registers them into one patch registry
   needs no rebuild of the game or the runtime.
 
 Because bundles ride the same JIT dispatch, run the game binary with the JIT
-environment  normally sets (`SAISEI_REPO_ROOT`, `SAISEI_PYTHON`,
+environment the launcher normally sets (`SAISEI_REPO_ROOT`, `SAISEI_JITC`,
 `SAISEI_JIT_DIR`) so first-reached code still compiles on demand.
 
 ## How it fits the whole

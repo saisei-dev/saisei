@@ -32,15 +32,20 @@ fn parse_int(s: &str, what: &str) -> i64 {
 
 // ---------- key / hex / address helpers (pure, unit-tested) ----------
 
-/// Map a friendly key name to a 7-bit DOS scancode (compiler's SCANCODES /
-/// ASCII_TO_SCAN table). Returns the "control: ..." error text on failure.
+/// Map a friendly key name to a DOS scancode byte for the control protocol
+/// (compiler's SCANCODES / ASCII_TO_SCAN table). Bit 7 marks the extended
+/// (grey, 0xE0-prefixed) variant: the named arrow keys are the dedicated grey
+/// cursor keys on a real keyboard, so they resolve to 0x80|code — games whose
+/// INT9 handlers track the E0 prefix (e.g. DM's IBMIO movement dispatch)
+/// distinguish them from the keypad codes. Returns the "control: ..." error
+/// text on failure.
 fn resolve_key(name: &str) -> Result<u8, String> {
     let n = name.to_lowercase();
     match n.as_str() {
-        "up" => return Ok(0x48),
-        "down" => return Ok(0x50),
-        "left" => return Ok(0x4B),
-        "right" => return Ok(0x4D),
+        "up" => return Ok(0x48 | 0x80),
+        "down" => return Ok(0x50 | 0x80),
+        "left" => return Ok(0x4B | 0x80),
+        "right" => return Ok(0x4D | 0x80),
         "space" => return Ok(0x39),
         "enter" => return Ok(0x1C),
         "esc" => return Ok(0x01),
@@ -723,10 +728,11 @@ mod tests {
 
     #[test]
     fn keys_named() {
-        assert_eq!(resolve_key("up"), Ok(0x48));
-        assert_eq!(resolve_key("DOWN"), Ok(0x50));
-        assert_eq!(resolve_key("left"), Ok(0x4B));
-        assert_eq!(resolve_key("right"), Ok(0x4D));
+        // Arrow names are the grey cursor keys: bit 7 = extended (E0-prefixed).
+        assert_eq!(resolve_key("up"), Ok(0xC8));
+        assert_eq!(resolve_key("DOWN"), Ok(0xD0));
+        assert_eq!(resolve_key("left"), Ok(0xCB));
+        assert_eq!(resolve_key("right"), Ok(0xCD));
         assert_eq!(resolve_key("space"), Ok(0x39));
         assert_eq!(resolve_key("enter"), Ok(0x1C));
         assert_eq!(resolve_key("esc"), Ok(0x01));
@@ -767,11 +773,12 @@ mod tests {
 
     #[test]
     fn tap_payload_shape() {
-        // ticks=300 -> 0x012C little-endian; sc for 'up' = 0x48.
+        // ticks=300 -> 0x012C little-endian; 'up' = grey Up = 0x48 with the
+        // extended bit (0x80) set so the shim emits the E0-prefixed make/break.
         let sc = resolve_key("up").unwrap();
         let ticks: i64 = 300;
         let payload = [sc, (ticks & 0xFF) as u8, ((ticks >> 8) & 0xFF) as u8];
-        assert_eq!(payload, [0x48, 0x2C, 0x01]);
+        assert_eq!(payload, [0xC8, 0x2C, 0x01]);
     }
 
     #[test]

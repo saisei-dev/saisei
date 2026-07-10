@@ -51,6 +51,13 @@ All bytes you write to the FIFO are interpreted by the shim's stdin reader
 | `\x10 <sc>` | Press scancode `sc` (no auto-release). The program sees the key as held until you send the matching release. |
 | `\x11 <sc>` | Release scancode `sc`. |
 | `\x12 <sc> <ticks_lo> <ticks_hi>` | **Tap**: press + schedule release after exactly N BIOS IRQ0 ticks of game time. The deterministic-input primitive — see below. |
+
+Bit 7 of `<sc>` selects the **extended (grey) variant** of the 7-bit code — the
+dedicated cursor/nav cluster, which real keyboards send E0-prefixed (and, with
+NumLock on — our boot default, as on real ATs — wrapped in the fake-shift
+framing `E0 2A … E0 AA`). E.g. `\x10\xC8` presses grey-Up, `\x10\x48`
+presses keypad-8. Games that key on the grey cluster (DM's movement) need the
+extended variant; `saisei control` resolves `up/down/left/right` to it.
 | `\x14` | Save a screenshot to `build/<name>/screenshots/screenshot<N>.png`. The counter is per-process. |
 | `\r` | Press Enter (auto-paired make/break, like real BIOS keyboard input). |
 | printable ASCII | Same as `\r` for the corresponding ASCII character. |

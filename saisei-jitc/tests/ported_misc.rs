@@ -1,23 +1,33 @@
-//! Ported from tests/test_*.py — miscellaneous compiler + one C-shim test:
+//! Ported from tests/test_*.py — miscellaneous compiler + one C-shim test.
+//!
+//! PORT DISPOSITIONS (C backend deleted):
+//!   unchanged: disassemble_retf__retf (front-half); parity8_helper (ported
+//!              to a rustc-compiled chunk-shell — no C toolchain)
+//!   ported:    filter_internal_labels (in-function extern label → match arm),
+//!              chunk_wrappers (was ir_to_c_header: .h prototypes/macros are a
+//!              C artifact; the Rust equivalent is the per-function `_impl`
+//!              wrapper emission), rcb_mov round-trip (active, was #[ignore]d
+//!              under the C header test), io_port_shim_coverage (scans
+//!              runtime/src/*.rs + build/*/jit/*.rs — the old scan over
+//!              runtime/**/*.c and build/*.c had gone vacuous: no .c exists)
+//!   collapsed: rcb ARITHMETIC (add via es:[0xFF2C]) → asserted Unsupported
+//!              ("rcb") — the Rust backend supports RCB operands on mov only
 //!
 //! This file mixes compiler tests (`mod common`) with one C-shim-style test
-//! (`mod shim_common`, for repo_root/guard). Run single-threaded is not required
-//! for the compiler tests, but the parity8 test uses the shim guard for parity
-//! with the other shim tests.
+//! (`mod shim_common`, for repo_root/guard).
 #![allow(non_snake_case)]
 mod common;
 mod shim_common;
 
 use common::*;
 use regex::Regex;
-use saisei_jitc::ir_to_c;
 use serde_json::json;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 // ==========================================================================
-// The the original CLI writes disasm.json = the flat instruction list; that maps to
+// The original CLI writes disasm.json = the flat instruction list; that maps to
 // the parsed IR's `code` array. A lone 0xCB byte decodes to `retf`.
 // ==========================================================================
 #[test]
@@ -32,152 +42,92 @@ fn disassemble_retf__retf() {
 }
 
 // ==========================================================================
-// An extern_label that falls inside a known function's body is filtered out of
-// the dispatcher lift and stays an in-function `case`.
+// An extern_label that falls inside a known function's body stays an
+// in-function block: the chunk renders it as its own dispatch match arm.
 // ==========================================================================
 #[test]
-fn ir_to_c_filter_internal_labels__filters_internal_extern_labels() {
-    let ir = json!({
-        "functions": [
-            {
-                "start": 0x0100,
-                "instructions": [
-                    {"address": 0x0100, "mnemonic": "mov", "op_str": "al, 1", "bytes": "B001"},
-                    {"address": 0x0102, "mnemonic": "jmp", "op_str": "0x200", "bytes": "E9FB00"},
-                    {"address": 0x0200, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
-                ],
-            }
+fn filter_internal_labels__internal_label_is_an_in_function_arm() {
+    let func = json!({
+        "start": 0x0100,
+        "instructions": [
+            {"address": 0x0100, "mnemonic": "mov", "op_str": "al, 1", "bytes": "B001"},
+            {"address": 0x0102, "mnemonic": "jmp", "op_str": "0x200", "bytes": "E9FB00", "target": 0x0200},
+            {"address": 0x0200, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
-        "extern_labels": [0x0200],
     });
-    // the original wrote 8 zero bytes as the "exe" image.
-    let exe = vec![0u8; 8];
-    let (c_text, _h) = ir_to_c::emit_c(&ir, &exe, "", None, Path::new("program.c"));
-    assert!(c_text.contains("case 0x0200:"), "{c_text}");
+    let src = render_rs(&func, &[], "");
+    assert!(src.contains("0x0200 => {"), "{src}");
+    assert!(src.contains("pc = 0x0200;"), "{src}");
 }
 
 // ==========================================================================
+// Was ir_to_c_header__emits_header_and_includes: the .h prototypes and call
+// macros are C artifacts. The Rust equivalent contract: every function gets an
+// exported `#[no_mangle]` `_impl` wrapper in the chunk.
 // ==========================================================================
 #[test]
-fn ir_to_c_header__emits_header_and_includes() {
-    let ir = json!({
-        "functions": [
-            {
-                "start": 0x0000,
-                "instructions": [
-                    {"address": 0x0000, "mnemonic": "ret", "op_str": "", "bytes": "C3"}
-                ],
-            },
-            {
-                "start": 0x0003,
-                "instructions": [
-                    {"address": 0x0003, "mnemonic": "ret", "op_str": "", "bytes": "C3"}
-                ],
-            },
-        ]
-    });
-    let exe = vec![0xC3u8, 0xC3];
-    let (c_text, h_text) = ir_to_c::emit_c(&ir, &exe, "", None, Path::new("program.c"));
-
+fn chunk_wrappers__every_function_gets_an_exported_impl() {
+    let funcs = [
+        json!({"start": 0x0000, "instructions": [
+            {"address": 0x0000, "mnemonic": "ret", "op_str": "", "bytes": "C3"}]}),
+        json!({"start": 0x0003, "instructions": [
+            {"address": 0x0003, "mnemonic": "ret", "op_str": "", "bytes": "C3"}]}),
+    ];
+    let src = render_rs_dispatch(&funcs, &[]);
     assert!(
-        h_text.contains(
-            "void func_0000_impl(uint16_t expected_retip, const char *file, const char *func, int line);"
-        ),
-        "{h_text}"
+        src.contains("pub extern \"C\" fn func_0000_impl(expected_retip: u16"),
+        "{src}"
     );
     assert!(
-        h_text.contains(
-            "#define func_0000(retip) func_0000_impl((retip), __FILE__, __func__, __LINE__)"
-        ),
-        "{h_text}"
+        src.contains("pub extern \"C\" fn func_0003_impl(expected_retip: u16"),
+        "{src}"
     );
-    assert!(
-        h_text.contains(
-            "void func_0003_impl(uint16_t expected_retip, const char *file, const char *func, int line);"
-        ),
-        "{h_text}"
-    );
-    assert!(
-        h_text.contains(
-            "#define func_0003(retip) func_0003_impl((retip), __FILE__, __func__, __LINE__)"
-        ),
-        "{h_text}"
-    );
-
-    assert!(c_text.contains("#include \"program.h\""), "{c_text}");
-    assert!(!c_text.contains("Forward declarations"), "{c_text}");
+    // Both route through the shared per-chunk dispatch state machine.
+    assert!(src.contains("dispatch(0x0000, expected_retip"), "{src}");
+    assert!(src.contains("dispatch(0x0003, expected_retip"), "{src}");
 }
 
 // ==========================================================================
-// es:[0xFF2C] is an RCB (register-control-block) field: mem ops become
-// rcb_read16 / rcb_write16 with faithful add-flag computation.
-//
-// NOTE(port-divergence): the Rust `saisei-jitc` port does NOT yet rewrite RCB
-// field operands inside ARITHMETIC instructions. the original's `handle_arithmetic`
-// runs each dest/src operand through `_match_rcb_access`, so `add ax, es:[0xFF2C]`
-// emits `uint32_t src = rcb_read16(DATA_BASE_SEG);` and `add es:[0xFF2C], ax`
-// emits `uint32_t old = rcb_read16(...)` + `rcb_write16(...)`. The Rust
-// `handle_arithmetic` (ir_to_c.rs:3297-3298) explicitly stubs that path
-// (`match_rcb_access` omitted), so those operands stay `memw(es, DATA_BASE_SEG)` /
-// `memw_write(es, DATA_BASE_SEG, ...)`. The `mov`-path RCB rewrite (first + last
-// asserts) DOES work in Rust; only the `add` read/write/read-modify-write asserts
-// diverge. Assertions kept intact — this is a Rust codegen gap, not a bad port.
+// es:[0xFF2C] is an RCB (register-control-block) field. The Rust backend
+// rewrites RCB operands on `mov` (rcb_read16/rcb_write16); RCB operands inside
+// ARITHMETIC instructions are intentionally Unsupported (a JIT hard error) —
+// no game-reached chunk uses them outside mov.
 // ==========================================================================
 #[test]
-#[ignore]
-fn ir_to_c_rcb_logging__rcb_logging() {
-    let ir = json!({
-        "functions": [
-            {
-                "start": 0x0000,
-                "instructions": [
-                    {"address": 0x0000, "mnemonic": "mov", "op_str": "word ptr es:[0xFF2C], ax", "bytes": "66"},
-                    {"address": 0x0003, "mnemonic": "add", "op_str": "ax, word ptr es:[0xFF2C]", "bytes": "66"},
-                    {"address": 0x0006, "mnemonic": "add", "op_str": "word ptr es:[0xFF2C], ax", "bytes": "66"},
-                    {"address": 0x0009, "mnemonic": "mov", "op_str": "ax, word ptr es:[0xFF2C]", "bytes": "66"},
-                    {"address": 0x000C, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
-                ],
-            }
-        ]
+fn rcb_mov__reads_and_writes_via_rcb_helpers() {
+    let func = json!({
+        "start": 0x0000,
+        "instructions": [
+            {"address": 0x0000, "mnemonic": "mov", "op_str": "word ptr es:[0xFF2C], ax", "bytes": "66"},
+            {"address": 0x0003, "mnemonic": "mov", "op_str": "ax, word ptr es:[0xFF2C]", "bytes": "66"},
+            {"address": 0x0006, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
+        ],
     });
-    let exe = vec![0u8; 2];
-    let (src, _h) = ir_to_c::emit_c(&ir, &exe, "", None, Path::new("program.c"));
+    let src = render_rs(&func, &[], "");
+    assert!(src.contains("rcb_write16(DATA_BASE_SEG, ax());"), "{src}");
+    assert!(src.contains("set_ax(rcb_read16(DATA_BASE_SEG));"), "{src}");
+}
 
-    assert!(src.contains("rcb_write16(DATA_BASE_SEG, ax);"), "{src}");
-    assert!(src.contains("uint32_t old = ax;"), "{src}");
-    assert!(
-        src.contains("uint32_t src = rcb_read16(DATA_BASE_SEG);"),
-        "{src}"
-    );
-    assert!(src.contains("uint32_t tmp = old + src;"), "{src}");
-    assert!(src.contains("CF = tmp > 0xFFFF;"), "{src}");
-    assert!(src.contains("ax = tmp & 0xFFFF;"), "{src}");
-    assert!(
-        src.contains("OF = (~(old ^ src) & (old ^ tmp) & 0x8000) != 0;"),
-        "{src}"
-    );
-    assert!(
-        src.contains("uint32_t old = rcb_read16(DATA_BASE_SEG);"),
-        "{src}"
-    );
-    assert!(src.contains("uint32_t src = ax;"), "{src}");
-    assert!(src.contains("uint32_t tmp = old + src;"), "{src}");
-    assert!(
-        src.contains("rcb_write16(DATA_BASE_SEG, tmp & 0xFFFF);"),
-        "{src}"
-    );
-    assert!(
-        src.contains("OF = (~(old ^ src) & (old ^ tmp) & 0x8000) != 0;"),
-        "{src}"
-    );
-    assert!(src.contains("ax = rcb_read16(DATA_BASE_SEG);"), "{src}");
+#[test]
+fn rcb_arithmetic__is_unsupported() {
+    let func = json!({
+        "start": 0x0000,
+        "instructions": [
+            {"address": 0x0000, "mnemonic": "add", "op_str": "ax, word ptr es:[0xFF2C]", "bytes": "66"},
+            {"address": 0x0003, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
+        ],
+    });
+    let err = try_render_rs(&func, &[], "").unwrap_err();
+    assert!(err.0.contains("rcb"), "{}", err.0);
 }
 
 // ==========================================================================
-// parity8 is a `static inline` in runtime/include/shims.h, so it is NOT an
-// exported .so symbol — it cannot be reached via dlopen/FFI. The faithful port
-// is exactly the original approach: compile a C snippet that #includes shims.h and
-// calls parity8, then run it; a non-zero return code fails a specific case.
+// parity8 is an inline helper of the chunk prelude (rt/saisei_rt.rs), not an
+// exported runtime symbol — it cannot be reached via dlopen/FFI on the shim
+// .so. So exercise it exactly the way a chunk does: compile a chunk-shell .rs
+// that include!s the prelude (the same rustc flags as compile_chunk), dlopen
+// it beside the runtime .so, and check all 256 inputs against a popcount
+// reference. Doubles as a "the prelude compiles standalone" regression test.
 // ==========================================================================
 #[test]
 fn parity8_helper__matches_x86_even_parity() {
@@ -186,46 +136,90 @@ fn parity8_helper__matches_x86_even_parity() {
 
     let dir = std::env::temp_dir().join(format!("saisei_parity8_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create temp dir");
-    let source = dir.join("parity8_check.c");
-    let binary = dir.join("parity8_check");
+    std::fs::copy(
+        root.join("saisei-jitc/rt/saisei_rt.rs"),
+        dir.join("saisei_rt.rs"),
+    )
+    .expect("copy prelude");
 
-    let src = r#"
-#include <stdint.h>
-#include "shims.h"
+    // The chunk-shell header mirrors codegen::emit_chunk's exactly.
+    let src = r#"#![no_std]
+#![allow(dead_code, non_snake_case, non_upper_case_globals, non_camel_case_types)]
+#![allow(unused_parens, unused_mut, unused_assignments, unused_unsafe, unused_variables)]
+#![allow(unreachable_code, unreachable_patterns)]
+use core::ffi::{c_char, c_int, c_void};
+include!("saisei_rt.rs");
+pub const SAISEI_SITE: &core::ffi::CStr = c"parity8_check";
 
-int main(void) {
-  /* PF should be 1 for even popcount in the low byte. */
-  if (parity8(0x00) != 1) return 1;
-  if (parity8(0x01) != 0) return 2;
-  if (parity8(0x03) != 1) return 3;
-  if (parity8(0xFF) != 1) return 4;
-  return 0;
+/// 0 if parity8 matches even-popcount parity for every byte; else input+1.
+#[no_mangle]
+pub extern "C" fn parity8_check() -> c_int {
+    let mut i: u32 = 0;
+    while i < 256 {
+        let v = i as u8;
+        let expect = (v.count_ones() % 2 == 0) as u8;
+        if parity8(v) != expect {
+            return (i as c_int) + 1;
+        }
+        i += 1;
+    }
+    0
 }
 "#;
-    std::fs::write(&source, src).expect("write parity8_check.c");
+    let rs = dir.join("parity8_check.rs");
+    let so = dir.join("parity8_check.so");
+    std::fs::write(&rs, src).expect("write parity8_check.rs");
 
-    let compile = Command::new("gcc")
-        .current_dir(&root)
-        .arg("-Iruntime/include")
-        .arg(&source)
-        .arg("-o")
-        .arg(&binary)
+    let compile = Command::new("rustc")
+        .current_dir(&dir)
+        .args([
+            "--edition",
+            "2021",
+            "--crate-type",
+            "cdylib",
+            "-C",
+            "opt-level=1",
+            "-C",
+            "overflow-checks=off",
+            "-C",
+            "debug-assertions=off",
+            "-C",
+            "panic=abort",
+            "-o",
+        ])
+        .arg(&so)
+        .arg(&rs)
         .status()
-        .expect("spawn gcc");
-    assert!(compile.success(), "gcc failed to compile parity8_check.c");
+        .expect("spawn rustc");
+    assert!(
+        compile.success(),
+        "rustc failed to compile parity8_check.rs"
+    );
 
-    let run = Command::new(&binary)
-        .current_dir(&root)
-        .status()
-        .expect("spawn parity8_check");
-    assert!(run.success(), "parity8_check exited with {:?}", run.code());
+    // The prelude binds extern DATA (cpu, virtual_memory, …): preload the
+    // runtime .so RTLD_GLOBAL so those resolve when the chunk-shell loads.
+    unsafe {
+        let rt = libloading::os::unix::Library::open(
+            Some(shim_common::runtime_so()),
+            libc::RTLD_NOW | libc::RTLD_GLOBAL,
+        )
+        .expect("dlopen runtime .so RTLD_GLOBAL");
+        let chk = libloading::Library::new(&so).expect("dlopen parity8_check.so");
+        let f: libloading::Symbol<unsafe extern "C" fn() -> i32> =
+            chk.get(b"parity8_check").expect("parity8_check symbol");
+        let rc = f();
+        assert_eq!(rc, 0, "parity8 mismatch at input 0x{:02X}", rc - 1);
+        drop(chk);
+        drop(rt);
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ==========================================================================
-// + regex logic. Every inb/inw/outb/outw port a resolved build artifact touches
-// must be implemented somewhere in the runtime shims.
+// Every inb/inw/outb/outw port a JIT chunk artifact touches must be handled
+// somewhere in the runtime shims (runtime/src). The chunk artifacts are the
+// build/*/jit/*.rs files; the shim surface is runtime-rs/src/*.rs.
 // ==========================================================================
 
 /// int(s, 16) — s is bare hex digits (no 0x prefix).
@@ -243,31 +237,26 @@ fn parse_base0(s: &str) -> i64 {
     }
 }
 
-/// Recursively collect every *.c under `dir` (mirrors Path.rglob("*.c")).
-fn rglob_c(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let p = entry.path();
-        if p.is_dir() {
-            rglob_c(&p, out);
-        } else if p.extension().and_then(|e| e.to_str()) == Some("c") {
-            out.push(p);
-        }
-    }
-}
-
-/// _extract_shim_ports() — the original returns {inb/inw/outb/outw: handled}, all the
-/// SAME set, so we just return the single `handled` set.
+/// Every port the Rust runtime handles: `port == 0x…` comparisons, `0x… =>`
+/// match arms, and `…_PORTS`-style array literals across runtime/src.
 fn extract_shim_ports() -> HashSet<i64> {
     let root = shim_common::repo_root();
-    let mut sources: Vec<PathBuf> = vec![root.join("runtime").join("core").join("shims.c")];
-    let mut rest: Vec<PathBuf> = Vec::new();
-    rglob_c(&root.join("runtime"), &mut rest);
-    rest.sort();
-    sources.extend(rest);
+    let src_dir = root.join("runtime").join("src");
+
+    let mut sources: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&src_dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("rs") {
+                sources.push(p);
+            }
+        }
+    }
+    sources.sort();
+    assert!(
+        !sources.is_empty(),
+        "no runtime sources found under {src_dir:?}"
+    );
 
     let text: String = sources
         .iter()
@@ -281,12 +270,21 @@ fn extract_shim_ports() -> HashSet<i64> {
     for c in port_eq.captures_iter(&text) {
         handled.insert(parse_hex(&c[1]));
     }
-    let case_re = Regex::new(r"case 0x([0-9A-Fa-f]+):").unwrap();
-    for c in case_re.captures_iter(&text) {
-        handled.insert(parse_hex(&c[1]));
+    // Match arms: `0x61 => …` / `0x40..=0x43 =>` (both bounds collected).
+    let arm_re = Regex::new(r"0x([0-9A-Fa-f]+)\s*(?:\.\.=\s*0x([0-9A-Fa-f]+)\s*)?=>").unwrap();
+    for c in arm_re.captures_iter(&text) {
+        let lo = parse_hex(&c[1]);
+        if let Some(hi) = c.get(2) {
+            let hi = parse_hex(hi.as_str());
+            for v in lo..=hi.min(lo + 0x400) {
+                handled.insert(v);
+            }
+        } else {
+            handled.insert(lo);
+        }
     }
-    // `const uint16_t x_ports[] = { 0x388, 0x389, 0xFFFF };`
-    let ports_re = Regex::new(r"_ports\[\]\s*=\s*\{([^}]*)\}").unwrap();
+    // `static OPL2_PORTS: [u16; 3] = [0x388, 0x389, 0xFFFF];`
+    let ports_re = Regex::new(r"(?i)_ports\s*(?::[^=]*)?=\s*\[([^\]]*)\]").unwrap();
     let hex_re = Regex::new(r"0x([0-9A-Fa-f]+)").unwrap();
     for body in ports_re.captures_iter(&text) {
         for m in hex_re.captures_iter(&body[1]) {
@@ -299,21 +297,20 @@ fn extract_shim_ports() -> HashSet<i64> {
     handled
 }
 
-/// _resolve_port(arg, lines, line_no) — literal port, or a `dx`/`dl` backscan.
+/// Literal port, or a `set_dx(…)`/`set_dl(…)` backscan (chunk .rs syntax).
 fn resolve_port(arg: &str, lines: &[&str], line_no: usize) -> Option<i64> {
     let full = Regex::new(r"^(?:0x[0-9A-Fa-f]+|\d+)$").unwrap();
     if full.is_match(arg) {
         return Some(parse_base0(arg));
     }
-    if arg != "dx" {
+    if !arg.starts_with("dx") {
         return None;
     }
 
-    let dx_re = Regex::new(r"\bdx\s*=\s*(0x[0-9A-Fa-f]+|\d+)\s*;").unwrap();
-    let dl_re = Regex::new(r"\bdl\s*=\s*(0x[0-9A-Fa-f]+|\d+)\s*;").unwrap();
+    let dx_re = Regex::new(r"set_dx\((0x[0-9A-Fa-f]+|\d+)\);").unwrap();
+    let dl_re = Regex::new(r"set_dl\((0x[0-9A-Fa-f]+|\d+)\);").unwrap();
 
     let mut dx_value: Option<i64> = None;
-    // range(line_no - 1, max(-1, line_no - 24), -1)
     let stop = std::cmp::max(-1i64, line_no as i64 - 24);
     let mut back = line_no as i64 - 1;
     while back > stop {
@@ -333,18 +330,22 @@ fn resolve_port(arg: &str, lines: &[&str], line_no: usize) -> Option<i64> {
     dx_value
 }
 
-/// _artifact_io_calls() -> [(filename, 1-based line, op, port)].
+/// [(chunk filename, 1-based line, op, port)] across build/*/jit/*.rs.
 fn artifact_io_calls() -> Vec<(String, usize, String, i64)> {
     let root = shim_common::repo_root();
     let build = root.join("build");
 
-    // sorted(build.glob("*.c")) — non-recursive.
     let mut paths: Vec<PathBuf> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&build) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("c") {
-                paths.push(p);
+    if let Ok(games) = std::fs::read_dir(&build) {
+        for game in games.flatten() {
+            let jit = game.path().join("jit");
+            if let Ok(entries) = std::fs::read_dir(&jit) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("rs") {
+                        paths.push(p);
+                    }
+                }
             }
         }
     }
@@ -359,7 +360,7 @@ fn artifact_io_calls() -> Vec<(String, usize, String, i64)> {
         for (idx, line) in lines.iter().enumerate() {
             if let Some(m) = io_re.captures(line) {
                 let op = m[1].to_string();
-                let arg = m[2].trim().to_string();
+                let arg = m[2].trim().trim_end_matches("()").to_string();
                 if let Some(port) = resolve_port(&arg, &lines, idx) {
                     let name = path
                         .file_name()
@@ -380,7 +381,6 @@ fn io_port_shim_coverage__resolved_artifact_io_ports_are_implemented_in_shims() 
     let mut missing: Vec<(String, usize, String, i64)> = Vec::new();
 
     for (filename, line_no, op, port) in artifact_io_calls() {
-        // the original: `if port not in shim_ports[op]` — every op maps to the same set.
         let _ = &op;
         if !handled.contains(&port) {
             missing.push((filename, line_no, op, port));

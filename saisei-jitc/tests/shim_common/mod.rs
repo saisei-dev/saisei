@@ -45,7 +45,7 @@ impl Register16 {
     }
 }
 
-/// cpu.flags — matches runtime/include/cpu_state.h EXACTLY (includes PF, which
+/// cpu.flags — matches the runtime CpuState layout (cpu.rs) EXACTLY (includes PF, which
 /// the old the original test struct omitted).
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -59,7 +59,7 @@ pub struct Flags {
     pub DF: u8,
 }
 
-/// The `cpu` global — mirrors CPUState in runtime/include/cpu_state.h.
+/// The `cpu` global — mirrors the runtime CpuState layout (cpu.rs).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CpuState {
@@ -79,37 +79,35 @@ pub struct CpuState {
     pub flags: Flags,
 }
 
-/// Build the runtime shim .so once; return the cached path. Uses the exact gcc
+/// The runtime shim .so: cargo builds it directly (the `saisei-runtime` crate's
+/// cdylib target, SDL2/system libs linked via its build.rs) — no C toolchain
+/// involved. Every `#[no_mangle]` fn and data symbol is dynamically exported,
+/// so the tests can dlsym them. Each test dlopens an isolated COPY (fresh
+/// globals). `game_config` resolves to the runtime's weak default (no per-game
+/// config needed for the shim unit tests).
 fn cached_so() -> &'static PathBuf {
     static SO: OnceLock<PathBuf> = OnceLock::new();
     SO.get_or_init(|| {
         let root = repo_root();
-        let out = std::env::temp_dir().join(format!("saisei_shims_base_{}.so", std::process::id()));
-        let status = std::process::Command::new("gcc")
-            .current_dir(&root)
-            .args([
-                "-shared",
-                "-fPIC",
-                "-Iruntime/include",
-                "runtime/core/shims.c",
-                "runtime/core/save_manager.c",
-                "runtime/core/snapshot.c",
-                "runtime/hw/io_bus.c",
-                "runtime/hw/audio.c",
-                "runtime/hw/video.c",
-                "runtime/hw/keyboard.c",
-                "runtime/hw/timer.c",
-                "runtime/os/dos.c",
-                "runtime/os/bios.c",
-                "runtime/os/mouse.c",
-                "-o",
-            ])
-            .arg(&out)
-            .status()
-            .expect("spawn gcc");
-        assert!(status.success(), "gcc failed to build runtime shims");
-        out
+        let so = root.join("target/release/libsaisei_runtime.so");
+        if !so.exists() {
+            let st = std::process::Command::new("cargo")
+                .current_dir(&root)
+                .args(["build", "--release", "-p", "saisei-runtime"])
+                .status()
+                .expect("spawn cargo");
+            assert!(st.success(), "cargo build -p saisei-runtime failed");
+        }
+        assert!(so.exists(), "cargo did not produce {}", so.display());
+        so
     })
+}
+
+/// Path to the runtime .so (building it if needed) — for tests that need the
+/// shared library itself (e.g. RTLD_GLOBAL preloading for chunk-shell tests)
+/// rather than an isolated ShimLib copy.
+pub fn runtime_so() -> &'static PathBuf {
+    cached_so()
 }
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);

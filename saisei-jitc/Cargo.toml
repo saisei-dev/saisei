@@ -2,7 +2,7 @@
 name = "saisei-jitc"
 version = "0.0.0"
 edition = "2021"
-description = "Saisei JIT translator (Rust port of compiler/). Decodes an in-memory x86 region to the lossless JSON IR and, eventually, to C."
+description = "Saisei JIT translator. Decodes an in-memory x86 region to the lossless JSON IR and emits native Rust chunks for rustc."
 
 [[bin]]
 name = "saisei-jitc"

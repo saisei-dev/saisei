@@ -2,23 +2,23 @@
 
 **再生 — "rebirth."** Take a DOS game you loved, and bring it back to life as real, native code.
 
-The classics you grew up with are frozen in old binaries — playable only through an emulator, and a black box even then. Saisei thaws them out. As a game runs, Saisei decompiles it into readable C, compiles that with clang, and runs *it*. The translated C **is** the game. No emulator sits in the middle — and nothing stays a black box.
+The classics you grew up with are frozen in old binaries — playable only through an emulator, and a black box even then. Saisei thaws them out. As a game runs, Saisei decompiles it into readable Rust, compiles that with rustc, and runs *it*. The translated Rust **is** the game. No emulator sits in the middle — and nothing stays a black box.
 
 So a game stops being a sealed artifact and becomes something you can open up:
 
 - ▶️ **Play** — run the classics as fast, native programs.
-- 🔍 **Explore** — read the C Saisei generates and finally see how your favorite game actually works.
+- 🔍 **Explore** — read the Rust Saisei generates and finally see how your favorite game actually works.
 - 🎨 **Remake** *(WIP)* — swap the art, remix the music, rewrite the gameplay, and ship your own cut.
 
 Packed, overlay-swapped, and self-modifying games all just work, because Saisei only ever compiles the bytes that are about to run. Old games don't have to stay frozen — give them a second life.
 
 ## Start playing
 
-Set up once. You'll need the reference 3.10+, `clang`, and SDL2:
+Set up once. You'll need Rust (the whole toolchain is Rust) and SDL2:
 
 ```bash
-# Debian/Ubuntu:  sudo apt install clang libsdl2-dev libcapstone-dev pkg-config
-# macOS:          brew install llvm sdl2 capstone pkg-config
+# Debian/Ubuntu:  sudo apt install libsdl2-dev pkg-config
+# macOS:          brew install sdl2 pkg-config
 # Rust:           https://rustup.rs
 
 # Build the toolchain (the `saisei` + `saisei-jitc` binaries):
@@ -42,16 +42,16 @@ Two more commands for when you need them: `saisei run <name> --headless` runs wi
 
 Playing is the front door. The point is to make these games **open to tinker with** again — that's the direction:
 
-- 🤖 **Explore a game with an AI agent** *(WIP)* — turn the generated C into a map of how a game works. *(guide coming soon)*
+- 🤖 **Explore a game with an AI agent** *(WIP)* — turn the generated Rust into a map of how a game works. *(guide coming soon)*
 - 🩹 **Write patches** *(WIP)* — small, shareable mods that hook a game's own functions with no source changes. → [patch bundles](patches/README.md)
 - 🎨 **Replace art, music, and gameplay** *(WIP)* — swap a game's resources and behavior while it runs. *(coming soon)*
-- ❄️ **Freeze to a standalone binary** *(WIP)* — collect the compiled pieces into one native executable for the target of your choice: desktop (Linux, macOS, Windows) and eventually mobile (Android, iOS), with no the reference or clang required to run it. Your childhood DOS game, native on your phone. *(coming soon)*
+- ❄️ **Freeze to a standalone binary** *(WIP)* — collect the compiled pieces into one native executable for the target of your choice: desktop (Linux, macOS, Windows) and eventually mobile (Android, iOS), with no compiler required to run it. Your childhood DOS game, native on your phone. *(coming soon)*
 
 *(WIP = work in progress. These are the direction, not promises with dates — links land here as each one ships.)*
 
 ## How it works
 
-At run time Saisei loads the program image, takes the entry point from the MZ header, and JIT-compiles each code segment the first time control reaches it: decode → lossless IR → C → clang → `dlopen`. Nothing is decoded ahead of time, and compiled chunks are keyed by the bytes that are actually live — so a decompressed or overlaid region is recompiled from whatever is really there. The full design is in the [architecture overview](docs/architecture.md).
+At run time Saisei loads the program image, takes the entry point from the MZ header, and JIT-compiles each code segment the first time control reaches it: decode → lossless IR → Rust → rustc → `dlopen`. Nothing is decoded ahead of time, and compiled chunks are keyed by the bytes that are actually live — so a decompressed or overlaid region is recompiled from whatever is really there. The full design is in the [architecture overview](docs/architecture.md).
 
 ## Contributing
 
@@ -61,7 +61,7 @@ Saisei is early and there's plenty to build. Set up the dev tooling once:
 git config core.hooksPath .githooks   # runs `cargo fmt --check` before each commit
 ```
 
-Run `cargo fmt` and `cargo test` (with `SAISEI_CAPSTONE_LIB_DIR` set to your Capstone lib dir) before you push. Start with the [architecture overview](docs/architecture.md) and the [runtime memory model](docs/runtime_memory_model.md).
+Run `cargo fmt` and `cargo test` before you push. Start with the [architecture overview](docs/architecture.md) and the [runtime memory model](docs/runtime_memory_model.md).
 
 ## License
 

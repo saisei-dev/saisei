@@ -2,7 +2,7 @@
 name = "saisei"
 version = "0.0.0"
 edition = "2021"
-description = "Saisei launcher CLI ( + the source + the source + the source)."
+description = "Saisei launcher CLI (new-game / build / run / play)."
 
 [lib]
 name = "saisei"

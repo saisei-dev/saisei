@@ -1,11 +1,11 @@
-//! saisei-jitc — Rust port of the compiler/ JIT translator.
+//! saisei-jitc — the JIT translator CLI: disasm (bytes → IR), emit (IR → Rust
+//! chunk text), jit-compile (the runtime-invoked segment → .so pipeline).
 //!
-//! Subcommands (mirroring the reference entry points during the port):
 //! disasm <input> --outdir DIR [--image-base HEX] [--entry HEX ...]
 //! [--skip-entry-0000] [--cs-base HEX] [--max-insns N]
 //! — writes DIR/program.ir.json.
 
-use saisei_jitc::{disassemble, ir_to_c};
+use saisei_jitc::{codegen, disassemble};
 
 use std::path::PathBuf;
 use std::process::exit;
@@ -117,12 +117,16 @@ fn cmd_disasm(args: DisasmArgs) {
     std::fs::write(&out, ir).unwrap_or_else(|e| die(&format!("write {}: {e}", out.display())));
 }
 
-fn cmd_emit_c(mut it: std::vec::IntoIter<String>) {
+/// `emit <ir.json> [--out P] [--prefix P] [--image-base H] [--rt PATH]` —
+/// emit the chunk as readable Rust. Exits 3 if the chunk uses a construct the
+/// emitter can't express yet (the same condition is a hard error on the JIT
+/// path — use this subcommand to reproduce and fix such gaps offline).
+fn cmd_emit(mut it: std::vec::IntoIter<String>) {
     let mut positional: Vec<PathBuf> = Vec::new();
-    let mut out = PathBuf::from("program.c");
+    let mut out = PathBuf::from("program.rs");
     let mut prefix = String::new();
     let mut image_base: Option<i64> = None;
-    let mut _metadata: Option<PathBuf> = None;
+    let mut rt_path: Option<String> = None;
     while let Some(a) = it.next() {
         match a.as_str() {
             "--out" => out = PathBuf::from(it.next().unwrap_or_else(|| die("--out needs a value"))),
@@ -133,64 +137,27 @@ fn cmd_emit_c(mut it: std::vec::IntoIter<String>) {
                         .unwrap_or_else(|| die("--image-base needs a value")),
                 ))
             }
-            "--metadata" => {
-                _metadata = Some(PathBuf::from(
-                    it.next().unwrap_or_else(|| die("--metadata needs a value")),
-                ))
-            }
+            "--rt" => rt_path = Some(it.next().unwrap_or_else(|| die("--rt needs a value"))),
             other if other.starts_with("--") => die(&format!("unknown flag: {other}")),
             other => positional.push(PathBuf::from(other)),
         }
     }
-    if positional.len() != 2 {
-        die("emit-c needs <ir.json> <exe>");
+    if positional.len() != 1 {
+        die("emit needs <ir.json>");
     }
     let ir_bytes = std::fs::read(&positional[0])
         .unwrap_or_else(|e| die(&format!("read {}: {e}", positional[0].display())));
     let ir: serde_json::Value =
         serde_json::from_slice(&ir_bytes).unwrap_or_else(|e| die(&format!("parse IR: {e}")));
-    let code = std::fs::read(&positional[1])
-        .unwrap_or_else(|e| die(&format!("read {}: {e}", positional[1].display())));
-
-    let (c_text, h_text) = ir_to_c::emit_c(&ir, &code, &prefix, image_base, &out);
-    std::fs::write(&out, c_text).unwrap_or_else(|e| die(&format!("write {}: {e}", out.display())));
-    let hpath = out.with_extension("h");
-    std::fs::write(&hpath, h_text)
-        .unwrap_or_else(|e| die(&format!("write {}: {e}", hpath.display())));
-}
-
-/// `structured <ir.json> <code.bin> [--prefix P] [--image-base H]` — run the
-/// BASE (readable-C) renderer and print `{hex: [lines], "__extra__": {...}}`
-/// JSON to stdout. Used by the differential harness that validates the Rust
-/// structured renderer byte-identical against the reference.
-fn cmd_structured(mut it: std::vec::IntoIter<String>) {
-    let mut positional: Vec<PathBuf> = Vec::new();
-    let mut prefix = String::new();
-    let mut image_base: Option<i64> = None;
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--prefix" => prefix = it.next().unwrap_or_else(|| die("--prefix needs a value")),
-            "--image-base" => {
-                image_base = Some(parse_int(
-                    &it.next()
-                        .unwrap_or_else(|| die("--image-base needs a value")),
-                ))
-            }
-            other if other.starts_with("--") => die(&format!("unknown flag: {other}")),
-            other => positional.push(PathBuf::from(other)),
+    let rt = rt_path.unwrap_or_else(|| "saisei_rt.rs".to_string());
+    match codegen::emit_chunk(&ir, &prefix, image_base, &rt) {
+        Ok(rs) => std::fs::write(&out, rs)
+            .unwrap_or_else(|e| die(&format!("write {}: {e}", out.display()))),
+        Err(u) => {
+            eprintln!("[saisei-jitc] emit unsupported: {}", u.0);
+            exit(3);
         }
     }
-    if positional.len() != 2 {
-        die("structured needs <ir.json> <code.bin>");
-    }
-    let ir_bytes = std::fs::read(&positional[0])
-        .unwrap_or_else(|e| die(&format!("read {}: {e}", positional[0].display())));
-    let ir: serde_json::Value =
-        serde_json::from_slice(&ir_bytes).unwrap_or_else(|e| die(&format!("parse IR: {e}")));
-    let code = std::fs::read(&positional[1])
-        .unwrap_or_else(|e| die(&format!("read {}: {e}", positional[1].display())));
-    let out = ir_to_c::render_structured(&ir, &code, &prefix, image_base);
-    println!("{}", serde_json::to_string(&out).unwrap());
 }
 
 fn sha_hex16(data: &[u8]) -> String {
@@ -205,29 +172,17 @@ fn sha_hex16(data: &[u8]) -> String {
     s
 }
 
-/// Hash the pieces whose change must invalidate a cached chunk: the translator
-/// binary itself + the runtime headers (struct layouts compiled into the .so).
+/// Hash the piece whose change must invalidate a cached chunk: the translator
+/// binary itself. The embedded chunk prelude (`SAISEI_RT`, rt/saisei_rt.rs)
+/// and every emitter are compiled into the exe, so its bytes cover them —
+/// NOTE: the prelude's `#[repr(C)]` structs and the runtime's shims.rs layouts
+/// must be edited together; rebuilding this binary then recompiles all chunks.
 fn toolchain_hash() -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Ok(bytes) = std::fs::read(&exe) {
             h.update(&bytes);
-        }
-    }
-    if let Ok(repo) = std::env::var("SAISEI_REPO_ROOT") {
-        let inc = PathBuf::from(&repo).join("runtime").join("include");
-        if let Ok(rd) = std::fs::read_dir(&inc) {
-            let mut hs: Vec<PathBuf> = rd
-                .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("h"))
-                .collect();
-            hs.sort();
-            for p in hs {
-                if let Ok(b) = std::fs::read(&p) {
-                    h.update(&b);
-                }
-            }
         }
     }
     let d = h.finalize();
@@ -245,6 +200,73 @@ fn write_u32s(path: &std::path::Path, header: u32, body: &[u32]) {
         buf.extend(v.to_le_bytes());
     }
     std::fs::write(path, buf).unwrap_or_else(|e| die(&format!("write {}: {e}", path.display())));
+}
+
+/// The `saisei_rt` prelude, embedded so `jit-compile` can drop it next to each
+/// chunk (the Rust equivalent of the C chunks `#include "shims.h"`).
+const SAISEI_RT: &str = include_str!("../rt/saisei_rt.rs");
+
+/// Compile one chunk: emit readable Rust, compile it with rustc to `so`.
+/// Returns the case-key set on success, or the failure reason — which the JIT
+/// caller treats as a hard error (there is no fallback backend).
+fn compile_chunk(
+    ir: &serde_json::Value,
+    name: &str,
+    image_base: i64,
+    outdir: &std::path::Path,
+    so: &std::path::Path,
+) -> Result<Vec<u32>, String> {
+    let rs_text =
+        match codegen::emit_chunk(ir, &format!("{name}_"), Some(image_base), "saisei_rt.rs") {
+            Ok(t) => t,
+            Err(u) => return Err(format!("unsupported construct: {}", u.0)),
+        };
+    // Drop the prelude next to the chunk so `include!("saisei_rt.rs")` resolves.
+    let rt_p = outdir.join("saisei_rt.rs");
+    let need_rt = std::fs::read_to_string(&rt_p)
+        .map(|s| s != SAISEI_RT)
+        .unwrap_or(true);
+    if need_rt {
+        std::fs::write(&rt_p, SAISEI_RT).ok();
+    }
+    let rs_p = outdir.join(format!("{name}.rs"));
+    if let Err(e) = std::fs::write(&rs_p, &rs_text) {
+        return Err(format!("write {}: {e}", rs_p.display()));
+    }
+    // rustc: cdylib with C-like wrapping arithmetic (overflow-checks off) so the
+    // translated math matches the x86 model and never panics across the FFI edge.
+    let status = std::process::Command::new("rustc")
+        .args([
+            "--edition",
+            "2021",
+            "--crate-type",
+            "cdylib",
+            "-C",
+            "opt-level=1",
+            "-C",
+            "overflow-checks=off",
+            "-C",
+            "debug-assertions=off",
+            "-C",
+            "panic=abort",
+            "-o",
+        ])
+        .arg(so)
+        .arg(&rs_p)
+        .status();
+    if !matches!(status, Ok(s) if s.success()) {
+        return Err(format!("rustc failed for {}", rs_p.display()));
+    }
+    eprintln!("[saisei-jitc] compiled {}", rs_p.display());
+    // Case-key set from the dispatch match arms (`0xXXXX =>`), sorted+unique.
+    let case_re = regex::Regex::new(r"(?m)^\s*0x([0-9A-Fa-f]+) =>").unwrap();
+    let mut keys: Vec<u32> = case_re
+        .captures_iter(&rs_text)
+        .filter_map(|c| u32::from_str_radix(c.get(1).unwrap().as_str(), 16).ok())
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    Ok(keys)
 }
 
 /// the runtime-invoked orchestrator.
@@ -281,8 +303,8 @@ fn cmd_jit_compile(mut it: std::vec::IntoIter<String>) {
         .to_lowercase();
     let name = format!("{base}_{content_sha}");
     let p = |ext: &str| outdir.join(format!("{name}.{ext}"));
-    let (so, sha_p, range_p, keys_p, code_p, c_p) =
-        (p("so"), p("sha"), p("range"), p("keys"), p("code"), p("c"));
+    let (so, sha_p, range_p, keys_p, code_p) =
+        (p("so"), p("sha"), p("range"), p("keys"), p("code"));
     let sym = format!("{name}_dispatch");
     let key = format!("{content_sha}:{}", toolchain_hash());
 
@@ -309,34 +331,19 @@ fn cmd_jit_compile(mut it: std::vec::IntoIter<String>) {
     let ir_str = disassemble::disassemble_ir(&blob, &[entry], true, image_base, 30000, None);
     let ir: serde_json::Value =
         serde_json::from_str(&ir_str).unwrap_or_else(|e| die(&format!("IR parse: {e}")));
-    let (c_text, h_text) = ir_to_c::emit_c(&ir, &blob, &format!("{name}_"), Some(image_base), &c_p);
-    std::fs::write(&c_p, &c_text).unwrap_or_else(|e| die(&format!("write {}: {e}", c_p.display())));
-    std::fs::write(c_p.with_extension("h"), &h_text).ok();
 
-    // Compile to a .so; runtime symbols resolve at dlopen against -rdynamic main.
-    let repo = std::env::var("SAISEI_REPO_ROOT").unwrap_or_else(|_| ".".into());
-    let inc = format!("{repo}/runtime/include");
-    let status = std::process::Command::new("clang")
-        .args(["-shared", "-fPIC", "-O1"])
-        .arg(&c_p)
-        .args(["-I", &inc, "-I"])
-        .arg(&outdir)
-        .arg("-o")
-        .arg(&so)
-        .status();
-    if !matches!(status, Ok(s) if s.success()) {
-        eprintln!("[saisei-jitc] clang failed for {}", c_p.display());
-        exit(1);
-    }
-
-    // Case-key set (the dispatch `case 0xXXX:` labels), sorted+unique.
-    let case_re = regex::Regex::new(r"case 0x([0-9A-Fa-f]+):").unwrap();
-    let mut keys: Vec<u32> = case_re
-        .captures_iter(&c_text)
-        .filter_map(|c| u32::from_str_radix(c.get(1).unwrap().as_str(), 16).ok())
-        .collect();
-    keys.sort_unstable();
-    keys.dedup();
+    // Emit readable Rust and compile it with rustc — the one and only backend.
+    // A construct the emitter can't express, or a rustc failure, is a HARD
+    // error: extend codegen.rs to cover it (there is no fallback backend).
+    let keys: Vec<u32> = match compile_chunk(&ir, &name, image_base, &outdir, &so) {
+        Ok(keys) => keys,
+        Err(why) => die(&format!(
+            "could not compile chunk {name} (seg-base 0x{image_base:X}): {why}. \
+             Add the missing construct to saisei-jitc/src/codegen.rs. Use \
+             `saisei-jitc emit` on the segment, or the offline `gap_sweep` test, \
+             to reproduce the reason."
+        )),
+    };
 
     // Decoded byte coverage + decoded-address range from the IR functions.
     let empty = Vec::new();
@@ -402,12 +409,11 @@ fn main() {
     let mut it = std::env::args().skip(1); // skip argv0
     let sub = it
         .next()
-        .unwrap_or_else(|| die("usage: saisei-jitc <disasm|emit-c|jit-compile> ..."));
+        .unwrap_or_else(|| die("usage: saisei-jitc <disasm|emit|jit-compile> ..."));
     let rest: Vec<String> = it.collect();
     match sub.as_str() {
         "disasm" => cmd_disasm(parse_disasm(rest.into_iter())),
-        "emit-c" => cmd_emit_c(rest.into_iter()),
-        "structured" => cmd_structured(rest.into_iter()),
+        "emit" => cmd_emit(rest.into_iter()),
         "jit-compile" => cmd_jit_compile(rest.into_iter()),
         other => die(&format!("unknown subcommand: {other}")),
     }

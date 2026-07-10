@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // local helpers
 // ---------------------------------------------------------------------------
 
-/// `pit` global — matches PITState in runtime/include/timer.h.
+/// `pit` global — matches the runtime PITState layout (timer.rs).
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PitState {
@@ -439,17 +439,22 @@ fn test_safe_point_accumulates_fractional_pit_cycles() {
 }
 
 // ---------------------------------------------------------------------------
-// 54. test_outb_pic_eoi_clears_pending_irq
+// 54. test_outb_pic_eoi_preserves_pending_irq
+//     8259A spec: EOI clears the in-service bit only. A pending request (IRR)
+//     survives EOI and is delivered later. The old model cleared irq0_pending
+//     on EOI, silently destroying timer ticks that became pending while a
+//     handler ran (or when a driver wrote defensive EOIs from its main loop,
+//     e.g. DM's IBMIO) — starving INT8 and freezing game clocks.
 // ---------------------------------------------------------------------------
 #[test]
-fn test_outb_pic_eoi_clears_pending_irq() {
+fn test_outb_pic_eoi_preserves_pending_irq() {
     let _g = shim_common::guard();
     let lib = ShimLib::load();
     unsafe {
         let outb: unsafe extern "C" fn(u16, u8) = lib.func("outb");
         *lib.global_ptr::<u8>("irq0_pending") = 1;
         outb(0x20, 0x20);
-        assert_eq!(lib.read_global::<u8>("irq0_pending"), 0);
+        assert_eq!(lib.read_global::<u8>("irq0_pending"), 1);
     }
 }
 

@@ -1,23 +1,108 @@
-//! Ported from tests/test_*.py — base (structured) CCodeRenderer tests:
+#![allow(non_snake_case)]
+//! Ported from tests/test_*.py — base (structured) CCodeRenderer tests, now
+//! asserted against the Rust chunk backend (`render_rs`).
+//!
+//! PORT DISPOSITIONS (C backend deleted):
+//!   ported:    59 tests — C-text assertions rewritten per the token map
+//!              (case 0xNNNN: -> 0xNNNN => {, jump_table -> jump_table_,
+//!              lcall_table -> lcall_table_, long_jump -> long_jump_, ip= ->
+//!              set_ip, ...). Notables:
+//!              - ir_to_c__call_to_unknown_address_still_translates_literally
+//!                was #[ignore]d (the C renderer process::exit(2) on unknown
+//!                direct-call targets); the Rust backend dispatches through
+//!                call_table_ — re-activated as
+//!                ir_to_c__call_to_unknown_address_dispatches_via_call_table.
+//!              - jump_table_rcb__jmp_word_ptr_es_rcb_field_uses_rcb_read16,
+//!                jump_table_rcb__ljmp_es_rcb_fields_use_rcb_read16,
+//!                jump_table_rcb__jmp_word_ptr_es_lowercase_hex: the old
+//!                port-divergence notes (missing match_rcb_access rewrite) do
+//!                not apply — ir_to_rust wires RCB into indirect_jump_target
+//!                and render_arg, asserted directly.
+//!              - label_goto__jmp_to_label_sets_pc and
+//!                prefix__name_prefix_applied dropped their renderer()
+//!                func_names pokes (no label channel in the flat state
+//!                machine); the semantic core (pc transfer, name prefix on the
+//!                emitted _impl/dispatch symbols) is asserted.
+//!              - assert_jump_table's `!contains("pc =")` now applies to the
+//!                jump-table ARM only (the whole chunk always carries pc
+//!                assignments in the ret epilogue/boilerplate).
+//!   collapsed: the Rust backend does not specialize int 21h per AH (every
+//!              int 21h emits `dos_api();` after in-order register writes) nor
+//!              int 10h per AH (`run_interrupt(0x10);`). Families are
+//!              represented by ir_to_c__dos_interrupt_with_known_ah_emits_dos_api
+//!              (renamed from ..._is_rendered_as_named_call),
+//!              ir_to_c__dos_interrupt_preserves_unrelated_registers, and
+//!              ir_to_c__bios_video_mode_interrupt_emits_run_interrupt
+//!              (renamed from ..._emits_named_call). Collapsed (deleted) DOS
+//!              per-AH members: xchg_invalidates_cached_dos_register_arguments,
+//!              dos_open_file_is_rendered_as_named_call,
+//!              dos_read_file_uses_buffer_and_len, dos_print_string_uses_pointer,
+//!              dos_open_file_uses_pointer, dos_alloc_mem_includes_constant,
+//!              dos_exec_uses_pointer, dos_set_interrupt_vector_builds_far_pointer,
+//!              dos_get_interrupt_vector_emits_mov_ax,
+//!              dos_reset_disk_is_rendered_as_named_call,
+//!              dos_set_dta_includes_constant, dos_select_drive_uses_dl,
+//!              dos_get_current_drive_is_rendered,
+//!              dos_get_disk_free_space_uses_dl, dos_make_dir_uses_pointer,
+//!              dos_change_dir_uses_pointer, dos_find_first_uses_pointer_and_cx,
+//!              dos_lseek_includes_arguments, last_ah_al__mov_ah_invalidates_al
+//!              (the last-ah/last-dx argument CACHE was a C-renderer construct;
+//!              Rust writes registers immediately, so no staleness exists).
+//!              Collapsed BIOS per-AH members:
+//!              bios_set_palette_interrupt_emits_named_call,
+//!              bios_cga_palette_interrupt_emits_named_call,
+//!              bios_cursor_position_interrupt_emits_named_call,
+//!              bios_teletype_interrupt_emits_named_call.
+//!   deleted:   ir_to_c__invalidate_register_clears_cached_bx_for_byte_writes
+//!              (empty #[ignore] stub; private C-renderer register cache),
+//!              ir_to_c__unsupported_bios_interrupt_raises (empty #[ignore]
+//!              stub; the Rust backend lowers every int NN to run_interrupt —
+//!              nothing to raise), jump_table_rcb__match_rcb_access_lowercase_name
+//!              and jump_table_rcb__match_rcb_access_lowercase_hex (empty
+//!              #[ignore] stubs; private API — behavior covered by the active
+//!              rcb rendering tests), metadata__function_name_metadata and
+//!              metadata__instruction_comment_metadata (func_names/comments
+//!              are C-renderer reverse-engineering annotation channels; the
+//!              Rust chunk backend has none by design).
 mod common;
 use common::*;
 use serde_json::{json, Value};
 
+// the original helpers built an `app_`-prefixed / unprefixed CCodeRenderer;
+// same signatures, now rendering through the Rust chunk backend.
 fn render_app(func: &Value, known_addrs: &[i64]) -> String {
-    render_c(func, known_addrs, "app_")
+    render_rs(func, known_addrs, "app_")
 }
 
-// the original `render` helpers in the other files use CCodeRenderer() (no prefix).
 fn render_plain(func: &Value, known_addrs: &[i64]) -> String {
-    render_c(func, known_addrs, "")
+    render_rs(func, known_addrs, "")
 }
 
+/// Slice out one dispatch-match arm (`0xNNNN => { ... }`) from a chunk text.
+/// Arms close with a brace at 12-space indent; inner blocks are deeper.
+fn arm(src: &str, addr: i64) -> String {
+    let key = format!("0x{addr:04X} => {{");
+    src.split(&key)
+        .nth(1)
+        .unwrap_or_else(|| panic!("arm {key} must exist in:\n{src}"))
+        .split("\n            }")
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+/// The Rust jump-table contract: the arm computes the 20-bit linear target
+/// with wrapping arithmetic, calls the noreturn jump_table_ helper, and makes
+/// no direct pc transfer of its own. (All jump-table fixtures start at 0x0000.)
 fn assert_jump_table(src: &str) {
-    assert!(src.contains("jump_table((((uint32_t)cs << 4) +"), "{src}");
-    assert!(src.contains("& 0xFFFFF, expected_retip);"), "{src}");
-    assert!(src.contains("return;"), "{src}");
-    assert!(!src.contains("pc ="), "{src}");
-    assert!(!src.contains(" t = "), "{src}");
+    let body = arm(src, 0x0000);
+    assert!(
+        body.contains("jump_table_((((cs() as u32) << 4).wrapping_add("),
+        "{body}"
+    );
+    assert!(body.contains(") & 0xFFFFF, expected_retip);"), "{body}");
+    assert!(body.contains("return;"), "{body}");
+    assert!(!body.contains("pc ="), "{body}");
 }
 
 // ============================================================================
@@ -33,26 +118,20 @@ fn ir_to_c__call_to_known_address_emits_function_call() {
         ],
     });
     let src = render_app(&func, &[0x0000, 0x05F9]);
+    // push the cs-relative return IP, then transfer to the sibling arm
     assert!(
-        src.contains("memw_write(ss, sp, (uint16_t)(0x00003U + 0x10100U - ((uint32_t)cs << 4)));"),
+        src.contains("memw_write(ss(), sp(), ((0x3u32).wrapping_add(0x10100).wrapping_sub((cs() as u32) << 4)) as u16);"),
         "{src}"
     );
     assert!(src.contains("pc = 0x05F9;"), "{src}");
-    assert!(!src.contains("// TODO ASM: call"), "{src}");
 }
 
-// NOTE(port-divergence): The the original base `CCodeRenderer.handle_call` emits a
-// literal `pc = target` for ANY resolved direct-call target when `name_prefix`
-// is set (the `elif self.name_prefix:` branch, ir_to_c), so an unknown
-// target still translates. The Rust `render_function_c` routes `call` through
-// the unified `handle_call` (a port of PCSwitchRenderer.handle_call,
-// ir_to_c), which requires the target to be in known/func_names/
-// extern_labels and otherwise calls `emit_unsupported_abort` -> std::process::
-// exit(2). That process exit cannot be caught in-process (it would kill the
-// whole test binary), so the test is kept for parity but ignored.
+// The C renderer aborted (process::exit(2)) on a direct call to an unknown
+// target, so the original test was #[ignore]d. The Rust backend dispatches it
+// through call_table_ at the live cs-relative linear address (the JIT compiles
+// the target on reach) — active again.
 #[test]
-#[ignore]
-fn ir_to_c__call_to_unknown_address_still_translates_literally() {
+fn ir_to_c__call_to_unknown_address_dispatches_via_call_table() {
     let func = json!({
         "start": 0x0000,
         "instructions": [
@@ -62,11 +141,10 @@ fn ir_to_c__call_to_unknown_address_still_translates_literally() {
     });
     let src = render_app(&func, &[0x0000]);
     assert!(
-        src.contains("memw_write(ss, sp, (uint16_t)(0x00003U + 0x10100U - ((uint32_t)cs << 4)));"),
+        src.contains("call_table_(((0x3u32).wrapping_add(0x10100).wrapping_sub((cs() as u32) << 4)) as u16, (((cs() as u32) << 4).wrapping_add(0x1234)) & 0xFFFFF);"),
         "{src}"
     );
-    assert!(src.contains("pc = 0x1234;"), "{src}");
-    assert!(!src.contains("// TODO ASM: call"), "{src}");
+    assert!(!src.contains("pc = 0x1234;"), "{src}");
 }
 
 #[test]
@@ -78,8 +156,16 @@ fn ir_to_c__ret_instruction_emits_return_statement() {
         ],
     });
     let src = render_app(&func, &[]);
-    assert!(src.contains("return;"), "{src}");
-    assert!(!src.contains("// TODO ASM: ret"), "{src}");
+    // near ret pops the return IP and re-enters the dispatch loop with it
+    assert!(src.contains("let popped_ip = memw(ss(), sp());"), "{src}");
+    assert!(
+        src.contains("set_sp((sp().wrapping_add(2)) & 0xFFFF);"),
+        "{src}"
+    );
+    assert!(
+        src.contains("pc = (((cs() as u32) << 4).wrapping_add(popped_ip as u32).wrapping_sub(0x10100)) as i32;"),
+        "{src}"
+    );
 }
 
 #[test]
@@ -93,12 +179,25 @@ fn ir_to_c__and_instruction_is_rendered() {
         ],
     });
     let src = render_app(&func, &[]);
-    assert!(src.contains("al = (al & dh) & 0xFF;"), "{src}");
-    assert!(src.contains("al = (al & 0x44) & 0xFF;"), "{src}");
+    assert!(
+        src.contains("let tmp: u8 = (((al()) as u32 & (dh()) as u32) & 0xFF) as u8;"),
+        "{src}"
+    );
+    assert!(
+        src.contains("let tmp: u8 = (((al()) as u32 & (0x44) as u32) & 0xFF) as u8;"),
+        "{src}"
+    );
+    assert!(src.contains("set_al(tmp);"), "{src}");
 }
 
+// ----------------------------------------------------------------------------
+// The Rust backend does not specialize int 21h per AH — register writes happen
+// in program order, then `dos_api();` reads the live registers. These two are
+// the representatives for the collapsed per-AH DOS family (see file header).
+// ----------------------------------------------------------------------------
+
 #[test]
-fn ir_to_c__dos_interrupt_with_known_ah_is_rendered_as_named_call() {
+fn ir_to_c__dos_interrupt_with_known_ah_emits_dos_api() {
     let func = json!({
         "start": 0x0000,
         "instructions": [
@@ -108,10 +207,8 @@ fn ir_to_c__dos_interrupt_with_known_ah_is_rendered_as_named_call() {
         ],
     });
     let src = render_app(&func, &[]);
-    assert!(
-        src.contains("CF = dos_print_string((const char *)seg_off(ds, dx));"),
-        "{src}"
-    );
+    assert!(src.contains("set_ah(0x9);"), "{src}");
+    assert!(src.contains("dos_api();"), "{src}");
 }
 
 #[test]
@@ -140,35 +237,14 @@ fn ir_to_c__dos_interrupt_preserves_unrelated_registers() {
         ],
     });
     let src = render_app(&func, &[]);
-    assert!(src.contains("CF = dos_write_char(0x41);"), "{src}");
-    assert!(src.contains("cx = 0x1234;"), "{src}");
-    assert!(
-        src.find("cx = 0x1234;").unwrap() < src.find("dos_write_char").unwrap(),
-        "{src}"
-    );
-}
-
-#[test]
-fn ir_to_c__xchg_invalidates_cached_dos_register_arguments() {
-    let func = json!({
-        "start": 0x0000,
-        "instructions": [
-            {"address":0x0000,"mnemonic":"mov","op_str":"dx, 0x1234","bytes":"BA3412"},
-            {"address":0x0003,"mnemonic":"xchg","op_str":"dx, bx","bytes":"87DA"},
-            {"address":0x0005,"mnemonic":"mov","op_str":"ah, 0x3d","bytes":"B43D"},
-            {"address":0x0007,"mnemonic":"int","op_str":"21","bytes":"CD21"},
-            {"address":0x0009,"mnemonic":"ret","op_str":"","bytes":"C3"},
-        ],
-    });
-    let src = render_app(&func, &[]);
-    assert!(
-        src.contains("CF = dos_open_file((const char *)seg_off(ds, dx));"),
-        "{src}"
-    );
-    assert!(
-        !src.contains("CF = dos_open_file((const char *)seg_off(cs, 0x1234));"),
-        "{src}"
-    );
+    assert!(src.contains("set_cx(0x1234);"), "{src}");
+    assert!(src.contains("set_ah(0x2);"), "{src}");
+    assert!(src.contains("set_dl(0x41);"), "{src}");
+    // all register writes execute, in program order, before the DOS call
+    let cx = src.find("set_cx(0x1234);").unwrap();
+    let dl = src.find("set_dl(0x41);").unwrap();
+    let call = src.find("dos_api();").unwrap();
+    assert!(cx < dl && dl < call, "{src}");
 }
 
 #[test]
@@ -181,7 +257,7 @@ fn ir_to_c__interrupt_emits_run_interrupt() {
         ],
     });
     let src = render_app(&func, &[]);
-    assert!(src.contains("ip = 0x0000;"), "{src}");
+    assert!(src.contains("set_ip(0x0000);"), "{src}");
     assert!(src.contains("run_interrupt(0x60);"), "{src}");
 }
 
@@ -195,75 +271,8 @@ fn ir_to_c__interrupt_1a_emits_run_interrupt() {
         ],
     });
     let src = render_app(&func, &[]);
-    assert!(src.contains("ip = 0x0000;"), "{src}");
+    assert!(src.contains("set_ip(0x0000);"), "{src}");
     assert!(src.contains("run_interrupt(0x1A);"), "{src}");
-}
-
-#[test]
-fn ir_to_c__dos_open_file_is_rendered_as_named_call() {
-    let func = json!({
-        "start": 0x0000,
-        "instructions": [
-            {"address":0x0000,"mnemonic":"mov","op_str":"ax, 3D00h","bytes":"B8003D"},
-            {"address":0x0003,"mnemonic":"int","op_str":"21","bytes":"CD21"},
-            {"address":0x0005,"mnemonic":"ret","op_str":"","bytes":"C3"},
-        ],
-    });
-    let src = render_app(&func, &[]);
-    assert!(src.contains("CF = dos_open_file("), "{src}");
-}
-
-#[test]
-fn ir_to_c__dos_read_file_uses_buffer_and_len() {
-    let func = json!({
-        "start": 0x0000,
-        "instructions": [
-            {"address":0x0000,"mnemonic":"mov","op_str":"ax, 3F00h","bytes":"B8003F"},
-            {"address":0x0003,"mnemonic":"int","op_str":"21","bytes":"CD21"},
-            {"address":0x0005,"mnemonic":"ret","op_str":"","bytes":"C3"},
-        ],
-    });
-    let src = render_app(&func, &[]);
-    assert!(
-        src.contains("CF = dos_read_file(bx, (void *)seg_off(ds, dx), cx);"),
-        "{src}"
-    );
-}
-
-#[test]
-fn ir_to_c__dos_print_string_uses_pointer() {
-    let func = json!({
-        "start": 0x0000,
-        "instructions": [
-            {"address":0x0000,"mnemonic":"mov","op_str":"dx, 0x0100","bytes":"BA0001"},
-            {"address":0x0003,"mnemonic":"mov","op_str":"ah, 9","bytes":"B409"},
-            {"address":0x0005,"mnemonic":"int","op_str":"21","bytes":"CD21"},
-            {"address":0x0007,"mnemonic":"ret","op_str":"","bytes":"C3"},
-        ],
-    });
-    let src = render_plain(&func, &[]);
-    assert!(
-        src.contains("CF = dos_print_string((const char *)seg_off(cs, 0x0100));"),
-        "{src}"
-    );
-}
-
-#[test]
-fn ir_to_c__dos_open_file_uses_pointer() {
-    let func = json!({
-        "start": 0x0000,
-        "instructions": [
-            {"address":0x0000,"mnemonic":"mov","op_str":"dx, 0x0100","bytes":"BA0001"},
-            {"address":0x0003,"mnemonic":"mov","op_str":"ax, 0x3d00","bytes":"B8003D"},
-            {"address":0x0006,"mnemonic":"int","op_str":"21","bytes":"CD21"},
-            {"address":0x0008,"mnemonic":"ret","op_str":"","bytes":"C3"},
-        ],
-    });
-    let src = render_plain(&func, &[]);
-    assert!(
-        src.contains("CF = dos_open_file((const char *)seg_off(cs, 0x0100));"),
-        "{src}"
-    );
 }
 
 #[test]
@@ -276,74 +285,7 @@ fn ir_to_c__mov_ax_without_interrupt_is_emitted() {
         ],
     });
     let src = render_app(&func, &[]);
-    assert!(src.contains("ax ="), "{src}");
-}
-
-#[test]
-fn ir_to_c__dos_alloc_mem_includes_constant() {
-    let func = json!({
-        "start": 0x0000,
-        "instructions": [
-            {"address":0x0000,"mnemonic":"mov","op_str":"bx, 0x0100","bytes":"BB0001"},
-            {"address":0x0003,"mnemonic":"mov","op_str":"ax, 0x4800","bytes":"B80048"},
-            {"address":0x0006,"mnemonic":"int","op_str":"21","bytes":"CD21"},
-            {"address":0x0008,"mnemonic":"ret","op_str":"","bytes":"C3"},
-        ],
-    });
-    let src = render_app(&func, &[]);
-    assert!(src.contains("CF = dos_alloc_mem(0x0100);"), "{src}");
-}
-
-#[test]
-fn ir_to_c__dos_exec_uses_pointer() {
-    let func = json!({
-        "start": 0x0000,
-        "instructions": [
-            {"address":0x0000,"mnemonic":"mov","op_str":"dx, 0x0100","bytes":"BA0001"},
-            {"address":0x0003,"mnemonic":"mov","op_str":"bx, 0x0120","bytes":"BB2001"},
-            {"address":0x0006,"mnemonic":"mov","op_str":"ax, 0x4b00","bytes":"B8004B"},
-            {"address":0x0009,"mnemonic":"int","op_str":"21","bytes":"CD21"},
-            {"address":0x000B,"mnemonic":"ret","op_str":"","bytes":"C3"},
-        ],
-    });
-    let src = render_plain(&func, &[]);
-    assert!(
-        src.contains("CF = dos_exec((void *)0x0120, (const char *)seg_off(cs, 0x0100));"),
-        "{src}"
-    );
-}
-
-#[test]
-fn ir_to_c__dos_set_interrupt_vector_builds_far_pointer() {
-    let func = json!({
-        "start": 0x0000,
-        "instructions": [
-            {"address":0x0000,"mnemonic":"mov","op_str":"ax, 0x2521","bytes":"B82125"},
-            {"address":0x0003,"mnemonic":"mov","op_str":"dx, 0x0100","bytes":"BA0001"},
-            {"address":0x0006,"mnemonic":"int","op_str":"21","bytes":"CD21"},
-            {"address":0x0008,"mnemonic":"ret","op_str":"","bytes":"C3"},
-        ],
-    });
-    let src = render_app(&func, &[]);
-    assert!(
-        src.contains("CF = dos_set_interrupt_vector(0x21, ds, 0x0100);"),
-        "{src}"
-    );
-}
-
-#[test]
-fn ir_to_c__dos_get_interrupt_vector_emits_mov_ax() {
-    let func = json!({
-        "start": 0x0000,
-        "instructions": [
-            {"address":0x0000,"mnemonic":"mov","op_str":"ax, 0x3508","bytes":"B80835"},
-            {"address":0x0003,"mnemonic":"int","op_str":"21","bytes":"CD21"},
-            {"address":0x0005,"mnemonic":"ret","op_str":"","bytes":"C3"},
-        ],
-    });
-    let src = render_app(&func, &[]);
-    assert!(src.contains("ax = 0x3508;"), "{src}");
-    assert!(src.contains("CF = dos_get_interrupt_vector();"), "{src}");
+    assert!(src.contains("set_ax(0x1234);"), "{src}");
 }
 
 #[test]
@@ -358,12 +300,10 @@ fn ir_to_c__lds_loads_far_pointer_for_dos_call() {
         ],
     });
     let src = render_app(&func, &[]);
-    assert!(
-        src.contains("uint16_t _far_seg = memw(cs, 0x08BB);"),
-        "{src}"
-    );
-    assert!(src.contains("dx = memw(cs, 0x08B9);"), "{src}");
-    assert!(src.contains("ds = _far_seg;"), "{src}");
+    // seg word read from [mem+2] BEFORE the offset overwrites dx / ds changes
+    assert!(src.contains("let _far_seg = memw(cs(), 0x08BB);"), "{src}");
+    assert!(src.contains("set_dx(memw(cs(), 0x08B9));"), "{src}");
+    assert!(src.contains("set_ds(_far_seg);"), "{src}");
     assert!(src.contains("dos_api();"), "{src}");
 }
 
@@ -377,163 +317,19 @@ fn ir_to_c__les_loads_far_pointer() {
         ],
     });
     let src = render_app(&func, &[]);
-    assert!(
-        src.contains("uint16_t _far_seg = memw(cs, 0x0F62);"),
-        "{src}"
-    );
-    assert!(src.contains("di = memw(cs, 0x0F60);"), "{src}");
-    assert!(src.contains("es = _far_seg;"), "{src}");
+    assert!(src.contains("let _far_seg = memw(cs(), 0x0F62);"), "{src}");
+    assert!(src.contains("set_di(memw(cs(), 0x0F60));"), "{src}");
+    assert!(src.contains("set_es(_far_seg);"), "{src}");
 }
 
-#[test]
-fn ir_to_c__dos_reset_disk_is_rendered_as_named_call() {
-    let func = json!({
-        "start": 0x0000,
-        "instructions": [
-            {"address":0x0000,"mnemonic":"mov","op_str":"ah, 0x0d","bytes":"B40D"},
-            {"address":0x0002,"mnemonic":"int","op_str":"21","bytes":"CD21"},
-            {"address":0x0004,"mnemonic":"ret","op_str":"","bytes":"C3"},
-        ],
-    });
-    let src = render_app(&func, &[]);
-    assert!(src.contains("CF = dos_reset_disk();"), "{src}");
-}
+// ----------------------------------------------------------------------------
+// The Rust backend does not specialize int 10h per AH either — the register
+// writes execute, then run_interrupt(0x10) reads them. Representative for the
+// collapsed per-AH BIOS family (see file header).
+// ----------------------------------------------------------------------------
 
 #[test]
-fn ir_to_c__dos_set_dta_includes_constant() {
-    let func = json!({
-        "start": 0x0000,
-        "instructions": [
-            {"address":0x0000,"mnemonic":"mov","op_str":"dx, 0x0100","bytes":"BA0001"},
-            {"address":0x0003,"mnemonic":"mov","op_str":"ah, 0x1a","bytes":"B41A"},
-            {"address":0x0005,"mnemonic":"int","op_str":"21","bytes":"CD21"},
-            {"address":0x0007,"mnemonic":"ret","op_str":"","bytes":"C3"},
-        ],
-    });
-    let src = render_app(&func, &[]);
-    assert!(
-        src.contains("CF = dos_set_dta((void *)seg_off(cs, 0x0100));"),
-        "{src}"
-    );
-}
-
-#[test]
-fn ir_to_c__dos_select_drive_uses_dl() {
-    let func = json!({
-        "start": 0x0000,
-        "instructions": [
-            {"address":0x0000,"mnemonic":"mov","op_str":"ah, 0x0e","bytes":"B40E"},
-            {"address":0x0002,"mnemonic":"int","op_str":"21","bytes":"CD21"},
-            {"address":0x0004,"mnemonic":"ret","op_str":"","bytes":"C3"},
-        ],
-    });
-    let src = render_app(&func, &[]);
-    assert!(src.contains("CF = dos_select_drive(dl);"), "{src}");
-}
-
-#[test]
-fn ir_to_c__dos_get_current_drive_is_rendered() {
-    let func = json!({
-        "start": 0x0000,
-        "instructions": [
-            {"address":0x0000,"mnemonic":"mov","op_str":"ah, 0x19","bytes":"B419"},
-            {"address":0x0002,"mnemonic":"int","op_str":"21","bytes":"CD21"},
-            {"address":0x0004,"mnemonic":"ret","op_str":"","bytes":"C3"},
-        ],
-    });
-    let src = render_app(&func, &[]);
-    assert!(src.contains("CF = dos_get_current_drive();"), "{src}");
-}
-
-#[test]
-fn ir_to_c__dos_get_disk_free_space_uses_dl() {
-    let func = json!({
-        "start": 0x0000,
-        "instructions": [
-            {"address":0x0000,"mnemonic":"mov","op_str":"ah, 0x36","bytes":"B436"},
-            {"address":0x0002,"mnemonic":"int","op_str":"21","bytes":"CD21"},
-            {"address":0x0004,"mnemonic":"ret","op_str":"","bytes":"C3"},
-        ],
-    });
-    let src = render_app(&func, &[]);
-    assert!(src.contains("CF = dos_get_disk_free_space(dl);"), "{src}");
-}
-
-#[test]
-fn ir_to_c__dos_make_dir_uses_pointer() {
-    let func = json!({
-        "start": 0x0000,
-        "instructions": [
-            {"address":0x0000,"mnemonic":"mov","op_str":"dx, 0x0100","bytes":"BA0001"},
-            {"address":0x0003,"mnemonic":"mov","op_str":"ax, 0x3900","bytes":"B80039"},
-            {"address":0x0006,"mnemonic":"int","op_str":"21","bytes":"CD21"},
-            {"address":0x0008,"mnemonic":"ret","op_str":"","bytes":"C3"},
-        ],
-    });
-    let src = render_plain(&func, &[]);
-    assert!(
-        src.contains("CF = dos_make_dir((const char *)seg_off(cs, 0x0100));"),
-        "{src}"
-    );
-}
-
-#[test]
-fn ir_to_c__dos_change_dir_uses_pointer() {
-    let func = json!({
-        "start": 0x0000,
-        "instructions": [
-            {"address":0x0000,"mnemonic":"mov","op_str":"dx, 0x0100","bytes":"BA0001"},
-            {"address":0x0003,"mnemonic":"mov","op_str":"ax, 0x3b00","bytes":"B8003B"},
-            {"address":0x0006,"mnemonic":"int","op_str":"21","bytes":"CD21"},
-            {"address":0x0008,"mnemonic":"ret","op_str":"","bytes":"C3"},
-        ],
-    });
-    let src = render_plain(&func, &[]);
-    assert!(
-        src.contains("CF = dos_change_dir((const char *)seg_off(cs, 0x0100));"),
-        "{src}"
-    );
-}
-
-#[test]
-fn ir_to_c__dos_find_first_uses_pointer_and_cx() {
-    let func = json!({
-        "start": 0x0000,
-        "instructions": [
-            {"address":0x0000,"mnemonic":"mov","op_str":"dx, 0x0100","bytes":"BA0001"},
-            {"address":0x0003,"mnemonic":"mov","op_str":"ax, 0x4e00","bytes":"B8004E"},
-            {"address":0x0006,"mnemonic":"int","op_str":"21","bytes":"CD21"},
-            {"address":0x0008,"mnemonic":"ret","op_str":"","bytes":"C3"},
-        ],
-    });
-    let src = render_plain(&func, &[]);
-    assert!(
-        src.contains("CF = dos_find_first((const char *)seg_off(cs, 0x0100), cx);"),
-        "{src}"
-    );
-}
-
-#[test]
-fn ir_to_c__dos_lseek_includes_arguments() {
-    let func = json!({
-        "start": 0x0000,
-        "instructions": [
-            {"address":0x0000,"mnemonic":"mov","op_str":"bx, 0x0005","bytes":"BB0500"},
-            {"address":0x0003,"mnemonic":"mov","op_str":"dx, 0x0010","bytes":"BA1000"},
-            {"address":0x0006,"mnemonic":"mov","op_str":"ax, 0x4202","bytes":"B80242"},
-            {"address":0x0009,"mnemonic":"int","op_str":"21","bytes":"CD21"},
-            {"address":0x000B,"mnemonic":"ret","op_str":"","bytes":"C3"},
-        ],
-    });
-    let src = render_app(&func, &[]);
-    assert!(
-        src.contains("CF = dos_lseek(0x0005, cx, 0x0010, 0x02);"),
-        "{src}"
-    );
-}
-
-#[test]
-fn ir_to_c__bios_video_mode_interrupt_emits_named_call() {
+fn ir_to_c__bios_video_mode_interrupt_emits_run_interrupt() {
     let func = json!({
         "start": 0x0000,
         "instructions": [
@@ -543,103 +339,8 @@ fn ir_to_c__bios_video_mode_interrupt_emits_named_call() {
         ],
     });
     let src = render_app(&func, &[]);
-    assert!(src.contains("bios_set_video_mode(0x13);"), "{src}");
-    assert!(!src.contains("// TODO ASM: int 10"), "{src}");
-    assert!(!src.contains("ax ="), "{src}");
-}
-
-#[test]
-fn ir_to_c__bios_set_palette_interrupt_emits_named_call() {
-    let func = json!({
-        "start": 0x0000,
-        "instructions": [
-            {"address":0x0000,"mnemonic":"mov","op_str":"cx, 0x0002","bytes":"B90200"},
-            {"address":0x0003,"mnemonic":"mov","op_str":"dx, 0x0200","bytes":"BA0002"},
-            {"address":0x0006,"mnemonic":"mov","op_str":"bx, 0x0001","bytes":"BB0100"},
-            {"address":0x0009,"mnemonic":"mov","op_str":"ax, 0x1012","bytes":"B81210"},
-            {"address":0x000C,"mnemonic":"int","op_str":"10","bytes":"CD10"},
-            {"address":0x000E,"mnemonic":"ret","op_str":"","bytes":"C3"},
-        ],
-    });
-    let src = render_app(&func, &[]);
-    assert!(src.contains("bios_set_palette();"), "{src}");
-    assert!(!src.contains("// TODO ASM: int 10"), "{src}");
-    assert!(src.contains("ax = 0x1012;"), "{src}");
-}
-
-#[test]
-fn ir_to_c__bios_cga_palette_interrupt_emits_named_call() {
-    let func = json!({
-        "start": 0x0000,
-        "instructions": [
-            {"address":0x0000,"mnemonic":"mov","op_str":"bx, 0x0101","bytes":"BB0101"},
-            {"address":0x0003,"mnemonic":"mov","op_str":"ah, 0x0B","bytes":"B40B"},
-            {"address":0x0005,"mnemonic":"int","op_str":"10","bytes":"CD10"},
-            {"address":0x0007,"mnemonic":"ret","op_str":"","bytes":"C3"},
-        ],
-    });
-    let src = render_app(&func, &[]);
-    assert!(src.contains("bios_set_cga_palette(0x01, 0x01);"), "{src}");
-}
-
-#[test]
-fn ir_to_c__bios_cursor_position_interrupt_emits_named_call() {
-    let func = json!({
-        "start": 0x0000,
-        "instructions": [
-            {"address":0x0000,"mnemonic":"mov","op_str":"dx, 0x0514","bytes":"BA1405"},
-            {"address":0x0003,"mnemonic":"mov","op_str":"bx, 0x0000","bytes":"BB0000"},
-            {"address":0x0006,"mnemonic":"mov","op_str":"ah, 0x02","bytes":"B402"},
-            {"address":0x0008,"mnemonic":"int","op_str":"10","bytes":"CD10"},
-            {"address":0x000A,"mnemonic":"ret","op_str":"","bytes":"C3"},
-        ],
-    });
-    let src = render_app(&func, &[]);
-    assert!(
-        src.contains("bios_set_cursor_position(0x00, 0x05, 0x14);"),
-        "{src}"
-    );
-}
-
-#[test]
-fn ir_to_c__bios_teletype_interrupt_emits_named_call() {
-    let func = json!({
-        "start": 0x0000,
-        "instructions": [
-            {"address":0x0000,"mnemonic":"mov","op_str":"ax, 0x0E41","bytes":"B8410E"},
-            {"address":0x0003,"mnemonic":"mov","op_str":"bx, 0x0007","bytes":"BB0700"},
-            {"address":0x0006,"mnemonic":"int","op_str":"10","bytes":"CD10"},
-            {"address":0x0008,"mnemonic":"ret","op_str":"","bytes":"C3"},
-        ],
-    });
-    let src = render_app(&func, &[]);
-    assert!(
-        src.contains("bios_teletype_output(0x41, 0x00, 0x07);"),
-        "{src}"
-    );
-}
-
-// NOTE(port-divergence): the original calls the private-in-Rust `_invalidate_register`
-// method directly after setting `last_bx`. In Rust `invalidate_register` is a
-// private method (not `pub`), so it cannot be invoked from an integration test —
-// there is no public Rust equivalent for the direct call. The behavior is
-// exercised indirectly by the DOS-argument-invalidation tests above.
-#[test]
-#[ignore]
-fn ir_to_c__invalidate_register_clears_cached_bx_for_byte_writes() {
-    // TODO(port): Renderer::invalidate_register is private; no public API to
-    // drive it directly with a preset last_bx.
-}
-
-// NOTE(port-divergence): the original expects `UnsupportedInstructionError` to be
-// raised (catchable). The Rust port signals an unsupported instruction via
-// `emit_unsupported_abort`, which calls `std::process::exit(2)` — this is not a
-// catchable Rust panic, so `catch_unwind` cannot observe it and running the test
-// in-process would kill the test binary. Kept for parity, ignored.
-#[test]
-#[ignore]
-fn ir_to_c__unsupported_bios_interrupt_raises() {
-    // TODO(port): Rust aborts via std::process::exit(2), not a catchable error.
+    assert!(src.contains("set_ax(0x13);"), "{src}");
+    assert!(src.contains("run_interrupt(0x10);"), "{src}");
 }
 
 // ============================================================================
@@ -650,13 +351,13 @@ fn jump_function_entry__jmp_known_function_entry_without_block_sets_pc() {
     let func = json!({
         "start": 0x0000,
         "instructions": [
-            {"address":0x0000,"mnemonic":"jmp","op_str":"0100","bytes":""},
-            {"address":0x0003,"mnemonic":"ret","op_str":"","bytes":""},
+            {"address":0x0000,"mnemonic":"jmp","op_str":"0100","bytes":"E9FD00","target":0x0100},
+            {"address":0x0003,"mnemonic":"ret","op_str":"","bytes":"C3"},
         ],
     });
     let src = render_plain(&func, &[0x0000, 0x0100]);
     assert!(src.contains("pc = 0x0100;"), "{src}");
-    assert!(!src.contains("func_0100();"), "{src}");
+    assert!(!src.contains("func_0100()"), "{src}");
 }
 
 #[test]
@@ -664,14 +365,16 @@ fn jump_function_entry__jmp_known_function_entry_with_block_sets_pc() {
     let func = json!({
         "start": 0x0000,
         "instructions": [
-            {"address":0x0000,"mnemonic":"jmp","op_str":"0006","bytes":"","target":0x0006},
-            {"address":0x0003,"mnemonic":"ret","op_str":"","bytes":""},
-            {"address":0x0006,"mnemonic":"ret","op_str":"","bytes":""},
+            {"address":0x0000,"mnemonic":"jmp","op_str":"0006","bytes":"E90300","target":0x0006},
+            {"address":0x0003,"mnemonic":"ret","op_str":"","bytes":"C3"},
+            {"address":0x0006,"mnemonic":"ret","op_str":"","bytes":"C3"},
         ],
     });
     let src = render_plain(&func, &[0x0000, 0x0006]);
     assert!(src.contains("pc = 0x0006;"), "{src}");
-    assert!(!src.contains("func_0006();"), "{src}");
+    // the target block is its own dispatch arm, not a called function
+    assert!(src.contains("0x0006 => {"), "{src}");
+    assert!(!src.contains("func_0006()"), "{src}");
 }
 
 // ============================================================================
@@ -682,14 +385,16 @@ fn jump_table__jmp_word_ptr_cs_uses_jump_table() {
     let func = json!({
         "start": 0x0000,
         "instructions": [
-            {"address":0x0000,"mnemonic":"jmp","op_str":"word ptr cs:[0x10c]","bytes":"FF2E0C01",
+            {"address":0x0000,"mnemonic":"jmp","op_str":"word ptr cs:[0x10c]","bytes":"2EFF260C01",
              "detail":{"mem_refs":[{"segment":"CS","disp":0x10C,"access":"read"}]}},
             {"address":0x0005,"mnemonic":"ret","op_str":"","bytes":"C3"},
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("// ASM: jmp word ptr cs:[0x10c]"), "{src}");
-    assert!(src.contains("jump_table((((uint32_t)cs << 4) + (uint16_t)(memw(cs, 0x10c))) & 0xFFFFF, expected_retip);"), "{src}");
+    assert!(
+        src.contains("jump_table_((((cs() as u32) << 4).wrapping_add((memw(cs(), 0x10C)) as u32)) & 0xFFFFF, expected_retip);"),
+        "{src}"
+    );
     assert_jump_table(&src);
 }
 
@@ -698,17 +403,16 @@ fn jump_table__jmp_word_ptr_cs_with_bp_index_uses_jump_table() {
     let func = json!({
         "start": 0x0000,
         "instructions": [
-            {"address":0x0000,"mnemonic":"jmp","op_str":"word ptr cs:[bp + 0x10c]","bytes":"FFAE0C01",
+            {"address":0x0000,"mnemonic":"jmp","op_str":"word ptr cs:[bp + 0x10c]","bytes":"2EFFA60C01",
              "detail":{"mem_refs":[{"segment":"CS","disp":0x10C,"access":"read"}]}},
             {"address":0x0005,"mnemonic":"ret","op_str":"","bytes":"C3"},
         ],
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("// ASM: jmp word ptr cs:[bp + 0x10c]"),
+        src.contains("jump_table_((((cs() as u32) << 4).wrapping_add((memw(cs(), (((bp() as u32).wrapping_add(0x10Cu32)) & 0xFFFF) as u16)) as u32)) & 0xFFFFF, expected_retip);"),
         "{src}"
     );
-    assert!(src.contains("jump_table((((uint32_t)cs << 4) + (uint16_t)(memw(cs, (bp + 0x10c) & 0xFFFF))) & 0xFFFFF, expected_retip);"), "{src}");
     assert_jump_table(&src);
 }
 
@@ -723,8 +427,10 @@ fn jump_table__jmp_word_ptr_cs_with_bx_register_uses_jump_table() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("// ASM: jmp word ptr cs:[bx]"), "{src}");
-    assert!(src.contains("jump_table((((uint32_t)cs << 4) + (uint16_t)(memw(cs, bx))) & 0xFFFFF, expected_retip);"), "{src}");
+    assert!(
+        src.contains("jump_table_((((cs() as u32) << 4).wrapping_add((memw(cs(), bx())) as u32)) & 0xFFFFF, expected_retip);"),
+        "{src}"
+    );
     assert_jump_table(&src);
 }
 
@@ -733,14 +439,14 @@ fn jump_table__jmp_known_function_sets_pc() {
     let func = json!({
         "start": 0x0000,
         "instructions": [
-            {"address":0x0000,"mnemonic":"jmp","op_str":"0100","bytes":""},
-            {"address":0x0003,"mnemonic":"ret","op_str":"","bytes":""},
+            {"address":0x0000,"mnemonic":"jmp","op_str":"0100","bytes":"E9FD00","target":0x0100},
+            {"address":0x0003,"mnemonic":"ret","op_str":"","bytes":"C3"},
         ],
     });
     let src = render_plain(&func, &[0x0000, 0x0100]);
     assert!(src.contains("pc = 0x0100;"), "{src}");
-    assert!(!src.contains("func_0100();"), "{src}");
-    assert!(src.contains("// ASM: jmp 0100"), "{src}");
+    assert!(!src.contains("func_0100()"), "{src}");
+    assert!(!src.contains("jump_table_"), "{src}");
 }
 
 #[test]
@@ -754,8 +460,10 @@ fn jump_table__jmp_word_ptr_es_with_bx_uses_jump_table() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("// ASM: jmp word ptr es:[bx]"), "{src}");
-    assert!(src.contains("jump_table((((uint32_t)cs << 4) + (uint16_t)(memw(es, bx))) & 0xFFFFF, expected_retip);"), "{src}");
+    assert!(
+        src.contains("jump_table_((((cs() as u32) << 4).wrapping_add((memw(es(), bx())) as u32)) & 0xFFFFF, expected_retip);"),
+        "{src}"
+    );
     assert_jump_table(&src);
 }
 
@@ -770,8 +478,10 @@ fn jump_table__jmp_word_ptr_es_with_offset_uses_jump_table() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("// ASM: jmp word ptr es:[0x010C]"), "{src}");
-    assert!(src.contains("jump_table((((uint32_t)cs << 4) + (uint16_t)(memw(es, 0x010c))) & 0xFFFFF, expected_retip);"), "{src}");
+    assert!(
+        src.contains("jump_table_((((cs() as u32) << 4).wrapping_add((memw(es(), 0x10C)) as u32)) & 0xFFFFF, expected_retip);"),
+        "{src}"
+    );
     assert_jump_table(&src);
 }
 
@@ -780,14 +490,16 @@ fn jump_table__jmp_word_ptr_without_segment_uses_ds() {
     let func = json!({
         "start": 0x0000,
         "instructions": [
-            {"address":0x0000,"mnemonic":"jmp","op_str":"word ptr [0x010C]","bytes":"FF260C01",
+            {"address":0x0000,"mnemonic":"jmp","op_str":"word ptr [0x010C]","bytes":"3EFF260C01",
              "detail":{"mem_refs":[{"segment":"DS","disp":0x10C,"access":"read"}]}},
             {"address":0x0005,"mnemonic":"ret","op_str":"","bytes":"C3"},
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("// ASM: jmp word ptr [0x010C]"), "{src}");
-    assert!(src.contains("jump_table((((uint32_t)cs << 4) + (uint16_t)(memw(ds, 0x010c))) & 0xFFFFF, expected_retip);"), "{src}");
+    assert!(
+        src.contains("jump_table_((((cs() as u32) << 4).wrapping_add((memw(ds(), 0x10C)) as u32)) & 0xFFFFF, expected_retip);"),
+        "{src}"
+    );
     assert_jump_table(&src);
 }
 
@@ -796,14 +508,16 @@ fn jump_table__jmp_word_ptr_bp_defaults_to_ss() {
     let func = json!({
         "start": 0x0000,
         "instructions": [
-            {"address":0x0000,"mnemonic":"jmp","op_str":"word ptr [bp + 0x10c]","bytes":"FF660C01",
+            {"address":0x0000,"mnemonic":"jmp","op_str":"word ptr [bp + 0x10c]","bytes":"36FFA60C01",
              "detail":{"mem_refs":[{"segment":"SS","disp":0x10C,"access":"read"}]}},
             {"address":0x0005,"mnemonic":"ret","op_str":"","bytes":"C3"},
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("// ASM: jmp word ptr [bp + 0x10c]"), "{src}");
-    assert!(src.contains("jump_table((((uint32_t)cs << 4) + (uint16_t)(memw(ss, (bp + 0x10c) & 0xFFFF))) & 0xFFFFF, expected_retip);"), "{src}");
+    assert!(
+        src.contains("jump_table_((((cs() as u32) << 4).wrapping_add((memw(ss(), (((bp() as u32).wrapping_add(0x10Cu32)) & 0xFFFF) as u16)) as u32)) & 0xFFFFF, expected_retip);"),
+        "{src}"
+    );
     assert_jump_table(&src);
 }
 
@@ -812,101 +526,79 @@ fn jump_table__jmp_word_ptr_cs_with_negative_offset_uses_jump_table() {
     let func = json!({
         "start": 0x0000,
         "instructions": [
-            {"address":0x0000,"mnemonic":"jmp","op_str":"word ptr cs:[bx - 0x10]","bytes":"",
+            {"address":0x0000,"mnemonic":"jmp","op_str":"word ptr cs:[bx - 0x10]","bytes":"2EFF67F0",
              "detail":{"mem_refs":[{"segment":"CS","disp":-0x10,"access":"read"}]}},
-            {"address":0x0003,"mnemonic":"ret","op_str":"","bytes":""},
+            {"address":0x0004,"mnemonic":"ret","op_str":"","bytes":"C3"},
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("// ASM: jmp word ptr cs:[bx - 0x10]"), "{src}");
-    assert!(src.contains("jump_table((((uint32_t)cs << 4) + (uint16_t)(memw(cs, (bx - 0x10) & 0xFFFF))) & 0xFFFFF, expected_retip);"), "{src}");
+    assert!(
+        src.contains("jump_table_((((cs() as u32) << 4).wrapping_add((memw(cs(), (((bx() as u32).wrapping_sub(0x10u32)) & 0xFFFF) as u16)) as u32)) & 0xFFFFF, expected_retip);"),
+        "{src}"
+    );
     assert_jump_table(&src);
 }
 
 // ============================================================================
+// es:[0xFFxx] operands are RCB (runtime-control-block) fields; the Rust
+// backend rewrites reads on the indirect-jump/far-pointer paths through the
+// rcb_read16 helper with the named field. (The old port-divergence notes about
+// a missing match_rcb_access rewrite applied to the deleted C renderer path.)
 // ============================================================================
 
-// NOTE(port-divergence): Rust's `indirect_jump_target` (ir_to_c.rs:1294) builds
-// `memw(es, 0xff0c)` directly and omits the `match_rcb_access` RCB rewrite that
-// the original's `_indirect_jump_target` applies, so the Rust output
-// is `memw(es, 0xff0c)` rather than `rcb_read16(DATA_BUF1_OFF)`. Genuine port
-// bug (RCB naming not wired into the normalized-indirect-jump path); kept and
-// ignored.
 #[test]
 fn jump_table_rcb__jmp_word_ptr_es_rcb_field_uses_rcb_read16() {
     let func = json!({
         "start": 0x0000,
         "instructions": [
-            {"address":0x0000,"mnemonic":"jmp","op_str":"word ptr es:[0xFF0C]","bytes":"",
+            {"address":0x0000,"mnemonic":"jmp","op_str":"word ptr es:[0xFF0C]","bytes":"26FF2E0CFF",
              "detail":{"mem_refs":[{"segment":"ES","disp":0xFF0C,"access":"read"}]}},
-            {"address":0x0005,"mnemonic":"ret","op_str":"","bytes":""},
+            {"address":0x0005,"mnemonic":"ret","op_str":"","bytes":"C3"},
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("// ASM: jmp word ptr es:[0xFF0C]"), "{src}");
-    assert!(src.contains("jump_table((((uint32_t)cs << 4) + (uint16_t)(rcb_read16(DATA_BUF1_OFF))) & 0xFFFFF, expected_retip);"), "{src}");
+    assert!(
+        src.contains("jump_table_((((cs() as u32) << 4).wrapping_add((rcb_read16(DATA_BUF1_OFF)) as u32)) & 0xFFFFF, expected_retip);"),
+        "{src}"
+    );
     assert_jump_table(&src);
 }
 
-// NOTE(port-divergence): Rust's `handle_ljmp` seg_reg:[off] path (ir_to_c.rs:
-// 2353) emits `memw(es, 0xFF06)` / `memw(es, 0xFF04)` and omits the
-// `match_rcb_access` RCB rewrite that the original's `handle_ljmp`
-// applies, so the Rust output lacks `rcb_read16(PREV_TIMER_VECTOR_SEG/OFF)`.
-// Genuine port bug; kept and ignored.
 #[test]
 fn jump_table_rcb__ljmp_es_rcb_fields_use_rcb_read16() {
     let func = json!({
         "start": 0x0000,
         "instructions": [
-            {"address":0x0000,"mnemonic":"ljmp","op_str":"es:[0xFF04]","bytes":"",
+            {"address":0x0000,"mnemonic":"ljmp","op_str":"es:[0xFF04]","bytes":"26FF2E04FF",
              "detail":{"mem_refs":[{"segment":"ES","disp":0xFF04,"access":"read"}]}},
-            {"address":0x0005,"mnemonic":"ret","op_str":"","bytes":""},
+            {"address":0x0005,"mnemonic":"ret","op_str":"","bytes":"C3"},
         ],
     });
     let src = render_plain(&func, &[]);
     assert!(
         src.contains(
-            "long_jump(rcb_read16(PREV_TIMER_VECTOR_SEG), rcb_read16(PREV_TIMER_VECTOR_OFF));"
+            "long_jump_(rcb_read16(PREV_TIMER_VECTOR_SEG), rcb_read16(PREV_TIMER_VECTOR_OFF));"
         ),
         "{src}"
     );
-    assert!(src.contains("// ASM: ljmp es:[0xFF04]"), "{src}");
 }
 
-// NOTE(port-divergence): same missing `match_rcb_access` rewrite in Rust's
-// `indirect_jump_target` (ir_to_c.rs:1294) as the rcb_field test above — Rust
-// emits `memw(es, 0xff0c)` instead of `rcb_read16(DATA_BUF1_OFF)`. Genuine port
-// bug; kept and ignored.
 #[test]
 fn jump_table_rcb__jmp_word_ptr_es_lowercase_hex() {
     let func = json!({
         "start": 0x0000,
         "instructions": [
-            {"address":0x0000,"mnemonic":"jmp","op_str":"word ptr es:[0xff0c]","bytes":"",
+            {"address":0x0000,"mnemonic":"jmp","op_str":"word ptr es:[0xff0c]","bytes":"26FF2E0CFF",
              "detail":{"mem_refs":[{"segment":"ES","disp":0xFF0C,"access":"read"}]}},
-            {"address":0x0005,"mnemonic":"ret","op_str":"","bytes":""},
+            {"address":0x0005,"mnemonic":"ret","op_str":"","bytes":"C3"},
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("// ASM: jmp word ptr es:[0xff0c]"), "{src}");
-    assert!(src.contains("jump_table((((uint32_t)cs << 4) + (uint16_t)(rcb_read16(DATA_BUF1_OFF))) & 0xFFFFF, expected_retip);"), "{src}");
+    assert!(
+        src.contains("jump_table_((((cs() as u32) << 4).wrapping_add((rcb_read16(DATA_BUF1_OFF)) as u32)) & 0xFFFFF, expected_retip);"),
+        "{src}"
+    );
     assert_jump_table(&src);
-}
-
-// NOTE(port-divergence): the original calls module-level `_match_rcb_access(...)`.
-// In Rust `match_rcb_access` is a private method on `Renderer` with no public
-// wrapper, so it cannot be invoked from an integration test. Its behavior is
-// covered by the rcb rendering tests above.
-#[test]
-#[ignore]
-fn jump_table_rcb__match_rcb_access_lowercase_name() {
-    // TODO(port): Renderer::match_rcb_access is private; no public Rust API.
-}
-
-#[test]
-#[ignore]
-fn jump_table_rcb__match_rcb_access_lowercase_hex() {
-    // TODO(port): Renderer::match_rcb_access is private; no public Rust API.
 }
 
 // ============================================================================
@@ -914,20 +606,20 @@ fn jump_table_rcb__match_rcb_access_lowercase_hex() {
 
 #[test]
 fn label_goto__jmp_to_label_sets_pc() {
+    // (was: renderer() + func_names poke asserting no label_0340: label/goto —
+    // the flat state machine has no label channel; the semantic core is the
+    // pc transfer into the target block's own arm.)
     let func = json!({
         "start": 0x0000,
         "instructions": [
-            {"address":0x0000,"mnemonic":"jmp","op_str":"0x340","bytes":""},
-            {"address":0x0340,"mnemonic":"ret","op_str":"","bytes":""},
+            {"address":0x0000,"mnemonic":"jmp","op_str":"0x340","bytes":"E93D03","target":0x0340},
+            {"address":0x0340,"mnemonic":"ret","op_str":"","bytes":"C3"},
         ],
     });
-    let mut r = renderer("");
-    r.func_names.insert(0x0340, "label_0340".into());
-    let src = r.render_function_c(&func, &known(&[0x0000])).join("\n");
+    let src = render_plain(&func, &[0x0000]);
     assert!(src.contains("pc = 0x0340;"), "{src}");
-    assert!(!src.contains("label_0340();"), "{src}");
-    assert!(!src.contains("dispatch("), "{src}");
-    assert!(!src.contains("label_0340:"), "{src}");
+    assert!(src.contains("0x0340 => {"), "{src}");
+    assert!(!src.contains("label_0340"), "{src}");
 }
 
 // ============================================================================
@@ -938,40 +630,20 @@ fn lahf_sahf__lahf_sahf_translate_flags() {
     let func = json!({
         "start": 0x0000,
         "instructions": [
-            {"address":0x0000,"mnemonic":"lahf","op_str":"","bytes":""},
-            {"address":0x0001,"mnemonic":"sahf","op_str":"","bytes":""},
-            {"address":0x0002,"mnemonic":"ret","op_str":"","bytes":""},
+            {"address":0x0000,"mnemonic":"lahf","op_str":"","bytes":"9F"},
+            {"address":0x0001,"mnemonic":"sahf","op_str":"","bytes":"9E"},
+            {"address":0x0002,"mnemonic":"ret","op_str":"","bytes":"C3"},
         ],
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("ah = (uint8_t)((SF << 7) | (ZF << 6) | (PF << 2) | 0x02 | CF);"),
+        src.contains("set_ah((SF() << 7) | (ZF() << 6) | (PF() << 2) | 0x02 | CF());"),
         "{src}"
     );
-    assert!(src.contains("SF = (ah >> 7) & 1;"), "{src}");
-    assert!(src.contains("ZF = (ah >> 6) & 1;"), "{src}");
-    assert!(src.contains("PF = (ah >> 2) & 1;"), "{src}");
-    assert!(src.contains("CF = ah & 1;"), "{src}");
-    assert!(!src.contains("// TODO ASM: lahf"), "{src}");
-    assert!(!src.contains("// TODO ASM: sahf"), "{src}");
-}
-
-// ============================================================================
-// ============================================================================
-
-#[test]
-fn last_ah_al__mov_ah_invalidates_al() {
-    let func = json!({
-        "start": 0x0000,
-        "instructions": [
-            {"address":0x0000,"mnemonic":"mov","op_str":"al, 0x02","bytes":"B002"},
-            {"address":0x0002,"mnemonic":"mov","op_str":"ah, 0x42","bytes":"B442"},
-            {"address":0x0004,"mnemonic":"int","op_str":"0x21","bytes":"CD21"},
-            {"address":0x0006,"mnemonic":"ret","op_str":"","bytes":"C3"},
-        ],
-    });
-    let src = render_plain(&func, &[]);
-    assert!(src.contains("CF = dos_lseek(bx, cx, dx, al);"), "{src}");
+    assert!(src.contains("set_SF((ah() >> 7) & 1);"), "{src}");
+    assert!(src.contains("set_ZF((ah() >> 6) & 1);"), "{src}");
+    assert!(src.contains("set_PF((ah() >> 2) & 1);"), "{src}");
+    assert!(src.contains("set_CF(ah() & 1);"), "{src}");
 }
 
 // ============================================================================
@@ -988,8 +660,10 @@ fn lcall__lcall_cs_indirect() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("lcall_table((uint16_t)(0x00005U + 0x10100U - ((uint32_t)cs << 4)), memw(cs, 0xff12), memw(cs, 0xff10));"), "{src}");
-    assert!(src.contains("// ASM: lcall cs:[0xff10]"), "{src}");
+    assert!(
+        src.contains("lcall_table_(((0x5u32).wrapping_add(0x10100).wrapping_sub((cs() as u32) << 4)) as u16, memw(cs(), 0xFF12), memw(cs(), 0xFF10));"),
+        "{src}"
+    );
 }
 
 #[test]
@@ -1003,8 +677,10 @@ fn lcall__lcall_cs_indirect_other_offset() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("lcall_table((uint16_t)(0x00005U + 0x10100U - ((uint32_t)cs << 4)), memw(cs, 0xff0e), memw(cs, 0xff0c));"), "{src}");
-    assert!(src.contains("// ASM: lcall cs:[0xff0c]"), "{src}");
+    assert!(
+        src.contains("lcall_table_(((0x5u32).wrapping_add(0x10100).wrapping_sub((cs() as u32) << 4)) as u16, memw(cs(), 0xFF0E), memw(cs(), 0xFF0C));"),
+        "{src}"
+    );
 }
 
 #[test]
@@ -1012,15 +688,16 @@ fn lcall__lcall_indirect_register() {
     let func = json!({
         "start": 0x0000,
         "instructions": [
-            {"address":0x0000,"mnemonic":"lcall","op_str":"[bx]","bytes":"",
+            {"address":0x0000,"mnemonic":"lcall","op_str":"[bx]","bytes":"FF1F",
              "detail":{"mem_refs":[{"segment":"DS","base":"BX","index":null,"scale":1,"disp":0,"access":"read"}]}},
             {"address":0x0005,"mnemonic":"ret","op_str":"","bytes":"C3"},
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("lcall_table((uint16_t)(0x00005U + 0x10100U - ((uint32_t)cs << 4)), memw(ds, bx + 0x0002), memw(ds, bx));"), "{src}");
-    assert!(src.contains("// ASM: lcall [bx]"), "{src}");
-    assert!(!src.contains("// TODO ASM: lcall [bx]"), "{src}");
+    assert!(
+        src.contains("lcall_table_(((0x5u32).wrapping_add(0x10100).wrapping_sub((cs() as u32) << 4)) as u16, memw(ds(), (((bx() as u32).wrapping_add(0x2u32)) & 0xFFFF) as u16), memw(ds(), bx()));"),
+        "{src}"
+    );
 }
 
 #[test]
@@ -1036,8 +713,11 @@ fn lcall__call_after_push_cs_pop_ds_is_near() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("call_table((uint16_t)(0x00007U + 0x10100U - ((uint32_t)cs << 4)), (((uint32_t)cs << 4) + (uint16_t)(memw(cs, 0x1000))"), "{src}");
-    assert!(!src.contains("lcall_table"), "{src}");
+    assert!(
+        src.contains("call_table_(((0x7u32).wrapping_add(0x10100).wrapping_sub((cs() as u32) << 4)) as u16, (((cs() as u32) << 4).wrapping_add((memw(cs(), 0x1000)) as u32)) & 0xFFFFF);"),
+        "{src}"
+    );
+    assert!(!src.contains("lcall_table_"), "{src}");
 }
 
 #[test]
@@ -1053,8 +733,11 @@ fn lcall__call_after_push_cs_with_intervening_instruction_is_near() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("call_table((uint16_t)(0x00008U + 0x10100U - ((uint32_t)cs << 4)), (((uint32_t)cs << 4) + (uint16_t)(memw(cs, 0x1000))"), "{src}");
-    assert!(!src.contains("lcall_table"), "{src}");
+    assert!(
+        src.contains("call_table_(((0x8u32).wrapping_add(0x10100).wrapping_sub((cs() as u32) << 4)) as u16, (((cs() as u32) << 4).wrapping_add((memw(cs(), 0x1000)) as u32)) & 0xFFFFF);"),
+        "{src}"
+    );
+    assert!(!src.contains("lcall_table_"), "{src}");
 }
 
 // ============================================================================
@@ -1070,14 +753,22 @@ fn lodsb__rep_lodsb_loads_last_byte_and_updates_regs() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("if (cx) {"), "{src}");
-    assert!(src.contains("int delta = DF ? -1 : 1;"), "{src}");
+    assert!(src.contains("if cx() != 0 {"), "{src}");
     assert!(
-        src.contains("al = memb(ds, si + (cx - 1) * delta);"),
+        src.contains("let delta: i32 = if DF() != 0 { -1 } else { 1 };"),
         "{src}"
     );
-    assert!(src.contains("si = (si + cx * delta) & 0xFFFF;"), "{src}");
-    assert!(src.contains("cx = 0;"), "{src}");
+    assert!(
+        src.contains(
+            "set_al(memb(ds(), ((si() as i32 + (cx() as i32 - 1) * delta) & 0xFFFF) as u16));"
+        ),
+        "{src}"
+    );
+    assert!(
+        src.contains("set_si(((si() as i32 + cx() as i32 * delta) & 0xFFFF) as u16);"),
+        "{src}"
+    );
+    assert!(src.contains("set_cx(0);"), "{src}");
 }
 
 #[test]
@@ -1091,7 +782,7 @@ fn lodsb__lodsb_respects_source_segment_override() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("al = memb(cs, si);"), "{src}");
+    assert!(src.contains("set_al(memb(cs(), si()));"), "{src}");
 }
 
 // ============================================================================
@@ -1107,11 +798,9 @@ fn long_jump__ljmp_uses_long_jump() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(
-        src.contains("long_jump(0x2000, 0x1000);\n    return;"),
-        "{src}"
-    );
-    assert!(src.contains("// ASM: ljmp 0x2000:0x1000"), "{src}");
+    assert!(src.contains("long_jump_(0x2000, 0x1000);"), "{src}");
+    let body = arm(&src, 0x0000);
+    assert!(body.contains("return;"), "{body}");
 }
 
 #[test]
@@ -1125,10 +814,11 @@ fn long_jump__ljmp_memory_operand() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("long_jump(memw(cs, 0x08AF), memw(cs, 0x08AD));\n    return;"),
+        src.contains("long_jump_(memw(cs(), 0x8AF), memw(cs(), 0x8AD));"),
         "{src}"
     );
-    assert!(src.contains("// ASM: ljmp cs:[0x8ad]"), "{src}");
+    let body = arm(&src, 0x0000);
+    assert!(body.contains("return;"), "{body}");
 }
 
 #[test]
@@ -1143,13 +833,15 @@ fn long_jump__ljmp_memory_operand_no_segment_prefix() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("long_jump(memw(ds, 0x2FFE), memw(ds, 0x2FFC));\n    return;"),
+        src.contains("long_jump_(memw(ds(), 0x2FFE), memw(ds(), 0x2FFC));"),
         "{src}"
     );
-    assert!(src.contains("// ASM: ljmp [0x2ffc]"), "{src}");
 }
 
 // ============================================================================
+// The loop-structure SHAPE (while/do-while) is a C-renderer construct; the
+// state machine keeps the semantic content: the break condition, the cx
+// decrement with its conditional back edge, and the ret epilogues.
 // ============================================================================
 
 #[test]
@@ -1167,9 +859,17 @@ fn loop_break__loop_with_conditional_break() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("return;"), "{src}");
-    assert!(
-        src.contains("while (--cx != 0)") || src.contains("do {"),
+    // the conditional break out of the loop
+    assert!(src.contains("if ZF() == 1 {"), "{src}");
+    assert!(src.contains("pc = 0x000A;"), "{src}");
+    // loop = dec cx + conditional back edge to the header
+    assert!(src.contains("set_cx(cx().wrapping_sub(1));"), "{src}");
+    assert!(src.contains("if cx() != 0 {"), "{src}");
+    assert!(src.contains("pc = 0x0000;"), "{src}");
+    // both rets emit their own pop-return epilogue
+    assert_eq!(
+        src.matches("let popped_ip = memw(ss(), sp());").count(),
+        2,
         "{src}"
     );
 }
@@ -1180,17 +880,25 @@ fn loop_break__loop_conditional_return() {
         "start": 0x0000,
         "instructions": [
             {"address":0x0000,"mnemonic":"nop","op_str":"","bytes":"90"},
-            {"address":0x0001,"mnemonic":"jmp","op_str":"0006","bytes":"E90400"},
-            {"address":0x0006,"mnemonic":"cmp","op_str":"cx, 3","bytes":"83F9"},
-            {"address":0x0008,"mnemonic":"jne","op_str":"000E","bytes":"7504"},
-            {"address":0x000A,"mnemonic":"ret","op_str":"","bytes":"C3"},
+            {"address":0x0001,"mnemonic":"jmp","op_str":"0006","bytes":"E90200","target":0x0006},
+            {"address":0x0006,"mnemonic":"cmp","op_str":"cx, 3","bytes":"83F903"},
+            {"address":0x0009,"mnemonic":"jne","op_str":"000E","bytes":"7503"},
+            {"address":0x000B,"mnemonic":"ret","op_str":"","bytes":"C3"},
             {"address":0x000E,"mnemonic":"dec","op_str":"cx","bytes":"49"},
-            {"address":0x000F,"mnemonic":"jmp","op_str":"0000","bytes":"E9F1FF"},
+            {"address":0x000F,"mnemonic":"jmp","op_str":"0000","bytes":"E9EEFF","target":0x0000},
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("if") && src.contains("return;"), "{src}");
-    assert!(!src.contains("// TODO ASM: jne"), "{src}");
+    // the conditional exit: jne branches around the ret
+    assert!(src.contains("if ZF() == 0 {"), "{src}");
+    assert!(src.contains("pc = 0x000E;"), "{src}");
+    assert!(src.contains("let popped_ip = memw(ss(), sp());"), "{src}");
+    // the dec step and the back edge
+    assert!(
+        src.contains("set_cx((old.wrapping_sub(1) & 0xFFFF) as u16);"),
+        "{src}"
+    );
+    assert!(src.contains("pc = 0x0000;"), "{src}");
 }
 
 #[test]
@@ -1203,12 +911,16 @@ fn loop_break__xor_self_clears_with_flags() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("xor8(&ah, ah);"), "{src}");
-    assert!(!src.contains("ZF"), "{src}");
+    // self-xor lowers to the flag-setting helper — no inline flag writes
+    assert!(src.contains("xor8(ah_ptr(), ah());"), "{src}");
+    assert!(!src.contains("set_ZF"), "{src}");
 }
 
 #[test]
 fn loop_break__loop_invalidates_cx_before_dos_int() {
+    // (C asserted the write-file call read live `cx`, not the cached mov value;
+    // Rust registers are written immediately — pin the loop decrement and that
+    // dos_api() follows the register setup.)
     let func = json!({
         "start": 0x0000,
         "instructions": [
@@ -1222,71 +934,15 @@ fn loop_break__loop_invalidates_cx_before_dos_int() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("cx = 5;"), "{src}");
-    assert!(src.contains("cx--;"), "{src}");
+    assert!(src.contains("set_cx(0x5);"), "{src}");
+    assert!(src.contains("set_cx(cx().wrapping_sub(1));"), "{src}");
+    assert!(src.contains("pc = 0x0003;"), "{src}");
+    assert!(src.contains("set_ah(0x40);"), "{src}");
+    assert!(src.contains("dos_api();"), "{src}");
     assert!(
-        src.contains("dos_write_file(0x0001, (const void *)seg_off(cs, 0x1000), cx);"),
+        src.find("set_ah(0x40);").unwrap() < src.find("dos_api();").unwrap(),
         "{src}"
     );
-}
-
-// ============================================================================
-// ============================================================================
-
-#[test]
-fn metadata__function_name_metadata() {
-    let func = json!({
-        "start": 0x0385,
-        "instructions": [
-            {"address":0x0385,"mnemonic":"call","op_str":"04EF","bytes":"E80000"},
-            {"address":0x0388,"mnemonic":"ret","op_str":"","bytes":"C3"},
-        ],
-    });
-    let mut r = renderer("game_");
-    r.func_names.insert(0x0385, "clearPendingKeys".into());
-    r.func_names.insert(0x04EF, "loadFile".into());
-    let lines = r.render_function_c(&func, &known(&[0x0385, 0x04EF]));
-    let src = lines.join("\n");
-    assert_eq!(lines[0], "// func_0385");
-    assert!(
-        src.contains(
-            "void game_clearPendingKeys_impl(const char *file, const char *func, int line)"
-        ),
-        "{src}"
-    );
-    assert!(src.contains("pc = 0x04EF;"), "{src}");
-    assert!(src.contains("continue;"), "{src}");
-}
-
-#[test]
-fn metadata__instruction_comment_metadata() {
-    let func = json!({
-        "start": 0x0385,
-        "instructions": [
-            {"address":0x0385,"mnemonic":"call","op_str":"04EF","bytes":"E80000"},
-            {"address":0x0388,"mnemonic":"ret","op_str":"","bytes":"C3"},
-        ],
-    });
-    let mut r = renderer("game_");
-    r.func_names.insert(0x0385, "clearPendingKeys".into());
-    r.func_names.insert(0x04EF, "loadFile".into());
-    r.comments.insert(0x0385, json!("Call loadFile"));
-    r.comments.insert(
-        0x0388,
-        json!({"text": "Multi line\ncomment", "multiline": true}),
-    );
-    let lines = r.render_function_c(&func, &known(&[0x0385, 0x04EF]));
-    assert!(
-        lines.iter().any(|l| l.trim() == "// Call loadFile"),
-        "{lines:?}"
-    );
-    let block = lines
-        .iter()
-        .position(|l| l.trim() == "/*")
-        .expect("no /* block");
-    assert_eq!(lines[block + 1].trim(), "Multi line");
-    assert_eq!(lines[block + 2].trim(), "comment");
-    assert_eq!(lines[block + 3].trim(), "*/");
 }
 
 // ============================================================================
@@ -1302,10 +958,22 @@ fn movsb_stosb__movsb_copies_byte_and_increments() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("int delta = DF ? -1 : 1;"), "{src}");
-    assert!(src.contains("memb_write(es, di, memb(ds, si));"), "{src}");
-    assert!(src.contains("si = (si + delta) & 0xFFFF;"), "{src}");
-    assert!(src.contains("di = (di + delta) & 0xFFFF;"), "{src}");
+    assert!(
+        src.contains("let delta: i32 = if DF() != 0 { -1 } else { 1 };"),
+        "{src}"
+    );
+    assert!(
+        src.contains("memb_write(es(), di(), memb(ds(), si()));"),
+        "{src}"
+    );
+    assert!(
+        src.contains("set_si(((si() as i32 + delta) & 0xFFFF) as u16);"),
+        "{src}"
+    );
+    assert!(
+        src.contains("set_di(((di() as i32 + delta) & 0xFFFF) as u16);"),
+        "{src}"
+    );
 }
 
 #[test]
@@ -1318,7 +986,7 @@ fn movsb_stosb__rep_movsb_loops_and_updates_regs() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("rep_movsb_block(es, ds);"), "{src}");
+    assert!(src.contains("rep_movsb_block(es(), ds());"), "{src}");
 }
 
 #[test]
@@ -1331,13 +999,19 @@ fn movsb_stosb__stosb_stores_byte_and_increments() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("int delta = DF ? -1 : 1;"), "{src}");
-    assert!(src.contains("memb_write(es, di, al);"), "{src}");
-    assert!(src.contains("di = (di + delta) & 0xFFFF;"), "{src}");
+    assert!(
+        src.contains("let delta: i32 = if DF() != 0 { -1 } else { 1 };"),
+        "{src}"
+    );
+    assert!(src.contains("memb_write(es(), di(), al());"), "{src}");
+    assert!(
+        src.contains("set_di(((di() as i32 + delta) & 0xFFFF) as u16);"),
+        "{src}"
+    );
 }
 
 #[test]
-fn movsb_stosb__rep_stosb_uses_memset_and_updates_regs() {
+fn movsb_stosb__rep_stosb_uses_block_helper_and_updates_regs() {
     let func = json!({
         "start": 0x0000,
         "instructions": [
@@ -1346,7 +1020,7 @@ fn movsb_stosb__rep_stosb_uses_memset_and_updates_regs() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("rep_stosb_block(es);"), "{src}");
+    assert!(src.contains("rep_stosb_block(es());"), "{src}");
 }
 
 #[test]
@@ -1363,7 +1037,10 @@ fn movsb_stosb__movsb_respects_source_segment_override() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("memb_write(es, di, memb(cs, si));"), "{src}");
+    assert!(
+        src.contains("memb_write(es(), di(), memb(cs(), si()));"),
+        "{src}"
+    );
 }
 
 // ============================================================================
@@ -1379,10 +1056,22 @@ fn movsw__movsw_copies_word_and_increments() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("int delta = DF ? -2 : 2;"), "{src}");
-    assert!(src.contains("memw_write(es, di, memw(ds, si));"), "{src}");
-    assert!(src.contains("si = (si + delta) & 0xFFFF;"), "{src}");
-    assert!(src.contains("di = (di + delta) & 0xFFFF;"), "{src}");
+    assert!(
+        src.contains("let delta: i32 = if DF() != 0 { -2 } else { 2 };"),
+        "{src}"
+    );
+    assert!(
+        src.contains("memw_write(es(), di(), memw(ds(), si()));"),
+        "{src}"
+    );
+    assert!(
+        src.contains("set_si(((si() as i32 + delta) & 0xFFFF) as u16);"),
+        "{src}"
+    );
+    assert!(
+        src.contains("set_di(((di() as i32 + delta) & 0xFFFF) as u16);"),
+        "{src}"
+    );
 }
 
 #[test]
@@ -1395,7 +1084,7 @@ fn movsw__rep_movsw_loops_and_updates_regs() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("rep_movsw_block(es, ds);"), "{src}");
+    assert!(src.contains("rep_movsw_block(es(), ds());"), "{src}");
 }
 
 // ============================================================================
@@ -1411,7 +1100,7 @@ fn no_dead_end__nop_instruction_is_ignored() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(!src.contains("// TODO ASM: nop"), "{src}");
+    assert!(!src.contains("nop"), "{src}");
 }
 
 // ============================================================================
@@ -1427,9 +1116,11 @@ fn not__not_inverts_and_sets_zero_flag() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("al = (~al) & 0xFF;"), "{src}");
-    assert!(src.contains("ZF = al == 0;"), "{src}");
-    assert!(!src.contains("// TODO ASM: not al"), "{src}");
+    assert!(
+        src.contains("set_al(((!((al()) as u32)) & 0xFF) as u8);"),
+        "{src}"
+    );
+    assert!(src.contains("set_ZF(((al()) == 0) as u8);"), "{src}");
 }
 
 #[test]
@@ -1437,17 +1128,19 @@ fn not__not_memory_uses_write_helper() {
     let func = json!({
         "start": 0x0000,
         "instructions": [
-            {"address":0x0000,"mnemonic":"not","op_str":"byte ptr cs:[0xff27]","bytes":"F61627FF"},
-            {"address":0x0004,"mnemonic":"ret","op_str":"","bytes":"C3"},
+            {"address":0x0000,"mnemonic":"not","op_str":"byte ptr cs:[0xff27]","bytes":"2EF61627FF"},
+            {"address":0x0005,"mnemonic":"ret","op_str":"","bytes":"C3"},
         ],
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("memb_write(cs, 0xff27, (~memb(cs, 0xff27)) & 0xFF);"),
+        src.contains("memb_write(cs(), 0xFF27, ((!((memb(cs(), 0xFF27)) as u32)) & 0xFF) as u8);"),
         "{src}"
     );
-    assert!(src.contains("ZF = memb(cs, 0xff27) == 0;"), "{src}");
-    assert!(!src.contains("// TODO ASM: not"), "{src}");
+    assert!(
+        src.contains("set_ZF(((memb(cs(), 0xFF27)) == 0) as u8);"),
+        "{src}"
+    );
 }
 
 // ============================================================================
@@ -1455,24 +1148,20 @@ fn not__not_memory_uses_write_helper() {
 
 #[test]
 fn prefix__name_prefix_applied() {
+    // (was: renderer("foo_") + func_names poke; the Rust equivalent contract is
+    // the prefix on the emitted dispatch/_impl symbols, with the jmp remaining
+    // a pc transfer rather than a prefixed call.)
     let func = json!({
         "start": 0x0000,
         "instructions": [
-            {"address":0x0000,"mnemonic":"jmp","op_str":"0x0100","bytes":""},
+            {"address":0x0000,"mnemonic":"jmp","op_str":"0x0100","bytes":"E9FD00","target":0x0100},
         ],
     });
-    let mut r = renderer("foo_");
-    r.func_names.insert(0x0100, "func_0100".into());
-    let lines = r.render_function_c(&func, &known(&[0x0000]));
-    assert!(
-        lines.iter().any(|l| l.contains("pc = 0x0100;")),
-        "{lines:?}"
-    );
-    assert!(
-        lines.iter().all(|l| !l.contains("foo_func_0100();")),
-        "{lines:?}"
-    );
-    assert!(lines.iter().all(|l| !l.contains("dispatch")), "{lines:?}");
+    let src = render_rs(&func, &[0x0000], "foo_");
+    assert!(src.contains("fn foo_dispatch("), "{src}");
+    assert!(src.contains("fn foo_func_0000_impl("), "{src}");
+    assert!(src.contains("pc = 0x0100;"), "{src}");
+    assert!(!src.contains("foo_func_0100()"), "{src}");
 }
 
 // ============================================================================
@@ -1488,8 +1177,11 @@ fn push_pop__push_register() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("sp = (sp - 2) & 0xFFFF;"), "{src}");
-    assert!(src.contains("memw_write(ss, sp, ax);"), "{src}");
+    assert!(
+        src.contains("set_sp((sp().wrapping_sub(2)) & 0xFFFF);"),
+        "{src}"
+    );
+    assert!(src.contains("memw_write(ss(), sp(), ax());"), "{src}");
 }
 
 #[test]
@@ -1502,8 +1194,11 @@ fn push_pop__push_immediate() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("sp = (sp - 2) & 0xFFFF;"), "{src}");
-    assert!(src.contains("memw_write(ss, sp, 0x1234);"), "{src}");
+    assert!(
+        src.contains("set_sp((sp().wrapping_sub(2)) & 0xFFFF);"),
+        "{src}"
+    );
+    assert!(src.contains("memw_write(ss(), sp(), 0x1234);"), "{src}");
 }
 
 #[test]
@@ -1516,9 +1211,20 @@ fn push_pop__push_sp_uses_pre_decrement_value() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("uint16_t push_value = sp;"), "{src}");
-    assert!(src.contains("sp = (sp - 2) & 0xFFFF;"), "{src}");
-    assert!(src.contains("memw_write(ss, sp, push_value);"), "{src}");
+    assert!(src.contains("let push_value = sp();"), "{src}");
+    assert!(
+        src.contains("set_sp((sp().wrapping_sub(2)) & 0xFFFF);"),
+        "{src}"
+    );
+    assert!(src.contains("memw_write(ss(), sp(), push_value);"), "{src}");
+    // the capture happens BEFORE the decrement (286+ semantics)
+    assert!(
+        src.find("let push_value = sp();").unwrap()
+            < src
+                .find("set_sp((sp().wrapping_sub(2)) & 0xFFFF);")
+                .unwrap(),
+        "{src}"
+    );
 }
 
 #[test]
@@ -1526,13 +1232,19 @@ fn push_pop__push_memory() {
     let func = json!({
         "start": 0x0000,
         "instructions": [
-            {"address":0x0000,"mnemonic":"push","op_str":"word ptr es:[di]","bytes":"2EFF"},
-            {"address":0x0002,"mnemonic":"ret","op_str":"","bytes":"C3"},
+            {"address":0x0000,"mnemonic":"push","op_str":"word ptr es:[di]","bytes":"26FF35"},
+            {"address":0x0003,"mnemonic":"ret","op_str":"","bytes":"C3"},
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("sp = (sp - 2) & 0xFFFF;"), "{src}");
-    assert!(src.contains("memw_write(ss, sp, memw(es, di));"), "{src}");
+    assert!(
+        src.contains("set_sp((sp().wrapping_sub(2)) & 0xFFFF);"),
+        "{src}"
+    );
+    assert!(
+        src.contains("memw_write(ss(), sp(), memw(es(), di()));"),
+        "{src}"
+    );
 }
 
 #[test]
@@ -1545,8 +1257,11 @@ fn push_pop__pop_register() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("ax = memw(ss, sp);"), "{src}");
-    assert!(src.contains("sp = (sp + 2) & 0xFFFF;"), "{src}");
+    assert!(src.contains("set_ax(memw(ss(), sp()));"), "{src}");
+    assert!(
+        src.contains("set_sp((sp().wrapping_add(2)) & 0xFFFF);"),
+        "{src}"
+    );
 }
 
 #[test]
@@ -1559,11 +1274,15 @@ fn push_pop__pop_memory() {
         ],
     });
     let src = render_plain(&func, &[]);
+    // bp-based operands default to SS; -2 renders as the wrapping +0xFFFE
     assert!(
-        src.contains("memw_write(ss, ((bp + 0xFFFE) & 0xFFFF), memw(ss, sp));"),
+        src.contains("memw_write(ss(), (((bp() as u32).wrapping_add(0xFFFEu32)) & 0xFFFF) as u16, memw(ss(), sp()));"),
         "{src}"
     );
-    assert!(src.contains("sp = (sp + 2) & 0xFFFF;"), "{src}");
+    assert!(
+        src.contains("set_sp((sp().wrapping_add(2)) & 0xFFFF);"),
+        "{src}"
+    );
 }
 
 #[test]
@@ -1576,8 +1295,14 @@ fn push_pop__pop_memory_with_segment_override() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("memw_write(es, di, memw(ss, sp));"), "{src}");
-    assert!(src.contains("sp = (sp + 2) & 0xFFFF;"), "{src}");
+    assert!(
+        src.contains("memw_write(es(), di(), memw(ss(), sp()));"),
+        "{src}"
+    );
+    assert!(
+        src.contains("set_sp((sp().wrapping_add(2)) & 0xFFFF);"),
+        "{src}"
+    );
 }
 
 #[test]
@@ -1591,8 +1316,14 @@ fn push_pop__push_pop_pair_preserves_stack_effect() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("sp = (sp - 2) & 0xFFFF;"), "{src}");
-    assert!(src.contains("memw_write(ss, sp, cs);"), "{src}");
-    assert!(src.contains("es = memw(ss, sp);"), "{src}");
-    assert!(src.contains("sp = (sp + 2) & 0xFFFF;"), "{src}");
+    assert!(
+        src.contains("set_sp((sp().wrapping_sub(2)) & 0xFFFF);"),
+        "{src}"
+    );
+    assert!(src.contains("memw_write(ss(), sp(), cs());"), "{src}");
+    assert!(src.contains("set_es(memw(ss(), sp()));"), "{src}");
+    assert!(
+        src.contains("set_sp((sp().wrapping_add(2)) & 0xFFFF);"),
+        "{src}"
+    );
 }

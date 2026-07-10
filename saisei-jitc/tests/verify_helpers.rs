@@ -1,5 +1,9 @@
-//! Verifies the DISASM (disasm→JSON) and PCSW (render_pc_dispatch) helper paths
+//! Verifies the DISASM (disasm→JSON) and chunk-render helper paths
 //! by porting one representative test from each category.
+//!
+//! PORT DISPOSITIONS (C backend deleted):
+//!   ported: 2 (pc_switch_renderer_emits_cases → dispatch match arms;
+//!           forward_jmp_no_label → intra-chunk pc transfer, no call_table_)
 mod common;
 use common::*;
 use serde_json::json;
@@ -17,19 +21,20 @@ fn pc_switch_renderer_emits_cases() {
             {"address":0x010B,"mnemonic":"ret","op_str":"","bytes":"C3"},
         ],
     });
-    let src = render_pc_dispatch(&[f], &[]);
-    let switch_section = src.split("switch (pc)").nth(1).unwrap();
-    assert!(switch_section.contains("case 0x0100:"), "{switch_section}");
-    assert!(switch_section.contains("pc = 0x0109;"));
-    assert!(switch_section.contains("pc = 0x0105;"));
-    let block_0100 = switch_section
-        .split("case 0x0100:")
+    let src = render_rs_dispatch(&[f], &[]);
+    let match_section = src.split("match pc").nth(1).unwrap();
+    assert!(match_section.contains("0x0100 => {"), "{match_section}");
+    assert!(match_section.contains("pc = 0x0109;"), "{match_section}");
+    assert!(match_section.contains("pc = 0x0105;"), "{match_section}");
+    // The cmp+jne block ends in exactly one `continue;` (after the if/else).
+    let block_0100 = match_section
+        .split("0x0100 => {")
         .nth(1)
         .unwrap()
-        .split("case")
+        .split("=> {")
         .next()
         .unwrap();
-    assert_eq!(block_0100.matches("continue;").count(), 1);
+    assert_eq!(block_0100.matches("continue;").count(), 1, "{block_0100}");
 }
 
 #[test]
@@ -38,11 +43,11 @@ fn forward_jmp_no_label() {
     let ir = disasm(&data, &[0x0]);
     let labels = extern_labels(&ir);
     assert!(!labels.contains(&0x0004));
+    // A forward jmp inside the function is an intra-chunk transfer: rendered as
+    // a direct `pc = …;` with no dispatch through the call table.
     let funcs = functions(&ir);
-    let mut r = renderer("");
-    r.extern_labels = labels;
-    let start = as_i(&funcs[0], "start");
-    let src = r.render_function_c(&funcs[0], &known(&[start])).join("\n");
-    assert!(!src.contains("dispatch("), "{src}");
-    assert!(!src.contains("label_0004"), "{src}");
+    let src = render_rs_ir(&ir, &[], "").expect("emit (forward jmp)");
+    assert!(!funcs.is_empty());
+    assert!(src.contains("pc = 0x0004;"), "{src}");
+    assert!(!src.contains("call_table_"), "{src}");
 }

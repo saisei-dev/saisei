@@ -1,24 +1,29 @@
-# Patched fork of capstone-sys 0.16.0 (bindings only, no vendored C).
+# Patched fork of capstone-sys 0.16.0: vendors capstone 5.0.7 (x86-only).
 #
 # Upstream capstone-sys 0.16.0 compiles a bundled capstone 5.0-rc2, which
-# disagrees with the reference's capstone 5.0.7 on some operand-access flags
-# (e.g. `test [mem], imm` -> readwrite vs read), and that flag feeds ir_to_c's
+# disagrees with capstone 5.0.7 on some operand-access flags (e.g.
+# `test [mem], imm` -> readwrite vs read), and that flag feeds the translator's
 # flag-liveness analysis. This fork keeps the (ABI-stable across 5.0.x)
-# pre-generated bindings but LINKS AN EXTERNAL libcapstone chosen via
-# SAISEI_CAPSTONE_LIB_DIR, so Rust and the oracle decode identically. Reproducible
-# and committed; for distribution, point the env var at a vendored libcapstone.
+# pre-generated bindings and compiles the checked-in capstone/ tree — the exact
+# C core from the PyPI capstone 5.0.7 sdist (what the Python reference's wheel
+# was built from), x86 module only — statically. `cargo build` needs no env
+# vars and the binaries carry no runtime libcapstone dependency.
+# SAISEI_CAPSTONE_LIB_DIR remains as an override to link an external dylib.
 [package]
 name = "capstone-sys"
 version = "0.16.0"
 edition = "2018"
 build = "build.rs"
 links = "capstone"
-description = "Patched capstone-sys: links an external libcapstone instead of the vendored rc2 source."
+description = "Patched capstone-sys: statically builds vendored capstone 5.0.7 (x86-only)."
 license = "MIT"
 
 [dependencies.libc]
 version = "0.2"
 default-features = false
+
+[build-dependencies]
+cc = "1"
 
 [features]
 default = ["full"]

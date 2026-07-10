@@ -1,15 +1,12 @@
-//! saisei-jitc library — the Rust port of the reference `compiler/` translator.
+//! saisei-jitc library — the JIT translator: DOS MZ program images to native
+//! Rust chunks.
 //!
-//! Exposes the translator/JIT internals as a library so both the `saisei-jitc`
-//! binary and the cargo test suite (ports of the reference `tests/` unit tests)
-//! can drive them. `ast`/`cfg`/`graph`/`patterns` are the structured
-//! (readable-C) renderer's support crates — dead on the JIT PCSwitch path but
-//! exercised by the ~100 structured-renderer tests.
+//! `disassemble` decodes bytes to the lossless JSON IR; `translate` is the
+//! shared front-half (operand rewriting, flag normalization, basic blocks);
+//! `codegen` emits each chunk as Rust for rustc. Exposed as a library so both
+//! the `saisei-jitc` binary and the cargo test suite can drive them.
 #![allow(dead_code)]
 
-pub mod ast;
-pub mod cfg;
+pub mod codegen;
 pub mod disassemble;
-pub mod graph;
-pub mod ir_to_c;
-pub mod patterns;
+pub mod translate;

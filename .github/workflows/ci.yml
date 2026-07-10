@@ -17,8 +17,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Install system deps (clang, capstone, SDL2)
-        run: sudo apt-get update && sudo apt-get install -y clang libcapstone-dev libsdl2-dev pkg-config
+      - name: Install system deps (capstone, SDL2)
+        run: sudo apt-get update && sudo apt-get install -y libcapstone-dev libsdl2-dev pkg-config
       - name: Point the build at the system Capstone
         run: echo "SAISEI_CAPSTONE_LIB_DIR=$(dirname "$(find /usr/lib -name 'libcapstone.so*' | head -1)")" >> "$GITHUB_ENV"
       - name: Format check
