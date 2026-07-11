@@ -417,6 +417,85 @@ fn sync_pressed_scancodes_with_keyboard_state() {
     }
 }
 
+/// Turn a `game_config` bundle id into a display name. The id is lowercase and
+/// often carries platform/locale tags (`alleycat`, `kings_bounty_dos_en`); we
+/// split on `_`/`-`, drop trailing bundle tokens, and title-case so the window
+/// reads like the game ("Kings Bounty", not "kings_bounty_dos_en"). Returns
+/// `None` for an empty/all-noise id.
+fn prettify_name(raw: &str) -> Option<String> {
+    let mut words: Vec<&str> = raw
+        .split(|c: char| c == '_' || c == '-' || c == ' ')
+        .filter(|w| !w.is_empty())
+        .collect();
+    // Trailing tokens that describe the bundle, not the game.
+    const NOISE: &[&str] = &[
+        "dos", "cd", "floppy", "disk", "en", "fr", "de", "es", "it", "nl", "pt", "us", "uk", "eu",
+        "jp", "v1", "v2",
+    ];
+    while words.len() > 1 && NOISE.contains(&words.last().unwrap().to_ascii_lowercase().as_str()) {
+        words.pop();
+    }
+    if words.is_empty() {
+        return None;
+    }
+    Some(
+        words
+            .iter()
+            .map(|w| {
+                let mut chars = w.chars();
+                let first = chars.next().unwrap().to_ascii_uppercase();
+                first.to_string() + &chars.as_str().to_ascii_lowercase()
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// The running game's display name from the linked-in `game_config` (`None`
+/// when no game is linked — weak-default config / shim tests).
+fn pretty_game_name() -> Option<String> {
+    let ptr = crate::shims::game_config.name;
+    if ptr.is_null() {
+        return None;
+    }
+    let raw = unsafe { core::ffi::CStr::from_ptr(ptr) }.to_string_lossy();
+    prettify_name(&raw)
+}
+
+/// Assemble the window title: "Saisei - <Game>" (plain "Saisei" when no game is
+/// known), with an optional trailing suffix like a buffer label.
+///
+/// ASCII only, on purpose. X11 window managers render the titlebar from their
+/// own font and legacy `WM_NAME`; non-ASCII there is unreliable — a color emoji
+/// or even a BMP symbol/em-dash shows as a tofu box, and a WM that reads
+/// `WM_NAME` as Latin-1 turns the UTF-8 bytes into mojibake. Sticking to ASCII
+/// makes the title render identically across every WM.
+fn format_title(game: Option<&str>, suffix: Option<&str>) -> String {
+    let mut title = match game {
+        Some(game) => format!("Saisei - {game}"),
+        None => "Saisei".to_string(),
+    };
+    if let Some(suffix) = suffix {
+        title.push_str(" (");
+        title.push_str(suffix);
+        title.push(')');
+    }
+    title
+}
+
+/// The title as a `CString`. SDL copies the string, so it need only outlive the
+/// set/create call.
+fn window_title(suffix: Option<&str>) -> std::ffi::CString {
+    let title = format_title(pretty_game_name().as_deref(), suffix);
+    // The format above never produces an interior NUL, but fall back defensively
+    // rather than unwrap-panic in the display path.
+    std::ffi::CString::new(title).unwrap_or_else(|_| std::ffi::CString::new("Saisei").unwrap())
+}
+
+unsafe fn set_window_title(suffix: Option<&str>) {
+    SDL_SetWindowTitle(WINDOW, window_title(suffix).as_ptr());
+}
+
 fn handle_events() {
     unsafe {
         SDL_PumpEvents();
@@ -456,15 +535,15 @@ fn handle_events() {
                         match sym {
                             SDLK_1 => {
                                 virtual_display_buffer = 0;
-                                SDL_SetWindowTitle(WINDOW, c"Saisei - Main Buffer".as_ptr());
+                                set_window_title(Some("Main Buffer"));
                             }
                             SDLK_2 => {
                                 virtual_display_buffer = 1;
-                                SDL_SetWindowTitle(WINDOW, c"Saisei - First Buffer".as_ptr());
+                                set_window_title(Some("First Buffer"));
                             }
                             SDLK_3 => {
                                 virtual_display_buffer = 2;
-                                SDL_SetWindowTitle(WINDOW, c"Saisei - Second Buffer".as_ptr());
+                                set_window_title(Some("Second Buffer"));
                             }
                             SDLK_F1 => {
                                 if k.repeat == 0 {
@@ -616,8 +695,9 @@ pub extern "C" fn virtual_display_init(width: c_int, height: c_int, scale: c_int
         }
         shim_reinstall_crash_handlers();
         SDL_SetHint(c"SDL_RENDER_SCALE_QUALITY".as_ptr(), c"0".as_ptr());
+        let title = window_title(None);
         WINDOW = SDL_CreateWindow(
-            c"Saisei".as_ptr(),
+            title.as_ptr(),
             SDL_WINDOWPOS_UNDEFINED,
             SDL_WINDOWPOS_UNDEFINED,
             width * SCALE_HINT,
@@ -714,4 +794,44 @@ pub extern "C" fn virtual_display_configure(width: c_int, height: c_int) {
         WIN_H = height;
     }
     recreate_texture(width, height);
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::{format_title, prettify_name};
+
+    #[test]
+    fn prettify_strips_bundle_tags_and_title_cases() {
+        assert_eq!(prettify_name("zeliard").as_deref(), Some("Zeliard"));
+        assert_eq!(prettify_name("alleycat").as_deref(), Some("Alleycat"));
+        assert_eq!(
+            prettify_name("kings_bounty_dos_en").as_deref(),
+            Some("Kings Bounty")
+        );
+        assert_eq!(prettify_name("popcorn_dos_fr").as_deref(), Some("Popcorn"));
+        assert_eq!(
+            prettify_name("dungeon-master").as_deref(),
+            Some("Dungeon Master")
+        );
+    }
+
+    #[test]
+    fn prettify_keeps_at_least_one_word() {
+        // An id that is *all* bundle tokens must not vanish entirely.
+        assert_eq!(prettify_name("dos").as_deref(), Some("Dos"));
+        assert_eq!(prettify_name("").as_deref(), None);
+        assert_eq!(prettify_name("___").as_deref(), None);
+    }
+
+    #[test]
+    fn format_matches_chosen_style() {
+        assert_eq!(format_title(Some("Zeliard"), None), "Saisei - Zeliard");
+        assert_eq!(
+            format_title(Some("Zeliard"), Some("Main Buffer")),
+            "Saisei - Zeliard (Main Buffer)"
+        );
+        assert_eq!(format_title(None, None), "Saisei");
+        // Title must be pure ASCII so every X11 WM titlebar renders it verbatim.
+        assert!(format_title(Some("Zeliard"), Some("Main Buffer")).is_ascii());
+    }
 }
