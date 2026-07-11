@@ -812,7 +812,7 @@ unsafe fn install_crash_handlers() {
     libc::sigaltstack(&alt, ptr::null_mut());
 
     let mut sa: libc::sigaction = core::mem::zeroed();
-    sa.sa_sigaction = crash_signal_handler as usize;
+    sa.sa_sigaction = crash_signal_handler as *const () as usize;
     libc::sigemptyset(&mut sa.sa_mask);
     sa.sa_flags = libc::SA_RESETHAND | libc::SA_ONSTACK;
     libc::sigaction(libc::SIGSEGV, &sa, ptr::null_mut());
@@ -827,7 +827,7 @@ unsafe fn install_crash_handlers() {
     // SIGUSR1: the repeatable, NON-fatal freeze sampler — its own handler, no
     // SA_RESETHAND (stays installed across taps), on the alt stack.
     let mut du: libc::sigaction = core::mem::zeroed();
-    du.sa_sigaction = freeze_diag_handler as usize;
+    du.sa_sigaction = freeze_diag_handler as *const () as usize;
     libc::sigemptyset(&mut du.sa_mask);
     du.sa_flags = libc::SA_ONSTACK | libc::SA_RESTART;
     libc::sigaction(libc::SIGUSR1, &du, ptr::null_mut());
@@ -1102,20 +1102,29 @@ unsafe fn lifecycle_elapsed_us() -> u64 {
 }
 
 unsafe fn lifecycle_fp_open_if_requested() {
-    static mut checked: c_int = 0;
-    if checked != 0 {
+    // Idempotent, and must NOT latch while the path is still unset. The path
+    // comes from --lifecycle-file (parsed in saisei_main), but the very first
+    // lifecycle event (the program LOAD) fires from the init_memory constructor,
+    // which runs *before* main — env vars were readable there, argv is not.
+    // Latching on that null-path call would permanently disable streaming, so we
+    // only stop retrying once a real open attempt (non-null path) has failed.
+    if !lifecycle_fp.is_null() {
         return;
     }
-    checked = 1;
-    let p = libc::getenv(cstr!("LIFECYCLE_FILE"));
+    let p = lifecycle_file_path_arg;
     if p.is_null() || *p == 0 {
+        return;
+    }
+    static mut open_failed: c_int = 0;
+    if open_failed != 0 {
         return;
     }
     lifecycle_fp = libc::fopen(p, cstr!("w"));
     if lifecycle_fp.is_null() {
+        open_failed = 1;
         libc::fprintf(
             stderr,
-            cstr!("LIFECYCLE_FILE: cannot open %s: %s\n"),
+            cstr!("--lifecycle-file: cannot open %s: %s\n"),
             p,
             libc::strerror(*libc::__errno_location()),
         );
@@ -1125,7 +1134,7 @@ unsafe fn lifecycle_fp_open_if_requested() {
         lifecycle_fp,
         ptr::addr_of_mut!(lifecycle_fp_buf) as *mut c_char,
         libc::_IOFBF,
-        core::mem::size_of_val(&lifecycle_fp_buf),
+        core::mem::size_of_val(&*ptr::addr_of!(lifecycle_fp_buf)),
     );
     libc::fprintf(
         lifecycle_fp,
@@ -1148,7 +1157,7 @@ unsafe fn lifecycle_ring_save(buf: *const c_char, mut len: usize) {
     }
 }
 
-unsafe extern "C" fn lifecycle_log(fmt: *const c_char, mut args: ...) {
+unsafe extern "C" fn lifecycle_log(fmt: *const c_char, args: ...) {
     lifecycle_fp_open_if_requested();
     let mut buf = [0u8; LIFECYCLE_LINE_MAX];
     let t = lifecycle_elapsed_us();
@@ -1247,7 +1256,7 @@ unsafe fn lifecycle_format_rec(
     cap: usize,
 ) -> usize {
     let bn = rec.bn.as_ptr() as *const c_char;
-    let mut w: c_int;
+    let w: c_int;
     if kind == LC_NRET {
         w = libc::snprintf(
             out,
@@ -1443,21 +1452,32 @@ pub unsafe extern "C" fn shim_pc_is_case_key(module: *const c_char, file_off: u3
 
 static mut trace_file_buf: [u8; 1 << 18] = [0; 1 << 18];
 
+// Paths from --trace-file / --lifecycle-file (parsed in saisei_main). They point
+// into argv, which lives for the whole process, so we keep the pointer directly.
+static mut trace_file_path_arg: *const c_char = ptr::null();
+static mut lifecycle_file_path_arg: *const c_char = ptr::null();
+
 unsafe fn trace_file_open_if_requested() {
-    static mut checked: c_int = 0;
-    if checked != 0 {
+    // Same rule as lifecycle: idempotent, and don't latch while the path is
+    // unset (see lifecycle_fp_open_if_requested) — the path arrives from argv in
+    // saisei_main, later than any constructor-time logging attempt.
+    if !trace_file_fp.is_null() {
         return;
     }
-    checked = 1;
-    let p = libc::getenv(cstr!("TRACE_FILE"));
+    let p = trace_file_path_arg;
     if p.is_null() || *p == 0 {
+        return;
+    }
+    static mut open_failed: c_int = 0;
+    if open_failed != 0 {
         return;
     }
     trace_file_fp = libc::fopen(p, cstr!("w"));
     if trace_file_fp.is_null() {
+        open_failed = 1;
         libc::fprintf(
             stderr,
-            cstr!("TRACE_FILE: cannot open %s: %s\n"),
+            cstr!("--trace-file: cannot open %s: %s\n"),
             p,
             libc::strerror(*libc::__errno_location()),
         );
@@ -1467,7 +1487,7 @@ unsafe fn trace_file_open_if_requested() {
         trace_file_fp,
         ptr::addr_of_mut!(trace_file_buf) as *mut c_char,
         libc::_IOFBF,
-        core::mem::size_of_val(&trace_file_buf),
+        core::mem::size_of_val(&*ptr::addr_of!(trace_file_buf)),
     );
 }
 
@@ -1964,16 +1984,16 @@ unsafe fn session_log_init() {
         return;
     }
     libc::snprintf(
-        session_log_path.as_mut_ptr() as *mut c_char,
-        session_log_path.len(),
+        ptr::addr_of_mut!(session_log_path) as *mut c_char,
+        (*ptr::addr_of!(session_log_path)).len(),
         cstr!("%s/session.log"),
         dir,
     );
-    session_log_fp = libc::fopen(session_log_path.as_ptr() as *const c_char, cstr!("w"));
+    session_log_fp = libc::fopen(ptr::addr_of!(session_log_path) as *const c_char, cstr!("w"));
     if session_log_fp.is_null() {
         shim_log_stdout(
             cstr!("[SESSION] fopen %s: %s\n"),
-            session_log_path.as_ptr() as *const c_char,
+            ptr::addr_of!(session_log_path) as *const c_char,
             libc::strerror(*libc::__errno_location()),
         );
         return;
@@ -1986,7 +2006,7 @@ unsafe fn session_log_init() {
     );
     shim_log_stdout(
         cstr!("[SESSION] logging stdin to %s\n"),
-        session_log_path.as_ptr() as *const c_char,
+        ptr::addr_of!(session_log_path) as *const c_char,
     );
 }
 
@@ -2027,7 +2047,7 @@ unsafe fn session_log_write_to_bundle(dir: *const c_char) {
         return;
     }
     libc::fflush(session_log_fp);
-    let src = libc::fopen(session_log_path.as_ptr() as *const c_char, cstr!("r"));
+    let src = libc::fopen(ptr::addr_of!(session_log_path) as *const c_char, cstr!("r"));
     if src.is_null() {
         return;
     }
@@ -2262,17 +2282,12 @@ unsafe fn quit_virtual_display() {
 // ============================================================================
 
 unsafe extern "C" fn init_keyboard() {
-    if !libc::getenv(cstr!("SAISEI_REPLAY")).is_null() {
-        vclock_state = VCLOCK_HALTED;
-        vclock_frozen_virtual_ns = 0;
-        shim_log_stdout(cstr!(
-            "[VCLOCK] SAISEI_REPLAY: initial halt at virtual_ns=0\n"
-        ));
-    }
+    // NOTE: --replay's initial vclock halt lives in saisei_main's argv parse
+    // (runs before run_machine), not here — the flag isn't known at ctor time.
     keyboard_fd = libc::STDIN_FILENO;
-    if libc::tcgetattr(keyboard_fd, &mut orig_termios) != 0 {
+    if libc::tcgetattr(keyboard_fd, ptr::addr_of_mut!(orig_termios)) != 0 {
         let tty = libc::open(cstr!("/dev/tty"), libc::O_RDONLY);
-        if tty >= 0 && libc::tcgetattr(tty, &mut orig_termios) == 0 {
+        if tty >= 0 && libc::tcgetattr(tty, ptr::addr_of_mut!(orig_termios)) == 0 {
             keyboard_fd = tty;
         } else {
             if tty >= 0 {
@@ -2298,7 +2313,7 @@ unsafe extern "C" fn init_keyboard() {
 
 unsafe extern "C" fn cleanup_keyboard() {
     if keyboard_initialized != 0 {
-        libc::tcsetattr(keyboard_fd, libc::TCSANOW, &orig_termios);
+        libc::tcsetattr(keyboard_fd, libc::TCSANOW, ptr::addr_of!(orig_termios));
         if keyboard_fd != libc::STDIN_FILENO {
             libc::close(keyboard_fd);
         }
@@ -2927,7 +2942,7 @@ static mut cached_host_now_ns: u64 = 0;
 const HOST_PROBE_MIN_VIRTUAL_NS: u64 = 50_000;
 
 #[no_mangle]
-pub unsafe extern "C" fn safe_point_impl(file: *const c_char, func: *const c_char, line: c_int) {
+pub unsafe extern "C" fn safe_point_impl(_file: *const c_char, func: *const c_char, line: c_int) {
     perf_sp_visits += 1;
     let now_ns = shim_time_sync();
     jit_instr_budget = JIT_BUDGET_QUANTUM;
@@ -3178,7 +3193,7 @@ pub unsafe extern "C" fn safe_point_impl(file: *const c_char, func: *const c_cha
                 continue;
             }
             let mut ascii: u8 = 0;
-            let mut scancode: u8 = 0;
+            let scancode: u8;
             let mut extended = false;
             if c == 0x1B {
                 let mut seq = [0u8; 2];
@@ -3519,7 +3534,7 @@ unsafe fn init_psp() {
         cstr!("PROMPT=$p$g"),
     ];
     let mut off: usize = 0;
-    for i in 0..env_vars.len() {
+    for i in 0..(*ptr::addr_of!(env_vars)).len() {
         let n = libc::strlen(env_vars[i]);
         libc::memcpy(
             env_block.add(off) as *mut c_void,
@@ -4113,8 +4128,8 @@ unsafe fn annot_file_path(name: *const c_char, out: *mut c_char, cap: usize) {
 unsafe fn aliasreg_compute_path() {
     annot_file_path(
         cstr!("aliases.json"),
-        aliasreg_path.as_mut_ptr() as *mut c_char,
-        aliasreg_path.len(),
+        ptr::addr_of_mut!(aliasreg_path) as *mut c_char,
+        (*ptr::addr_of!(aliasreg_path)).len(),
     );
 }
 
@@ -4216,7 +4231,7 @@ unsafe fn aliasreg_load() {
     }
     aliasreg_loaded = 1;
     aliasreg_compute_path();
-    let fp = libc::fopen(aliasreg_path.as_ptr() as *const c_char, cstr!("rb"));
+    let fp = libc::fopen(ptr::addr_of!(aliasreg_path) as *const c_char, cstr!("rb"));
     if fp.is_null() {
         return;
     }
@@ -4286,7 +4301,7 @@ unsafe fn aliasreg_save() {
         tmp.as_mut_ptr() as *mut c_char,
         tmp.len(),
         cstr!("%s.tmp"),
-        aliasreg_path.as_ptr() as *const c_char,
+        ptr::addr_of!(aliasreg_path) as *const c_char,
     );
     let fp = libc::fopen(tmp.as_ptr() as *const c_char, cstr!("wb"));
     if fp.is_null() {
@@ -4311,7 +4326,7 @@ unsafe fn aliasreg_save() {
     libc::fclose(fp);
     libc::rename(
         tmp.as_ptr() as *const c_char,
-        aliasreg_path.as_ptr() as *const c_char,
+        ptr::addr_of!(aliasreg_path) as *const c_char,
     );
 }
 
@@ -6472,12 +6487,12 @@ unsafe fn mem_page_flag_range(lo: u32, hi_exclusive: u32) {
 pub unsafe extern "C" fn mem_page_flags_recompute() {
     if bookend_active != 0 {
         // capture-everything mode: every write goes through the impl
-        for p in mem_page_flags.iter_mut() {
+        for p in (*ptr::addr_of_mut!(mem_page_flags)).iter_mut() {
             *p = 1;
         }
         return;
     }
-    for p in mem_page_flags.iter_mut() {
+    for p in (*ptr::addr_of_mut!(mem_page_flags)).iter_mut() {
         *p = 0;
     }
     // null-pointer page (the 0000:0000..000F warning lives in the impl)
@@ -7405,7 +7420,7 @@ unsafe extern "C" fn init_memory() {
     last_screenshot_time_ns = last_host_time_ns;
 
     cga.crtc_index = 0;
-    libc::memset(cga.crtc_regs.as_mut_ptr() as *mut c_void, 0, 0x20);
+    libc::memset(ptr::addr_of_mut!(cga.crtc_regs) as *mut c_void, 0, 0x20);
     cga.hsync_base = 0;
     cga.horiz_scroll = 0;
     cga.hsync_initialized = 0;
@@ -7708,7 +7723,7 @@ pub unsafe extern "C" fn inb(port: u16) -> u8 {
         // move between two reads inside one quantum (calibration loops #DE
         // on a zero delta otherwise).
         shim_time_sync();
-        let mut ret: u8;
+        let ret: u8;
         if pit.access_mode == 0x3 {
             if pit_read_expect_high == 0 {
                 if pit_latch_valid != 0 {
@@ -7970,8 +7985,8 @@ pub unsafe extern "C" fn outb(port: u16, value: u8) {
             }
         }
         0x3D8 => {
-            let mut new_mode = bios_video.video_mode;
-            let mut new_palette = bios_video.cga_palette_select;
+            let new_mode;
+            let new_palette;
             let graphics = (value >> 1) & 0x01;
             if graphics == 0 {
                 let high_res_text = value & 0x01;
@@ -8655,7 +8670,7 @@ unsafe fn crash_bundle_mkdir_parents(dir: *const c_char) -> c_int {
 
 unsafe fn crash_bundle_create_dir(kind: *const c_char, addr: u32) -> *const c_char {
     if crash_bundle_dir_cache[0] != 0 {
-        return crash_bundle_dir_cache.as_ptr() as *const c_char;
+        return ptr::addr_of!(crash_bundle_dir_cache) as *const c_char;
     }
     let now = libc::time(ptr::null_mut());
     let mut tm_buf: libc::tm = core::mem::zeroed();
@@ -8671,8 +8686,8 @@ unsafe fn crash_bundle_create_dir(kind: *const c_char, addr: u32) -> *const c_ch
     }
     kind_token[kt] = 0;
     libc::snprintf(
-        crash_bundle_dir_cache.as_mut_ptr() as *mut c_char,
-        crash_bundle_dir_cache.len(),
+        ptr::addr_of_mut!(crash_bundle_dir_cache) as *mut c_char,
+        (*ptr::addr_of!(crash_bundle_dir_cache)).len(),
         cstr!("crashes/crash_%04d%02d%02d_%02d%02d%02d_%s_0x%08X"),
         tm_buf.tm_year + 1900,
         tm_buf.tm_mon + 1,
@@ -8683,11 +8698,11 @@ unsafe fn crash_bundle_create_dir(kind: *const c_char, addr: u32) -> *const c_ch
         kind_token.as_ptr() as *const c_char,
         addr as c_uint,
     );
-    if crash_bundle_mkdir_parents(crash_bundle_dir_cache.as_ptr() as *const c_char) != 0 {
+    if crash_bundle_mkdir_parents(ptr::addr_of!(crash_bundle_dir_cache) as *const c_char) != 0 {
         crash_bundle_dir_cache[0] = 0;
         return ptr::null();
     }
-    crash_bundle_dir_cache.as_ptr() as *const c_char
+    ptr::addr_of!(crash_bundle_dir_cache) as *const c_char
 }
 
 unsafe fn crash_bundle_write_file(
@@ -9152,8 +9167,8 @@ unsafe fn report_unmapped(
         shim_fatal_captured = 1;
         shim_fatal_addr = addr;
         libc::snprintf(
-            shim_fatal_kind.as_mut_ptr() as *mut c_char,
-            shim_fatal_kind.len(),
+            ptr::addr_of_mut!(shim_fatal_kind) as *mut c_char,
+            (*ptr::addr_of!(shim_fatal_kind)).len(),
             cstr!("%s"),
             if kind.is_null() { cstr!("") } else { kind },
         );
@@ -9277,7 +9292,7 @@ unsafe fn report_unmapped(
         }
     }
     shim_flush_all_streams();
-    let mut target_fd: c_int = -1;
+    let target_fd: c_int;
     let mut tty_fd: c_int = -1;
     let out_fd = libc::fileno(stdout);
     if out_fd >= 0 && libc::isatty(out_fd) != 0 {
@@ -10044,7 +10059,9 @@ unsafe fn jit_compile_or_get(seg: u16, off: u16) -> *mut JitChunk {
                         (*c).stale = 0;
                         (*c).keys = ptr::null_mut();
                         (*c).nkeys = 0;
-                        jit_seg_index_relink(c.offset_from(jit_chunks.as_ptr()) as usize);
+                        jit_seg_index_relink(
+                            c.offset_from(ptr::addr_of!(jit_chunks) as *const JitChunk) as usize,
+                        );
                         if seg_base + lo < jit_code_lo {
                             jit_code_lo = seg_base + lo;
                         }
@@ -11196,7 +11213,10 @@ pub unsafe extern "C" fn shim_save_video_memory() {
     );
     shim_render_screenshot_png(path.as_ptr() as *const c_char);
 
-    let crc = stbiw__crc32(vga.palette.as_ptr(), vga.palette.len() as c_int);
+    let crc = stbiw__crc32(
+        ptr::addr_of!(vga.palette) as *const u8,
+        (*ptr::addr_of!(vga.palette)).len() as c_int,
+    );
     libc::snprintf(
         path.as_mut_ptr() as *mut c_char,
         path.len(),
@@ -11378,10 +11398,6 @@ pub unsafe extern "C" fn saisei_main(argc: c_int, argv: *mut *mut c_char) -> c_i
         let arg = *argv.offset(i as isize) as *const c_char;
         if libc::strcmp(arg, cstr!("--headless")) == 0 {
             headless_mode = 1;
-            let shot_secs = libc::getenv(cstr!("SAISEI_SCREENSHOT_SECS"));
-            if !shot_secs.is_null() && *shot_secs != 0 {
-                SCREENSHOT_INTERVAL_SECS = libc::atoi(shot_secs);
-            }
             i += 1;
             continue;
         }
@@ -11453,8 +11469,76 @@ pub unsafe extern "C" fn saisei_main(argc: c_int, argv: *mut *mut c_char) -> c_i
             i += 1;
             continue;
         }
+        // Developer knobs (previously passed via env; now argv-only).
+        if libc::strcmp(arg, cstr!("--verbose")) == 0 {
+            shim_stdout_enabled = 1;
+            i += 1;
+            continue;
+        }
+        if libc::strncmp(arg, cstr!("--trace-file="), 13) == 0 {
+            trace_file_path_arg = arg.add(13);
+            i += 1;
+            continue;
+        }
+        if libc::strcmp(arg, cstr!("--trace-file")) == 0 {
+            if i + 1 >= argc {
+                libc::fprintf(stderr, cstr!("Missing value after --trace-file\n"));
+                return 2;
+            }
+            i += 1;
+            trace_file_path_arg = *argv.offset(i as isize) as *const c_char;
+            i += 1;
+            continue;
+        }
+        if libc::strncmp(arg, cstr!("--lifecycle-file="), 17) == 0 {
+            lifecycle_file_path_arg = arg.add(17);
+            i += 1;
+            continue;
+        }
+        if libc::strcmp(arg, cstr!("--lifecycle-file")) == 0 {
+            if i + 1 >= argc {
+                libc::fprintf(stderr, cstr!("Missing value after --lifecycle-file\n"));
+                return 2;
+            }
+            i += 1;
+            lifecycle_file_path_arg = *argv.offset(i as isize) as *const c_char;
+            i += 1;
+            continue;
+        }
+        // Drive knobs (previously passed via env; now argv-only).
+        if libc::strncmp(arg, cstr!("--screenshot-secs="), 18) == 0 {
+            SCREENSHOT_INTERVAL_SECS = libc::atoi(arg.add(18));
+            i += 1;
+            continue;
+        }
+        if libc::strcmp(arg, cstr!("--screenshot-secs")) == 0 {
+            if i + 1 >= argc {
+                libc::fprintf(stderr, cstr!("Missing value after --screenshot-secs\n"));
+                return 2;
+            }
+            i += 1;
+            SCREENSHOT_INTERVAL_SECS = libc::atoi(*argv.offset(i as isize) as *const c_char);
+            i += 1;
+            continue;
+        }
+        if libc::strcmp(arg, cstr!("--replay")) == 0 {
+            // Replay determinism wants the virtual clock pinned at 0 before any
+            // instruction runs; argv is parsed before run_machine, so this is
+            // equivalent to the old constructor-time halt (was init_keyboard).
+            vclock_state = VCLOCK_HALTED;
+            vclock_frozen_virtual_ns = 0;
+            shim_log_stdout(cstr!("[VCLOCK] --replay: initial halt at virtual_ns=0\n"));
+            i += 1;
+            continue;
+        }
         i += 1;
     }
+    // The --lifecycle-file path is known now (argv parsed above). Open the stream
+    // eagerly so the file exists immediately, as it did when the path came from
+    // the environment at constructor time. (The initial program LOAD emitted by
+    // the init_memory constructor still lands in the in-memory ring, which is
+    // dumped on exit; everything from here on streams live.)
+    lifecycle_fp_open_if_requested();
     shim_log_stdout(
         cstr!("Emulation speedup multiplier: %.2fx\n"),
         emulation_speedup,
@@ -11607,7 +11691,10 @@ pub unsafe extern "C" fn shim_runtime_state_restore(in_: *const ShimRuntimeState
 
     irq0_pending = (*in_).irq0_pending;
     irq_pending = (*in_).irq_pending;
-    irq_pending_count = irq_pending.iter().filter(|&&x| x != 0).count() as u32;
+    irq_pending_count = (*ptr::addr_of!(irq_pending))
+        .iter()
+        .filter(|&&x| x != 0)
+        .count() as u32;
     last_int_no = (*in_).last_int_no;
     0
 }

@@ -57,7 +57,7 @@ fn test_dos_read_file_logs_buffer() {
 
         let mut open_ret = 1u8;
         let mut handle = 0u16;
-        let out = capture_stdout(|| unsafe {
+        let out = capture_stdout(|| {
             open_ret = dos_open_file(b"file.txt\0".as_ptr() as *const c_char);
             handle = (*lib.cpu()).r_ax.x;
             let mut buf = [0u8; 2];

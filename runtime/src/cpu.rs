@@ -9,6 +9,7 @@
 use core::ffi::{c_char, c_int};
 
 #[repr(C)]
+#[allow(non_snake_case)] // x86 flag names (FROZEN ABI, shared with JIT prelude)
 pub struct CpuFlags {
     pub CF: u8,
     pub PF: u8,
@@ -112,10 +113,12 @@ byte_halves!(dl, set_dl, dh, set_dh, dx, set_dx);
 macro_rules! flag {
     ($get:ident, $set:ident, $field:ident) => {
         #[inline(always)]
+        #[allow(non_snake_case)] // x86 flag names (CF/ZF/…)
         pub fn $get() -> u8 {
             unsafe { (*cpu_ptr()).flags.$field }
         }
         #[inline(always)]
+        #[allow(non_snake_case)]
         pub fn $set(v: u8) {
             unsafe {
                 (*cpu_ptr()).flags.$field = v;

@@ -62,7 +62,6 @@ extern "C" {
         func: *const c_char,
         line: c_int,
     );
-    fn safe_point_impl(file: *const c_char, func: *const c_char, line: c_int);
     fn shim_idle_wait();
     fn shim_log_stdout(fmt: *const c_char, ...);
     fn shim_exit_with_message(fmt: *const c_char, ...) -> !;
@@ -86,10 +85,6 @@ fn bv() -> *mut BiosVideoState {
 #[inline(always)]
 fn memw_write(seg: u16, off: u16, value: u16) {
     unsafe { memw_write_impl(seg, off, value, site(), site(), 0) }
-}
-#[inline(always)]
-fn safepoint() {
-    unsafe { safe_point_impl(site(), site(), 0) }
 }
 #[inline(always)]
 fn log_open(f: *const c_char, fu: *const c_char, l: c_int) {

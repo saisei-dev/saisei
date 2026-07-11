@@ -1,3 +1,4 @@
+#![allow(non_snake_case)] // fn_under_test__scenario naming convention
 //! Ported C-shim tests (batch: ported_shims_small_a). Rust FFI equivalents of
 //! the FFI-driven the original tests under tests/:
 //! Run single-threaded: SAISEI_VERBOSE / stdout fd are process-global state.

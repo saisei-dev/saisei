@@ -1,6 +1,7 @@
 //! saisei launcher — builds/runs game bundles and generates their GameConfig.
-//! Commands: build / run / play / copy-runtime / new-game / triage / replay /
-//! state-discover / control / run-with-pty / zbookend-diff / zoom.
+//! Commands: build / run / play / new-game / triage / replay /
+//! state-discover / control / run-with-pty / zbookend-diff / zoom (+ help /
+//! version). See `docs/console.md` for the tiered command + flag reference.
 //! JIT-only: `build` generates the per-game config and has cargo build the
 //! saisei-game binary; all program code is JIT-compiled at run time by the
 //! `saisei-jitc` binary.
@@ -531,6 +532,9 @@ struct RunOpts {
     lifecycle_file: Option<String>,
     screenshot_secs: Option<i64>,
     replay: bool,
+    // Developer: a game-function patch bundle (.so) forwarded to the runtime,
+    // which registers it at startup (runtime already parses --patch-bundle).
+    patch_bundle: Option<String>,
     // cargo features forwarded to the saisei-game build
     // (e.g. force_exit_after_10s for self-terminating smoke runs).
     features: Vec<String>,
@@ -594,14 +598,15 @@ fn run_game(root: &Path, game: &GameDef, o: &RunOpts) -> ! {
                 .to_string(),
         );
     }
-
-    let mut env = game_process_env(root, game);
+    // Developer / drive knobs go straight to the game binary's argv (parsed in
+    // the runtime's saisei_main). Trace/lifecycle paths are canonicalized here
+    // because the child runs with cwd = runtime_dir, not the launcher's cwd.
     if o.verbose {
-        env.insert("SAISEI_VERBOSE".into(), "1".into());
+        cmd.push("--verbose".into());
     }
     if let Some(t) = &o.trace_file {
-        env.insert(
-            "TRACE_FILE".into(),
+        cmd.push("--trace-file".into());
+        cmd.push(
             std::fs::canonicalize(t)
                 .unwrap_or_else(|_| PathBuf::from(t))
                 .display()
@@ -609,8 +614,8 @@ fn run_game(root: &Path, game: &GameDef, o: &RunOpts) -> ! {
         );
     }
     if let Some(l) = &o.lifecycle_file {
-        env.insert(
-            "LIFECYCLE_FILE".into(),
+        cmd.push("--lifecycle-file".into());
+        cmd.push(
             std::fs::canonicalize(l)
                 .unwrap_or_else(|_| PathBuf::from(l))
                 .display()
@@ -618,11 +623,23 @@ fn run_game(root: &Path, game: &GameDef, o: &RunOpts) -> ! {
         );
     }
     if let Some(s) = o.screenshot_secs {
-        env.insert("SAISEI_SCREENSHOT_SECS".into(), s.to_string());
+        cmd.push("--screenshot-secs".into());
+        cmd.push(s.to_string());
     }
     if o.replay {
-        env.insert("SAISEI_REPLAY".into(), "1".into());
+        cmd.push("--replay".into());
     }
+    if let Some(pb) = &o.patch_bundle {
+        cmd.push("--patch-bundle".into());
+        cmd.push(
+            std::fs::canonicalize(pb)
+                .unwrap_or_else(|_| PathBuf::from(pb))
+                .display()
+                .to_string(),
+        );
+    }
+
+    let env = game_process_env(root, game);
 
     let status = Command::new(&cmd[0])
         .args(&cmd[1..])
@@ -670,6 +687,7 @@ fn parse_run_opts(args: &[String], with_headless: bool) -> (Option<String>, RunO
             "--lifecycle-file" => o.lifecycle_file = it.next().cloned(),
             "--screenshot-secs" => o.screenshot_secs = it.next().and_then(|v| v.parse().ok()),
             "--replay" => o.replay = true,
+            "--patch-bundle" => o.patch_bundle = it.next().cloned(),
             "--features" => o.features.extend(
                 it.next()
                     .unwrap_or_else(|| die("--features needs a value"))
@@ -699,14 +717,79 @@ pub fn validate_speedup(v: f64) -> Result<f64, String> {
     }
 }
 
+/// The full command surface, grouped by audience (see `print_usage`). Printed
+/// on `help`/`--help`, and (to stderr) when invoked with no command.
+const USAGE: &str = "\
+saisei — runs DOS MZ executables by JIT-recompiling them to native code.
+
+usage: saisei <command> [options]
+
+Player — play a game:
+  play <game>              build and run in the SDL window
+  run <game>               build and run (headless-capable; for automation)
+  build <game>             build the game binary (run/play do this for you)
+  new-game <archive>       create a game bundle from a zip / directory / url
+
+Developer — debug and reverse-engineer:
+  triage                   inspect the newest crash bundle
+  state-discover           discover memory-state predicates across snapshots
+  zbookend-diff <a> <b>    diff two snapshots to find who wrote an address
+  zoom <img> <col> <row>   pixel-zoom a screenshot tile
+
+Drive — automate a running game (often from an AI/agent):
+  control <cmd>            drive a running game via its FIFO
+                           (tap press release enter space shot raw
+                            halt resume step read snapshot status; 'control help')
+  replay <log>             replay a recorded session against a --replay run
+  run-with-pty <cmd>       run a command under a pseudo-terminal
+
+run / play options:
+  --program <name>         pick a program in a multi-executable bundle   [player]
+  --restore-from <save>    resume from a snapshot                        [player]
+  --speedup <n>            emulation speed multiplier (default 1)        [player]
+  --headless               run without an SDL window (run only)         [drive]
+  --screenshot-secs <n>    auto-dump PNGs every n seconds (headless)     [drive]
+  --replay                 record inputs for later replay               [drive]
+  --verbose                stream the shim trace to stdout              [dev]
+  --trace-file <path>      write the execution trace to a file          [dev]
+  --lifecycle-file <path>  write LOAD/CALL/JMP lifecycle events          [dev]
+  --patch-bundle <path>    load a game-function patch .so                [dev]
+  --features <list>        cargo features for the game build            [dev]
+
+build options:
+  --warm[-secs <n>]        after building, warm the JIT cache for n seconds
+
+Run 'saisei version' for the build revision.";
+
+/// Best-effort build revision (git short hash), for `saisei version`.
+fn version_string(root: &Path) -> String {
+    Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 pub fn run() {
     let root = resolve_root();
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let (cmd, rest) = argv.split_first().unwrap_or_else(|| {
-        eprintln!("usage: saisei <build|run|play|copy-runtime|new-game|triage|replay|state-discover|control|run-with-pty|zbookend-diff|zoom> ...");
+        eprintln!("{USAGE}");
         exit(2)
     });
     match cmd.as_str() {
+        "help" | "--help" | "-h" => {
+            println!("{USAGE}");
+            exit(0)
+        }
+        "version" | "--version" | "-V" => {
+            println!("saisei {}", version_string(&root));
+            exit(0)
+        }
         "new-game" => new_game::main(&root, rest),
         "triage" => triage::main(&root, rest),
         "replay" => replay::main(&root, rest),
@@ -747,24 +830,6 @@ pub fn run() {
                 build(&root, &game);
             }
         }
-        "copy-runtime" => {
-            let mut program = None;
-            let mut game_name = None;
-            let mut it = rest.iter();
-            while let Some(a) = it.next() {
-                match a.as_str() {
-                    "--program" => program = it.next().cloned(),
-                    other if other.starts_with("--") => die(&format!("unknown flag: {other}")),
-                    other => game_name = Some(other.to_string()),
-                }
-            }
-            let game = load_game_definition(
-                &root,
-                &game_name.unwrap_or_else(|| die("copy-runtime needs a game name")),
-                program.as_deref(),
-            );
-            copy_runtime(&root, &game);
-        }
         "run" | "play" => {
             let game_name = rest
                 .iter()
@@ -790,6 +855,8 @@ pub fn run() {
             let game = load_game_definition(&root, &game_name, program.as_deref());
             run_game(&root, &game, &opts);
         }
-        other => die(&format!("unknown command: {other}")),
+        other => die(&format!(
+            "unknown command: {other}\nrun 'saisei help' to see available commands"
+        )),
     }
 }

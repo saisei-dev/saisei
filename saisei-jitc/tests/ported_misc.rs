@@ -23,7 +23,7 @@ use common::*;
 use regex::Regex;
 use serde_json::json;
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 // ==========================================================================
@@ -153,7 +153,7 @@ fn parity8_helper__matches_x86_even_parity() {
 
     // The chunk-shell header mirrors codegen::emit_chunk's exactly.
     let src = r#"#![no_std]
-#![allow(dead_code, non_snake_case, non_upper_case_globals, non_camel_case_types)]
+#![allow(dead_code, unused_imports, non_snake_case, non_upper_case_globals, non_camel_case_types)]
 #![allow(unused_parens, unused_mut, unused_assignments, unused_unsafe, unused_variables)]
 #![allow(unreachable_code, unreachable_patterns)]
 use core::ffi::{c_char, c_int, c_void};

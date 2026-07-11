@@ -36,7 +36,7 @@ saisei play coolgame
 
 `new-game` unpacks the archive — and asks which executable to run if there's more than one. `play` opens the game in a window, compiling each part to native code the moment control reaches it. No config files, no flags to weigh.
 
-Two more commands for when you need them: `saisei run <name> --headless` runs without a window (for scripting and CI), and `saisei build <name>` compiles without running. To drive a game from a script — keystrokes, screenshots, deterministic replay — see [Driving a program](docs/playing.md).
+Two more commands for when you need them: `saisei run <name> --headless` runs without a window (for scripting and CI), and `saisei build <name>` compiles without running. Run `saisei help` for the full command list. To drive a game from a script — keystrokes, screenshots, deterministic replay — see [Driving a program](docs/playing.md).
 
 ## Where Saisei is going
 

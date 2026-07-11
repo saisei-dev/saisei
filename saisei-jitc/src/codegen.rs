@@ -1743,7 +1743,7 @@ impl RRenderer {
     }
 
     /// repne/repnz scasb — repeat while not equal (scan for al).
-    fn handle_repne(&mut self, insn: &Insn, base: &str) -> R<Vec<String>> {
+    fn handle_repne(&mut self, _insn: &Insn, base: &str) -> R<Vec<String>> {
         if base != "scasb" {
             return uns(format!("repne {base}"));
         }

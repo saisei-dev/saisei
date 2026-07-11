@@ -4,7 +4,9 @@ This doc covers the interface for **driving a bundled program programmatically**
 sending keystrokes, taking screenshots, and getting deterministic results across
 runs. It's written for an agent or automation script that needs to navigate a
 program without a human at the keyboard. For the human-facing build/run flow, see
-`README.md`.
+`README.md`; for the full command + flag reference (every `saisei` and `saisei
+control` command, grouped Player / Developer / Drive), see `docs/console.md` or
+run `saisei help` / `saisei control help`.
 
 The mechanism is the same whether you run with or without the SDL window. The
 two modes differ only in whether the program also accepts SDL keyboard events.

@@ -298,7 +298,7 @@ mod tests {
     fn gap_under_8_merges_over_8_splits() {
         // diffs at 0 and at 8: 7 equal bytes in between (indices 1..8) -> merge.
         let mut a = vec![0u8; 20];
-        let mut b = vec![0u8; 20];
+        let b = vec![0u8; 20];
         a[0] = 1;
         a[8] = 1;
         assert_eq!(find_runs(&a, &b, &[]), vec![(0, 9)]);

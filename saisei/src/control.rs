@@ -15,7 +15,40 @@ use std::process::{exit, Command};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 const USAGE: &str =
-    "control: usage: saisei control [--fifo PATH] [--shots-dir PATH] [--snapshots-dir PATH] [--gap MS] <command> [args]";
+    "control: usage: saisei control [--fifo PATH] [--shots-dir PATH] [--snapshots-dir PATH] [--gap MS] <command> [args]\n  run 'saisei control help' for the full command list";
+
+/// Full command reference, printed by `saisei control help` / `--help`.
+const CONTROL_HELP: &str = "\
+saisei control — drive a running game through its input/control FIFO.
+
+usage: saisei control [global options] <command> [args]
+
+global options:
+  --fifo <path>          control FIFO (default /tmp/saisei_fifo)
+  --shots-dir <path>     where 'shot' looks for screenshots
+  --snapshots-dir <path> where 'read'/'snapshot' write output
+  --gap <ms>             delay between repeated inputs (default 80)
+
+input:
+  tap <key> [ticks]      press and release <key>, held for [ticks] (default 10)
+  press <key>            press (and hold) <key>
+  release <key>          release <key>
+  enter [count]          send Enter [count] times (default 1)
+  space [count]          tap Space [count] times (default 1)
+  raw <hex>...           send raw hex bytes to the FIFO (e.g. 12 39 03 00)
+
+execution:
+  halt                   halt the virtual clock (freeze the game)
+  resume                 resume the virtual clock
+  step [ticks]           single-step [ticks] instructions (default 1)
+
+observe:
+  shot [--out P] [--timeout S]    capture a screenshot (waits up to S s, default 3)
+  read <addr> [len] [--out P]     read len bytes (1..255, default 1) at <addr>
+  snapshot [name] [--out P]       take a state snapshot
+  status                          show FIFO existence, holders, latest shot
+
+keys accept names (up, enter, esc, f1, a) or a hex scancode (0x39).";
 
 fn die(msg: &str) -> ! {
     eprintln!("{msg}");
@@ -387,6 +420,9 @@ pub fn main(root: &Path, args: &[String]) -> ! {
         } else if let Some(v) = a.strip_prefix("--gap=") {
             gap = parse_int(v, "--gap");
             idx += 1;
+        } else if a == "--help" || a == "-h" {
+            println!("{CONTROL_HELP}");
+            exit(0);
         } else if a.starts_with('-') {
             die(&format!("control: unrecognized argument: {a}"));
         } else {
@@ -399,6 +435,10 @@ pub fn main(root: &Path, args: &[String]) -> ! {
     let fifo = PathBuf::from(&fifo_arg);
 
     match command.as_str() {
+        "help" | "?" => {
+            println!("{CONTROL_HELP}");
+            exit(0);
+        }
         "tap" => {
             let pos = positionals(sub);
             if pos.is_empty() {
@@ -707,7 +747,9 @@ pub fn main(root: &Path, args: &[String]) -> ! {
                 }
             }
         }
-        other => die(&format!("control: unknown command: {other}")),
+        other => die(&format!(
+            "control: unknown command: {other}\n  run 'saisei control help' for the command list"
+        )),
     }
     exit(0);
 }

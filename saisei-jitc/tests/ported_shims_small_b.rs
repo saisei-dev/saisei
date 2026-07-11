@@ -1,3 +1,4 @@
+#![allow(non_snake_case)] // fn_under_test__scenario naming convention
 //! Ported C-shim tests (batch `ported_shims_small_b`). 1:1 ports of the
 //! FFI-driven files:
 //! Run single-threaded: SAISEI_VERBOSE, the captured stdout fd, and the process
