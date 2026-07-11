@@ -1584,9 +1584,14 @@ impl RRenderer {
         ])
     }
     fn handle_popf(&mut self) -> R<Vec<String>> {
+        // POPF does NOT create an interrupt shadow. Only STI, MOV SS and POP SS
+        // inhibit interrupt recognition for the following instruction; after a
+        // POPF that enables IF, a pending maskable interrupt is recognized
+        // immediately. (Setting the shadow here was the same unfaithfulness as
+        // the IRET case — under the per-block safepoint model a POPF-in-loop
+        // would re-arm it between the rare safepoints and starve IRQ delivery.)
         Ok(vec![
             "{".into(),
-            "    let old_if = IF();".into(),
             "    let flags = memw(ss(), sp());".into(),
             "    set_CF((flags & 0x0001) as u8);".into(),
             "    set_PF(((flags >> 2) & 1) as u8);".into(),
@@ -1596,7 +1601,6 @@ impl RRenderer {
             "    set_DF(((flags >> 10) & 1) as u8);".into(),
             "    set_OF(((flags >> 11) & 1) as u8);".into(),
             "    set_sp((sp().wrapping_add(2)) & 0xFFFF);".into(),
-            "    if old_if == 0 && IF() != 0 { set_interrupt_shadow(1); }".into(),
             "}".into(),
         ])
     }

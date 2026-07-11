@@ -554,7 +554,8 @@ fn extra_instructions__pushf_popf() {
         ),
         "{src}"
     );
-    assert!(src.contains("let old_if = r.IF();"), "{src}");
+    // POPF does not create an interrupt shadow (no old_if capture), unlike STI.
+    assert!(!src.contains("let old_if"), "{src}");
     assert!(src.contains("let flags = r.memw(r.ss(), r.sp());"), "{src}");
     assert!(src.contains("r.set_CF((flags & 0x0001) as u8);"), "{src}");
     assert!(src.contains("r.set_PF(((flags >> 2) & 1) as u8);"), "{src}");
