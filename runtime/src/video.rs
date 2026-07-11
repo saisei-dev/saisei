@@ -615,6 +615,15 @@ unsafe fn stage_and_present_planar_mode() {
 pub extern "C" fn stage_and_present_current_buffer() {
     unsafe {
         let mode = (*bv()).video_mode;
+        // Pre-game phase: hold the placeholder logo through the game's text-mode
+        // console/setup screens (e.g. Dungeon Master's drive prompt) rather than
+        // presenting the text buffer. Only real graphics output retires the logo
+        // (see sdl::splash_is_up); input still flows via virtual_display_poll_input.
+        if headless_mode == 0 && is_text_mode(mode) != 0 && crate::sdl::splash_is_up() {
+            LAST_STAGE_PRESENT_BRANCH = STAGE_PRESENT_BRANCH_TEXT;
+            crate::sdl::show_splash();
+            return;
+        }
         if is_text_mode(mode) != 0 {
             LAST_STAGE_PRESENT_BRANCH = STAGE_PRESENT_BRANCH_TEXT;
             stage_and_present_text_mode();
@@ -701,15 +710,20 @@ pub extern "C" fn apply_video_mode_state(mode: u8) {
         if headless_mode == 0 {
             crate::sdl::virtual_display_set_mode(mode as c_int);
             if is_text_mode(mode) != 0 {
-                let mut cols = crate::bios::bios_video_columns();
-                if cols == 0 {
-                    cols = if mode == 0x00 || mode == 0x01 { 40 } else { 80 };
+                // Keep the fixed placeholder-logo window while it's still up; a
+                // text-console mode-set must not resize it to 80x25 geometry
+                // (that resize is the "reset to odd setup" during DM's prompt).
+                if !crate::sdl::splash_is_up() {
+                    let mut cols = crate::bios::bios_video_columns();
+                    if cols == 0 {
+                        cols = if mode == 0x00 || mode == 0x01 { 40 } else { 80 };
+                    }
+                    let mut rows = crate::bios::bios_video_rows();
+                    if rows == 0 {
+                        rows = 25;
+                    }
+                    ensure_display_geometry(cols as i32 * 8, rows as i32 * 8);
                 }
-                let mut rows = crate::bios::bios_video_rows();
-                if rows == 0 {
-                    rows = 25;
-                }
-                ensure_display_geometry(cols as i32 * 8, rows as i32 * 8);
             } else if is_cga_graphics_mode(mode) != 0 || mode == 0x13 {
                 ensure_display_geometry(320, 200);
             } else if is_tandy_graphics_mode(mode) {
@@ -952,6 +966,12 @@ fn write_png_file(path_bytes: &[u8], w: usize, h: usize, rgb: &[u8]) -> std::io:
     std::fs::write(path, &png)
 }
 
+/// Test-only: dump an RGB24 buffer to a PNG using this module's encoder.
+#[cfg(test)]
+pub(crate) fn write_png_for_test(path: &str, w: usize, h: usize, rgb: &[u8]) {
+    let _ = write_png_file(path.as_bytes(), w, h, rgb);
+}
+
 fn encode_png(w: usize, h: usize, rgb: &[u8]) -> Vec<u8> {
     // Raw = filtered scanlines: each row prefixed with filter byte 0 (none).
     let mut raw = Vec::with_capacity(h * (1 + w * 3));
@@ -1030,6 +1050,13 @@ fn crc32(data: &[u8]) -> u32 {
 }
 
 // ---- 8x8 font (public domain, from font8x8_basic.h) ------------------------
+
+/// One glyph from the shared 8x8 font, indexed by 7-bit code. Row `gy`, bit
+/// `1<<gx` set → pixel lit at column `gx` (LSB = leftmost), matching the
+/// text-mode renderer. Used by the SDL splash to draw the pre-game placeholder.
+pub(crate) fn font8x8_glyph(code: u8) -> &'static [u8; 8] {
+    &FONT8X8_BASIC[(code & 0x7F) as usize]
+}
 
 static FONT8X8_BASIC: [[u8; 8]; 128] = [
     [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],

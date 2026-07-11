@@ -91,7 +91,6 @@ extern "C" {
     fn SDL_Init(flags: u32) -> c_int;
     fn SDL_Quit();
     fn SDL_WasInit(flags: u32) -> u32;
-    fn SDL_GetError() -> *const c_char;
     fn SDL_GetTicks() -> u32;
     fn SDL_CreateWindow(
         title: *const c_char,
@@ -235,6 +234,9 @@ static mut WINDOW: *mut c_void = core::ptr::null_mut();
 static mut RENDERER: *mut c_void = core::ptr::null_mut();
 static mut TEXTURE: *mut c_void = core::ptr::null_mut();
 static mut DISPLAY_READY: bool = false;
+// Cleared until the game presents its first real frame; while false the window
+// shows the placeholder splash (see `draw_splash`) instead of a blank buffer.
+static mut GAME_HAS_PRESENTED: bool = false;
 static mut RGB_BUFFER: *mut u8 = core::ptr::null_mut();
 static mut RGB_BUFFER_SIZE: i32 = 0;
 static mut WIN_W: c_int = 0;
@@ -290,6 +292,153 @@ fn ensure_rgb_buffer(w: i32, h: i32) {
     }
 }
 
+// ---- placeholder splash (shown before the game's first present) -------------
+
+// Draw `text` into an RGB24 buffer with the shared 8x8 font, each glyph pixel a
+// `scale`×`scale` block, left edge at `x0`, top at `y0`, in color `rgb`. Clipped
+// to the buffer; the bit order matches the text-mode renderer (LSB = leftmost).
+fn draw_text(
+    buf: &mut [u8],
+    w: usize,
+    h: usize,
+    x0: i32,
+    y0: i32,
+    text: &str,
+    scale: i32,
+    rgb: [u8; 3],
+) {
+    let mut cx = x0;
+    for &ch in text.as_bytes() {
+        let glyph = crate::video::font8x8_glyph(ch);
+        for gy in 0..8i32 {
+            let bits = glyph[gy as usize];
+            for gx in 0..8i32 {
+                if bits & (1u8 << gx) == 0 {
+                    continue;
+                }
+                for sy in 0..scale {
+                    let py = y0 + gy * scale + sy;
+                    if py < 0 || py as usize >= h {
+                        continue;
+                    }
+                    for sx in 0..scale {
+                        let px = cx + gx * scale + sx;
+                        if px < 0 || px as usize >= w {
+                            continue;
+                        }
+                        let o = (py as usize * w + px as usize) * 3;
+                        buf[o] = rgb[0];
+                        buf[o + 1] = rgb[1];
+                        buf[o + 2] = rgb[2];
+                    }
+                }
+            }
+        }
+        cx += 8 * scale;
+    }
+}
+
+// Largest integer glyph scale that keeps `len` chars inside `frac` of `w`.
+fn fit_scale(len: usize, w: usize, frac: f32, max: i32) -> i32 {
+    if len == 0 {
+        return max;
+    }
+    let budget = (w as f32 * frac) as i32;
+    let s = budget / (len as i32 * 8);
+    s.clamp(1, max)
+}
+
+// Draw `text` horizontally centered at vertical position `y0`, returning the
+// glyph height in pixels so the caller can stack lines.
+fn draw_text_centered(
+    buf: &mut [u8],
+    w: usize,
+    h: usize,
+    y0: i32,
+    text: &str,
+    scale: i32,
+    rgb: [u8; 3],
+) -> i32 {
+    let text_w = text.len() as i32 * 8 * scale;
+    let x0 = (w as i32 - text_w) / 2;
+    draw_text(buf, w, h, x0, y0, text, scale, rgb);
+    8 * scale
+}
+
+// Build the placeholder RGB24 image: a dark-blue field with "SAISEI" and the
+// running game's name centered. Split out from the present path so its pixels
+// are unit-testable without SDL.
+fn build_splash_rgb(w: usize, h: usize, name: Option<&str>) -> Vec<u8> {
+    let mut buf = vec![0u8; w * h * 3];
+    // Background: a deep blue, faintly brighter toward the top.
+    for y in 0..h {
+        let b = (0x24 - (y as i32 * 0x14 / h.max(1) as i32)).clamp(0x0C, 0x24) as u8;
+        for x in 0..w {
+            let o = (y * w + x) * 3;
+            buf[o] = 0x06;
+            buf[o + 1] = 0x08;
+            buf[o + 2] = b;
+        }
+    }
+
+    let title = "SAISEI";
+    let title_scale = fit_scale(title.len(), w, 0.55, 6);
+    let name_scale = name
+        .map(|n| fit_scale(n.len(), w, 0.80, title_scale.max(1)))
+        .unwrap_or(1);
+
+    // Vertically center the stacked lines (title, gap, name).
+    let title_h = 8 * title_scale;
+    let gap = 4 * title_scale;
+    let name_h = if name.is_some() { 8 * name_scale } else { 0 };
+    let name_gap = if name.is_some() { gap } else { 0 };
+    let block_h = title_h + name_gap + name_h;
+    let mut y = (h as i32 - block_h) / 2;
+
+    y += draw_text_centered(&mut buf, w, h, y, title, title_scale, [0x8C, 0xC8, 0xFF]);
+    if let Some(name) = name {
+        y += name_gap;
+        let upper = name.to_ascii_uppercase();
+        draw_text_centered(&mut buf, w, h, y, &upper, name_scale, [0xE0, 0xE0, 0xE0]);
+    }
+    buf
+}
+
+/// True while the pre-game placeholder is still showing: the display is up and
+/// the game hasn't presented a real (graphics) frame yet. The present path uses
+/// this to hold the logo through the game's text-mode console/setup screens
+/// (e.g. Dungeon Master's drive prompt) instead of flashing the text buffer.
+pub(crate) fn splash_is_up() -> bool {
+    unsafe { DISPLAY_READY && !GAME_HAS_PRESENTED }
+}
+
+/// (Re)draw the placeholder splash. No-op unless the display is up.
+pub(crate) fn show_splash() {
+    draw_splash();
+}
+
+// Render the pre-game placeholder into the live texture and present it. Purely
+// host-side chrome — replaced the instant the game presents its first real frame.
+fn draw_splash() {
+    unsafe {
+        if RENDERER.is_null() || TEXTURE.is_null() || TEXTURE_W <= 0 || TEXTURE_H <= 0 {
+            return;
+        }
+        let w = TEXTURE_W as usize;
+        let h = TEXTURE_H as usize;
+        let buf = build_splash_rgb(w, h, pretty_game_name().as_deref());
+        SDL_UpdateTexture(
+            TEXTURE,
+            core::ptr::null(),
+            buf.as_ptr() as *const c_void,
+            (w * 3) as c_int,
+        );
+        SDL_RenderClear(RENDERER);
+        SDL_RenderCopy(RENDERER, TEXTURE, core::ptr::null(), core::ptr::null());
+        SDL_RenderPresent(RENDERER);
+    }
+}
+
 fn recreate_texture(w: c_int, h: c_int) {
     unsafe {
         if RENDERER.is_null() || w <= 0 || h <= 0 {
@@ -322,6 +471,11 @@ fn recreate_texture(w: c_int, h: c_int) {
         TEXTURE_W = w;
         TEXTURE_H = h;
         DISPLAY_READY = true;
+        // A fresh texture is blank; keep the placeholder up (through the game's
+        // mode-init window resizes) until it draws its first real frame.
+        if !GAME_HAS_PRESENTED {
+            draw_splash();
+        }
     }
 }
 
@@ -758,6 +912,8 @@ pub extern "C" fn virtual_display_present(
         if TEXTURE.is_null() || RENDERER.is_null() || vram.is_null() || palette.is_null() {
             return;
         }
+        // First real game frame retires the placeholder splash.
+        GAME_HAS_PRESENTED = true;
         ensure_rgb_buffer(w, h);
         for y in 0..h {
             let src = vram.add((y * pitch) as usize);
@@ -794,6 +950,83 @@ pub extern "C" fn virtual_display_configure(width: c_int, height: c_int) {
         WIN_H = height;
     }
     recreate_texture(width, height);
+}
+
+#[cfg(test)]
+mod splash_tests {
+    use super::build_splash_rgb;
+
+    // A text pixel has bright r/g channels; the deep-blue field does not.
+    fn is_text_pixel(rgb: &[u8]) -> bool {
+        rgb[0] > 0x40 && rgb[1] > 0x40
+    }
+
+    #[test]
+    fn splash_draws_centered_text() {
+        let (w, h) = (320usize, 200usize);
+        let buf = build_splash_rgb(w, h, Some("Zeliard"));
+        assert_eq!(buf.len(), w * h * 3);
+
+        // Corners are background (no text bleeds to the edges).
+        for &(x, y) in &[(0usize, 0usize), (w - 1, 0), (0, h - 1), (w - 1, h - 1)] {
+            let o = (y * w + x) * 3;
+            assert!(
+                !is_text_pixel(&buf[o..o + 3]),
+                "corner ({x},{y}) should be bg"
+            );
+        }
+
+        // Text pixels exist, and only in the middle band (title + name stack).
+        let mut rows_with_text = 0;
+        let mut total_text = 0;
+        for y in 0..h {
+            let mut row_has = false;
+            for x in 0..w {
+                let o = (y * w + x) * 3;
+                if is_text_pixel(&buf[o..o + 3]) {
+                    total_text += 1;
+                    row_has = true;
+                }
+            }
+            if row_has {
+                rows_with_text += 1;
+                assert!(
+                    (h / 4..3 * h / 4).contains(&y),
+                    "text row {y} outside middle band"
+                );
+            }
+        }
+        assert!(
+            total_text > 200,
+            "expected a substantial glyph mass, got {total_text}"
+        );
+        assert!(
+            rows_with_text >= 8,
+            "expected at least one glyph-height of rows"
+        );
+    }
+
+    #[test]
+    fn splash_without_name_still_has_title() {
+        let buf = build_splash_rgb(320, 200, None);
+        let total = buf.chunks_exact(3).filter(|p| is_text_pixel(p)).count();
+        assert!(
+            total > 100,
+            "title 'SAISEI' should render even with no game name"
+        );
+    }
+
+    // Dump a PNG of the splash for eyeball validation:
+    //   cargo test -p saisei-runtime --lib splash_dump_png -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn splash_dump_png() {
+        let (w, h) = (320usize, 200usize);
+        let buf = build_splash_rgb(w, h, Some("Zeliard"));
+        let path = std::env::temp_dir().join("saisei_splash.png");
+        crate::video::write_png_for_test(path.to_str().unwrap(), w, h, &buf);
+        eprintln!("wrote {}", path.display());
+    }
 }
 
 #[cfg(test)]
