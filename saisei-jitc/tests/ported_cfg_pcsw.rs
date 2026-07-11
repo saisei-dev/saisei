@@ -10,9 +10,9 @@
 //!              jcc_in_separate_block (linear cond_prev survives an
 //!              interleaved ret), bp_relative + nested_bp (nested → collapsed,
 //!              see below), if_then/if_else_spans_blocks, when_then_returns,
-//!              guard_if (flat model), call_no_return (arm has push+pc+continue,
-//!              no return), jump_table reg×8 (base & pcsw variants merged — one
-//!              backend now), retf helper, call pushes retip ×2,
+//!              guard_if (flat model), call_no_return (block fn has push +
+//!              `return next-pc`), jump_table reg×8 (base & pcsw variants
+//!              merged — one backend now), retf helper, call pushes retip ×2,
 //!              indirect_near_jmp, default arm (near_ret_tail_), late entry
 //!              block, dos_exit_returns (SEMANTICS FLIPPED: int 21h/AH=4Ch is
 //!              dos_api() — not statically nore turn — so the trailing insn
@@ -44,18 +44,6 @@ fn cond_prev_mnem(insn: &serde_json::Map<String, Value>) -> Option<&str> {
     insn.get("cond_prev")
         .and_then(|v| v.get("mnemonic"))
         .and_then(Value::as_str)
-}
-
-/// Slice out one dispatch-match arm (`0xNNNN => { ... }`) from a chunk text.
-fn arm(src: &str, addr: i64) -> String {
-    let key = format!("0x{addr:04X} => {{");
-    src.split(&key)
-        .nth(1)
-        .unwrap_or_else(|| panic!("arm {key} must exist in:\n{src}"))
-        .split("\n            }")
-        .next()
-        .unwrap()
-        .to_string()
 }
 
 // ==========================================================================
@@ -152,8 +140,8 @@ fn if_else__exec_stack_fields_rendered_with_names() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert!(src.contains("set_exec_saved_sp(sp());"), "{src}");
-    assert!(src.contains("set_sp(exec_saved_sp());"), "{src}");
+    assert!(src.contains("set_exec_saved_sp(r.sp());"), "{src}");
+    assert!(src.contains("r.set_sp(exec_saved_sp());"), "{src}");
 }
 
 #[test]
@@ -166,7 +154,7 @@ fn if_else__resident_control_block_fields_named() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert!(src.contains("rcb_write16(FIELD_1, 0x2D9);"), "{src}");
+    assert!(src.contains("r.rcb_write16(FIELD_1, 0x2D9);"), "{src}");
 }
 
 // ==========================================================================
@@ -188,10 +176,10 @@ fn if_else__sequential_jumps_each_emit_a_branch() {
         ],
     });
     let src = render_rs(&func, &[0x0000, 0x1000, 0x2000, 0x3000], "g_");
-    assert_eq!(src.matches("if ZF() == 1").count(), 3, "{src}");
-    assert!(src.contains("pc = 0x1000;"), "{src}");
-    assert!(src.contains("pc = 0x2000;"), "{src}");
-    assert!(src.contains("pc = 0x3000;"), "{src}");
+    assert_eq!(src.matches("if r.ZF() == 1").count(), 3, "{src}");
+    assert!(src.contains("return 0x1000;"), "{src}");
+    assert!(src.contains("return 0x2000;"), "{src}");
+    assert!(src.contains("return 0x3000;"), "{src}");
 }
 
 #[test]
@@ -207,8 +195,8 @@ fn if_else__empty_then_branch_renders() {
         ],
     });
     let src = render_rs(&func, &[0x0000, 0x1000], "g_");
-    assert!(src.contains("if ZF() == 1"), "{src}");
-    assert!(src.contains("pc = 0x1000;"), "{src}");
+    assert!(src.contains("if r.ZF() == 1"), "{src}");
+    assert!(src.contains("return 0x1000;"), "{src}");
 }
 
 #[test]
@@ -223,7 +211,7 @@ fn if_else__test_and_jz_branch_on_zf() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert!(src.contains("if ZF() == 1"), "{src}");
+    assert!(src.contains("if r.ZF() == 1"), "{src}");
 }
 
 #[test]
@@ -238,7 +226,7 @@ fn if_else__or_and_jnz_branch_on_zf() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert!(src.contains("if ZF() == 0"), "{src}");
+    assert!(src.contains("if r.ZF() == 0"), "{src}");
 }
 
 #[test]
@@ -260,8 +248,8 @@ fn if_else__cmp_followed_by_multiple_jumps_preserves_flags() {
     });
     let src = render_rs(&func, &[], "");
     // je uses ZF, the following jae reuses the SAME cmp's CF
-    assert!(src.contains("if ZF() == 1"), "{src}");
-    assert!(src.contains("if CF() == 0"), "{src}");
+    assert!(src.contains("if r.ZF() == 1"), "{src}");
+    assert!(src.contains("if r.CF() == 0"), "{src}");
 }
 
 #[test]
@@ -279,7 +267,7 @@ fn if_else__jcc_in_separate_block_uses_prior_cmp() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert!(src.contains("if CF() == 0"), "{src}");
+    assert!(src.contains("if r.CF() == 0"), "{src}");
 }
 
 // ==========================================================================
@@ -298,8 +286,8 @@ fn if_else__bp_relative_operands_lower_to_ss() {
     });
     let src = render_rs(&func, &[], "");
     // [bp±N] defaults to SS; negative disp is 16-bit two's complement
-    assert!(src.contains("memw(ss()"), "{src}");
-    assert!(src.contains("memw_write(ss()"), "{src}");
+    assert!(src.contains("r.memw(r.ss()"), "{src}");
+    assert!(src.contains("r.memw_write(r.ss()"), "{src}");
     assert!(src.contains("0xFFFC"), "{src}");
 }
 
@@ -337,10 +325,10 @@ fn if_else__if_then_spans_multiple_blocks() {
     let src = render_rs(&func, &[0x0016, 0x0520], "g_");
     // int 21h (AH=3Dh open / AH=4Ch exit) both go through the register-based
     // DOS dispatcher; the branch reads its CF result.
-    assert_eq!(src.matches("dos_api();").count(), 2, "{src}");
-    assert!(src.contains("if CF() == 0"), "{src}");
-    assert!(src.contains("pc = 0x0520;"), "{src}");
-    assert!(src.contains("set_bx(ax());"), "{src}");
+    assert_eq!(src.matches("r.dos_api();").count(), 2, "{src}");
+    assert!(src.contains("if r.CF() == 0"), "{src}");
+    assert!(src.contains("return 0x0520;"), "{src}");
+    assert!(src.contains("r.set_bx(r.ax());"), "{src}");
 }
 
 #[test]
@@ -357,10 +345,10 @@ fn if_else__if_else_spans_multiple_blocks() {
         ],
     });
     let src = render_rs(&func, &[0x0000, 0x1000, 0x2000, 0x3000], "g_");
-    assert!(src.contains("if ZF() == 1"), "{src}");
-    assert!(src.contains("pc = 0x1000;"), "{src}");
-    assert!(src.contains("pc = 0x2000;"), "{src}");
-    assert!(src.contains("pc = 0x3000;"), "{src}");
+    assert!(src.contains("if r.ZF() == 1"), "{src}");
+    assert!(src.contains("return 0x1000;"), "{src}");
+    assert!(src.contains("return 0x2000;"), "{src}");
+    assert!(src.contains("return 0x3000;"), "{src}");
 }
 
 #[test]
@@ -375,11 +363,12 @@ fn if_else__if_else_when_then_returns() {
         ],
     });
     let src = render_rs(&func, &[0x0000, 0x1000], "g_");
-    assert!(src.contains("if ZF() == 1"), "{src}");
-    assert!(src.contains("pc = 0x1000;"), "{src}");
+    assert!(src.contains("if r.ZF() == 1"), "{src}");
+    assert!(src.contains("return 0x1000;"), "{src}");
     // both ret instructions render their own pop-return epilogue
     assert_eq!(
-        src.matches("let popped_ip = memw(ss(), sp());").count(),
+        src.matches("let popped_ip = r.memw(r.ss(), r.sp());")
+            .count(),
         2,
         "{src}"
     );
@@ -397,15 +386,17 @@ fn if_else__guard_if_is_flat() {
         ],
     });
     let src = render_rs(&func, &[0x2000], "g_");
-    // Faithful flat model: `jmp 0x100` lowers to pc=0x0100; continue (never a
-    // tail-call into a coined helper symbol).
+    // Faithful flat model: `jmp 0x100` lowers to `return 0x0100;` — the block
+    // yields the next pc to the dispatch loop (never a tail-call into a coined
+    // helper symbol).
     assert!(!src.contains("g_func_0100();"), "{src}");
-    assert!(src.contains("pc = 0x0100;"), "{src}");
-    assert!(src.contains("pc = 0x2000;"), "{src}");
+    assert!(src.contains("return 0x0100;"), "{src}");
+    assert!(src.contains("return 0x2000;"), "{src}");
 }
 
 // ==========================================================================
-// call lowering: push return IP, set pc, continue — no `return;` in the block.
+// call lowering: push return IP, then yield the callee pc to the dispatch
+// loop (`return 0xTARGET;`) — never `return -1;` (done) for the call itself.
 // ==========================================================================
 
 #[test]
@@ -417,21 +408,22 @@ fn call_no_return__intra_chunk_call_continues() {
         ],
     });
     let src = render_rs_dispatch(&[func], &[0x0100]);
-    let block = arm(&src, 0x0000);
+    let block = blk(&src, 0x0000);
     assert!(
-        block.contains("set_sp((sp().wrapping_sub(2)) & 0xFFFF);"),
+        block.contains("r.set_sp((r.sp().wrapping_sub(2)) & 0xFFFF);"),
         "{block}"
     );
     assert!(
-        block.contains("memw_write(ss(), sp(), ((0x3u32).wrapping_add(0x10100).wrapping_sub((cs() as u32) << 4)) as u16);"),
+        block.contains("r.memw_write(r.ss(), r.sp(), ((0x3u32).wrapping_add(0x10100).wrapping_sub((r.cs() as u32) << 4)) as u16);"),
         "{block}"
     );
-    assert!(block.contains("pc = 0x0100;"), "{block}");
-    assert!(block.contains("continue;"), "{block}");
-    // the call transfers via pc/continue — any `return;` in the arm is only
-    // the unreachable arm terminator AFTER the continue, never the call itself
+    assert!(block.contains("return 0x0100;"), "{block}");
+    // the call transfers by yielding the callee pc — any `return -1;` (done)
+    // in the block is only the unreachable backstop AFTER the transfer, never
+    // the call itself; and dispatch-level `continue;` no longer exists at all
+    assert!(!block.contains("continue;"), "{block}");
     assert!(
-        block.find("continue;").unwrap() < block.find("return;").unwrap_or(usize::MAX),
+        block.find("return 0x0100;").unwrap() < block.find("return -1;").unwrap_or(usize::MAX),
         "{block}"
     );
 }
@@ -445,13 +437,12 @@ fn call__pushes_retip_and_continues() {
         ],
     });
     let src = render_rs_dispatch(&[func], &[0x0100, 0x0200]);
-    let block = arm(&src, 0x0100);
+    let block = blk(&src, 0x0100);
     assert!(
-        block.contains("memw_write(ss(), sp(), ((0x103u32).wrapping_add(0x10100).wrapping_sub((cs() as u32) << 4)) as u16);"),
+        block.contains("r.memw_write(r.ss(), r.sp(), ((0x103u32).wrapping_add(0x10100).wrapping_sub((r.cs() as u32) << 4)) as u16);"),
         "{block}"
     );
-    assert!(block.contains("pc = 0x0200;"), "{block}");
-    assert!(block.contains("continue;"), "{block}");
+    assert!(block.contains("return 0x0200;"), "{block}");
     // never a direct call to a coined per-function symbol
     assert!(!block.contains("func_0200"), "{block}");
 }
@@ -466,12 +457,12 @@ fn call__to_known_address_sets_pc() {
         ],
     });
     let src = render_rs_dispatch(&[func], &[0x0000, 0x0CAD]);
-    let block = arm(&src, 0x0000);
+    let block = blk(&src, 0x0000);
     assert!(
-        block.contains("memw_write(ss(), sp(), ((0x3u32).wrapping_add(0x10100).wrapping_sub((cs() as u32) << 4)) as u16);"),
+        block.contains("r.memw_write(r.ss(), r.sp(), ((0x3u32).wrapping_add(0x10100).wrapping_sub((r.cs() as u32) << 4)) as u16);"),
         "{block}"
     );
-    assert!(block.contains("pc = 0x0CAD;"), "{block}");
+    assert!(block.contains("return 0x0CAD;"), "{block}");
     assert!(!block.contains("func_0CAD"), "{block}");
 }
 
@@ -492,7 +483,7 @@ fn jump_table__jmp_reg_uses_jump_table() {
             ],
         });
         let src = render_rs(&func, &[], "");
-        assert!(src.contains("jump_table_("), "reg {reg}: {src}");
+        assert!(src.contains("r.jump_table_("), "reg {reg}: {src}");
         assert!(src.contains(&format!("{reg}()")), "reg {reg}: {src}");
         assert!(
             src.contains("& 0xFFFFF, expected_retip);"),
@@ -516,12 +507,15 @@ fn jump_table__indirect_near_jmp_through_memory() {
         ],
     });
     let src = render_rs_dispatch(&[func], &[]);
-    assert!(src.contains("jump_table_("), "{src}");
-    assert!(src.contains("memw(cs()"), "{src}");
+    assert!(src.contains("r.jump_table_("), "{src}");
+    assert!(src.contains("r.memw(r.cs()"), "{src}");
     assert!(src.contains("0x588"), "{src}");
-    // the jump_table_ transfer ends the arm
-    let block = arm(&src, 0x0000);
-    assert_eq!(block.matches("return;").count(), 1, "{block}");
+    // the jump_table_ transfer ends the block: it yields no next pc — every
+    // return is `return -1;` (done: the transfer's own, plus the unreachable
+    // backstop before the closing brace)
+    let block = blk(&src, 0x0000);
+    assert!(!block.contains("return 0x"), "{block}");
+    assert_eq!(block.matches("return -1;").count(), 2, "{block}");
 }
 
 // ==========================================================================
@@ -537,8 +531,8 @@ fn pc_switch__ret_far_emits_helper() {
         ],
     });
     let src = render_rs_dispatch(&[func], &[]);
-    let block = arm(&src, 0x0000);
-    assert!(block.contains("retf_();"), "{block}");
+    let block = blk(&src, 0x0000);
+    assert!(block.contains("r.retf_();"), "{block}");
 }
 
 #[test]
@@ -552,7 +546,7 @@ fn pc_switch__default_arm_is_cross_binary_ret() {
     let src = render_rs_dispatch(&[func], &[]);
     let default_block = src.split("_ => {").nth(1).unwrap();
     assert!(
-        default_block.contains("near_ret_tail_(popped_ip, expected_retip);"),
+        default_block.contains("r.near_ret_tail_(popped_ip, expected_retip);"),
         "{default_block}"
     );
     assert!(default_block.contains("return;"), "{default_block}");
@@ -568,10 +562,15 @@ fn pc_switch__entry_block_emitted_when_start_is_late() {
         ],
     });
     let src = render_rs_dispatch(&[func], &[]);
-    assert!(src.contains("0x0100 => {"), "{src}");
-    let entry_block = arm(&src, 0x0100);
-    assert!(entry_block.contains("pc = 0x0102;"), "{entry_block}");
-    assert!(src.contains("0x0102 => {"), "{src}");
+    // the undecoded entry pc gets a forwarder arm to the first real block,
+    // which gets a dispatch arm + block fn of its own
+    assert!(src.contains("0x0100 => 0x0102,"), "{src}");
+    assert!(
+        src.contains("0x0102 => blk_0102(r, expected_retip),"),
+        "{src}"
+    );
+    let entry_block = blk(&src, 0x0102);
+    assert!(entry_block.contains("r.set_ax(r.ax());"), "{entry_block}");
 }
 
 #[test]
@@ -589,8 +588,8 @@ fn pc_switch__int21_ah4c_goes_through_dos_api_and_falls_through() {
         ],
     });
     let src = render_rs_dispatch(&[func], &[]);
-    let block = arm(&src, 0x0100);
-    assert!(block.contains("set_ah(0x4C);"), "{block}");
-    assert!(block.contains("dos_api();"), "{block}");
-    assert!(block.contains("set_bx(bx());"), "{block}");
+    let block = blk(&src, 0x0100);
+    assert!(block.contains("r.set_ah(0x4C);"), "{block}");
+    assert!(block.contains("r.dos_api();"), "{block}");
+    assert!(block.contains("r.set_bx(r.bx());"), "{block}");
 }

@@ -327,8 +327,11 @@ fn test_pit_accumulates_ticks() {
 
         let pit = lib.read_global::<PitState>("pit");
         let ns_per_tick = (pit.reload as u64) * 1_000_000_000u64 / 1193182u64;
-        let last = lib.global_ptr::<u64>("last_host_time_ns");
-        *last = (*last).wrapping_sub(ns_per_tick * 3);
+        // The PIT counts VIRTUAL (instruction-driven) time: advance the clock.
+        // (+1µs: ns_per_tick floors, and virtual time is exact — no free wall
+        //-clock nanoseconds push it over the last crossing like the old model.)
+        let vnow = lib.global_ptr::<u64>("virtual_now_accum_ns");
+        *vnow += ns_per_tick * 3 + 1_000;
 
         safe_point_impl(cstr(EXT), cstr(SAFE_POINT), 0);
         let end = read_u32(&lib, 0x46C);
@@ -359,10 +362,17 @@ fn test_safe_point_respects_interrupt_shadow() {
 }
 
 // ---------------------------------------------------------------------------
-// 51. test_iret_sets_interrupt_shadow_on_if_enable
+// 51. test_iret_does_not_set_interrupt_shadow (Zeliard shop-music freeze guard)
 // ---------------------------------------------------------------------------
+// Delivering IRQ0 runs the timer ISR, which returns via IRET re-enabling IF.
+// IRET must NOT create an interrupt shadow (only STI/MOV SS/POP SS do). If it
+// did, a loop calling a software interrupt every iteration would re-arm the
+// shadow between the per-block budget safepoints and starve all further IRQ
+// delivery — the Zeliard weaponsmith freeze (the INT8 music tick never fires,
+// so the RCB-flag poll spins forever). So after safe_point_impl delivers the
+// pending IRQ0, the shadow must be back to 0, ready to deliver the next tick.
 #[test]
-fn test_iret_sets_interrupt_shadow_on_if_enable() {
+fn test_iret_does_not_set_interrupt_shadow() {
     let _g = shim_common::guard();
     let lib = ShimLib::load();
     unsafe {
@@ -374,16 +384,24 @@ fn test_iret_sets_interrupt_shadow_on_if_enable() {
         *lib.global_ptr::<u8>("irq0_pending") = 1;
         safe_point_impl(cstr(EXT), cstr(SAFE_POINT), 0);
         assert_eq!((*cpu).flags.IF, 1);
-        assert_eq!(lib.read_global::<u8>("interrupt_shadow"), 1);
+        assert_eq!(lib.read_global::<u8>("interrupt_shadow"), 0);
         assert_eq!(lib.read_global::<u8>("irq0_pending"), 0);
     }
 }
 
 // ---------------------------------------------------------------------------
-// 52. test_safe_point_skips_timer_enqueue_during_isr
+// 52. test_pit_free_runs_during_isr_but_defers_delivery
+//     (Alley Cat BIOS-delay-loop freeze guard)
 // ---------------------------------------------------------------------------
+// The 8254 is free-running: the BIOS tick must advance with elapsed time even
+// while the CPU is inside an ISR. Gating accumulation on isr_depth==0 froze the
+// clock whenever a guest spent its time in interrupt handlers — Alley Cat's
+// `sub ah,ah; int 1Ah` tick-poll delay (a software interrupt every iteration)
+// kept the per-block budget depleting inside the handler, so the tick never
+// advanced and the delay never ended. So: the tick advances here, irq0 latches
+// as pending, but IRQ0 DELIVERY is still deferred until isr_depth returns to 0.
 #[test]
-fn test_safe_point_skips_timer_enqueue_during_isr() {
+fn test_pit_free_runs_during_isr_but_defers_delivery() {
     let _g = shim_common::guard();
     let lib = ShimLib::load();
     unsafe {
@@ -399,12 +417,19 @@ fn test_safe_point_skips_timer_enqueue_during_isr() {
 
         let pit = lib.read_global::<PitState>("pit");
         let ns_per_tick = (pit.reload as u64) * 1_000_000_000u64 / 1193182u64;
-        let last = lib.global_ptr::<u64>("last_host_time_ns");
-        *last = (*last).wrapping_sub(ns_per_tick * 3);
+        let vnow = lib.global_ptr::<u64>("virtual_now_accum_ns");
+        *vnow += ns_per_tick * 3;
 
         safe_point_impl(cstr(EXT), cstr(SAFE_POINT), 0);
-        assert_eq!(read_u32(&lib, 0x46C), start_tick);
-        assert_eq!(lib.read_global::<u8>("irq0_pending"), 0);
+        // Clock advanced despite isr_depth==1 (free-running 8254).
+        assert!(
+            read_u32(&lib, 0x46C) > start_tick,
+            "BIOS tick must advance during an ISR: {} -> {}",
+            start_tick,
+            read_u32(&lib, 0x46C)
+        );
+        // Tick is pending but NOT delivered (delivery deferred while in the ISR).
+        assert_eq!(lib.read_global::<u8>("irq0_pending"), 1);
         assert_eq!(lib.read_global::<u8>("isr_depth"), 1);
     }
 }
@@ -421,7 +446,7 @@ fn test_safe_point_accumulates_fractional_pit_cycles() {
             lib.func("safe_point_impl");
 
         let pit = lib.read_global::<PitState>("pit");
-        let last = lib.global_ptr::<u64>("last_host_time_ns");
+        let vnow = lib.global_ptr::<u64>("virtual_now_accum_ns");
 
         safe_point_impl(cstr(EXT), cstr(SAFE_POINT), 0);
         let start_tick = read_u32(&lib, 0x46C);
@@ -430,7 +455,9 @@ fn test_safe_point_accumulates_fractional_pit_cycles() {
         let quarter_tick_ns = std::cmp::max(1u64, ns_per_tick / 4);
 
         for _ in 0..4 {
-            *last = (*last).wrapping_sub(quarter_tick_ns);
+            // virtual (instruction-driven) time is what the PIT counts
+            // (+1µs floor-rounding slack; see test_pit_accumulates_ticks)
+            *vnow += quarter_tick_ns + 1_000;
             safe_point_impl(cstr(EXT), cstr(SAFE_POINT), 0);
         }
 

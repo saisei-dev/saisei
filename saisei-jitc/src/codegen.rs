@@ -1,7 +1,9 @@
 //! program IR -> readable Rust: the chunk emitter (the one and only backend).
 //!
-//! Emits a flat pc-state-machine — `loop { match pc { … } }`, one match arm per
-//! basic block, `set_ip`/`SAFEPOINT()` per instruction — plus a `#[no_mangle]`
+//! Emits a flat pc-state-machine — `loop { pc = match pc { … } }`, one match
+//! arm per basic block calling a small per-block `fn … -> c_int` that returns
+//! the next pc (-1 to leave the dispatcher), `set_ip`/`SAFEPOINT()` per
+//! instruction — plus a `#[no_mangle]`
 //! `_impl` wrapper per function, targeting the `saisei_rt` prelude
 //! (`saisei-jitc/rt/saisei_rt.rs`). The shared front half (basic blocks, CFG
 //! successors) and the operand-rewriting layer (`rewrite_operands`,
@@ -88,7 +90,8 @@ fn operand_width8(op: &str) -> bool {
     op.starts_with("memb(") || is_byte_reg(&op.to_lowercase())
 }
 
-/// Noreturn runtime calls: after one, the dispatch must `return;` (control goes
+/// Noreturn runtime calls: after one, the block must `return -1;` — the
+/// dispatcher exits (control goes
 /// to the target and comes back via the trampoline). Mirrors NORETURN_FUNCS +
 /// the `terminates` check of the retired C backend; names carry the `_` suffix the prelude
 /// wrappers use (dos_exit is the exception).
@@ -124,6 +127,85 @@ fn writes_dx(insn: &Insn) -> bool {
                 .any(|v| v.as_str().map_or(false, |s| s.eq_ignore_ascii_case("dx")))
         })
         .unwrap_or(false)
+}
+
+/// Rewrite one emitted line against the block-local register cache: register/
+/// flag accessors and the runtime-call vocabulary become methods on `r`
+/// (`ax()` → `r.ax()`, `memw(` → `r.memw(`, `JIT_BUDGET(` → `r.budget(`), so
+/// blocks operate on the `&mut Regs` the dispatch loop threads through them
+/// (noalias → rustc keeps guest registers in host registers) instead of the
+/// shared `cpu` global. Pure helpers (seg_off, parity8, scanMemoryForAl,
+/// exec_saved_*, set_interrupt_shadow) stay free functions.
+fn localize_regs(line: &str) -> String {
+    static REGS_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    static CALLS_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let regs_re = REGS_RE.get_or_init(|| {
+        Regex::new(
+            r"\b((?:set_)?(?:ax|bx|cx|dx|si|di|bp|sp|ip|cs|ds|es|ss|al|ah|bl|bh|cl|ch|dl|dh|CF|PF|ZF|SF|OF|IF|DF))\(",
+        )
+        .unwrap()
+    });
+    let calls_re = CALLS_RE.get_or_init(|| {
+        Regex::new(
+            r"\b(memb_write|memw_write|memb|memw|rcb_read8|rcb_read16|rcb_write8|rcb_write16|inb|inw|outb|outw|JIT_BUDGET|HLT_WAIT|run_interrupt|schedule_interrupt|dos_api|dos_exit|bios_keyboard|rep_movsb_block|rep_movsw_block|rep_stosb_block|call_table_|lcall_table_|jump_table_|near_ret_tail_|long_jump_|iret_|retf_pop_|retf_)\(",
+        )
+        .unwrap()
+    });
+    let s = regs_re.replace_all(line, "r.$1(");
+    let s = calls_re.replace_all(&s, |c: &regex::Captures| {
+        let name = c.get(1).unwrap().as_str();
+        let m = if name == "JIT_BUDGET" { "budget" } else { name };
+        format!("r.{m}(")
+    });
+    s.into_owned()
+}
+
+/// Per-instruction virtual-time weight, in budget units (1 unit = one
+/// jit_ns_per_instr quantum ≈ 3–4 cycles of the modeled 386-class CPU). The
+/// flat 1-unit-per-instruction model let mul/div/string/memory-heavy code buy
+/// far less virtual time than real hardware charges; weighting the block
+/// debit by instruction class keeps the virtual clock faithful AND raises the
+/// sustainable model speed (a heavy instruction buys proportionally more
+/// virtual time per host cycle). Weights approximate 386 cycle counts / 3.3.
+/// String instructions count ONLY their setup here — rep iteration costs are
+/// debited at run time (the rep_*_block impls debit `count`; the inline rep
+/// loops emit a dynamic `JIT_BUDGET(cx() …)` debit).
+fn insn_weight(insn: &Insn) -> u32 {
+    let mnem = s(insn, "mnemonic");
+    let base = mnem.split(' ').last().unwrap_or(mnem); // "rep movsb" -> "movsb"
+    match base {
+        "mul" | "imul" => 5,  // 386: 12–25 cycles
+        "div" | "idiv" => 12, // 386: 38–43 cycles
+        "aam" | "aad" => 5,   // 17–19 cycles
+        "int" => 10,          // INT dispatch ≈ 37 cycles
+        "iret" => 10,
+        "in" | "out" => 4, // 12–26 cycles
+        "enter" => 4,
+        "pushaw" | "popaw" => 6,                // 18–24 cycles
+        "push" | "pop" | "pushf" | "popf" => 2, // 5–7 cycles
+        "leave" | "lds" | "les" | "xlatb" => 2,
+        "call" => 3,                                           // near call: 7+m cycles
+        "ret" | "retn" | "retf" => 3,                          // plus the runtime transfer debits
+        "loop" | "loopne" | "loopnz" | "loope" | "loopz" => 3, // 11–13 cycles
+        "shl" | "shr" | "sar" | "sal" | "rol" | "ror" | "rcl" | "rcr" => 2, // 3+n cycles
+        // Bare string op ≈ 7 cycles; under rep this is setup only (the
+        // per-iteration debit happens at run time).
+        "movsb" | "movsw" | "stosb" | "stosw" | "lodsb" | "lodsw" | "cmpsb" | "scasb" | "scasw" => {
+            2
+        }
+        "lea" => 1, // address arithmetic only — no memory access
+        "hlt" => 1, // idles at host pace anyway
+        "jmp" => 2,
+        m if m.starts_with('j') => 2, // jcc: 3 not taken / 7+m taken
+        _ => {
+            // ALU/mov class: 2 cycles reg-reg; ~6–7 with a memory operand.
+            if s(insn, "op_str").contains('[') {
+                2
+            } else {
+                1
+            }
+        }
+    }
 }
 
 fn var_re() -> &'static Regex {
@@ -252,6 +334,11 @@ pub struct RRenderer {
     cs_base: i64,
     load_base: i64,
     dispatch_cases: Vec<String>,
+    /// One small `fn {prefix}blk_{addr} -> c_int` per basic block (returns the
+    /// next pc, -1 to leave the dispatcher). Kept out of the dispatch fn so no
+    /// single fn body grows with the chunk — rustc's per-body analyses
+    /// (borrowck especially) are superlinear and dominate JIT compile time.
+    block_fns: Vec<String>,
     seen_cases: BTreeSet<i64>,
     known_funcs: BTreeSet<i64>,
 }
@@ -262,6 +349,9 @@ impl RRenderer {
     }
     fn func_name(&self, addr: i64) -> String {
         format!("{}func_{:04X}", self.t.prefix, addr)
+    }
+    fn block_name(&self, addr: i64) -> String {
+        format!("{}blk_{:04X}", self.t.prefix, addr)
     }
 
     // ---- operand lowering --------------------------------------------------
@@ -491,7 +581,7 @@ impl RRenderer {
                         seg & 0xFFFF,
                         off & 0xFFFF
                     ),
-                    "return;".into(),
+                    "return -1;".into(),
                 ]);
             }
             // seg_reg:[mem]
@@ -537,7 +627,10 @@ impl RRenderer {
         };
         let sa = self.render_arg(&seg_mem)?;
         let oa = self.render_arg(&off_mem)?;
-        Ok(vec![format!("long_jump_({sa}, {oa});"), "return;".into()])
+        Ok(vec![
+            format!("long_jump_({sa}, {oa});"),
+            "return -1;".into(),
+        ])
     }
 
     fn handle_ret(&mut self, insn: &Insn) -> R<Vec<String>> {
@@ -549,7 +642,7 @@ impl RRenderer {
                 Some(v) => lines.push(format!("retf_pop_(0x{:X});", v & 0xFFFF)),
                 None => lines.push("retf_();".into()),
             }
-            lines.push("return;".into());
+            lines.push("return -1;".into());
             return Ok(lines);
         }
         let mut lines = vec![
@@ -565,16 +658,15 @@ impl RRenderer {
         }
         if self.cs_base != 0 {
             lines.push(format!(
-                "    pc = ((popped_ip.wrapping_sub(0x{:04X})) & 0xFFFF) as i32;",
+                "    return ((popped_ip.wrapping_sub(0x{:04X})) & 0xFFFF) as i32;",
                 self.cs_base
             ));
         } else {
             lines.push(format!(
-                "    pc = (((cs() as u32) << 4).wrapping_add(popped_ip as u32).wrapping_sub(0x{:05X})) as i32;",
+                "    return (((cs() as u32) << 4).wrapping_add(popped_ip as u32).wrapping_sub(0x{:05X})) as i32;",
                 self.load_base
             ));
         }
-        lines.push("    continue;".into());
         lines.push("}".into());
         Ok(lines)
     }
@@ -865,6 +957,7 @@ impl RRenderer {
             "stosb" => Ok(vec!["rep_stosb_block(es());".into()]),
             "stosw" => Ok(vec![
                 "{".into(),
+                "    JIT_BUDGET(cx() as u32); // rep iterations debit virtual time".into(),
                 "    let delta: i32 = if DF() != 0 { -2 } else { 2 };".into(),
                 "    while cx() != 0 {".into(),
                 "        memw_write(es(), di(), ax());".into(),
@@ -875,6 +968,7 @@ impl RRenderer {
             ]),
             "lodsb" => Ok(vec![
                 "if cx() != 0 {".into(),
+                "    JIT_BUDGET(cx() as u32); // rep iterations debit virtual time".into(),
                 "    let delta: i32 = if DF() != 0 { -1 } else { 1 };".into(),
                 format!("    set_al(memb({seg}(), ((si() as i32 + (cx() as i32 - 1) * delta) & 0xFFFF) as u16));"),
                 "    set_si(((si() as i32 + cx() as i32 * delta) & 0xFFFF) as u16);".into(),
@@ -1173,7 +1267,7 @@ impl RRenderer {
                 "    let upper: u16 = memw({seg}(), (((({off}) as u32) + 2) & 0xFFFF) as u16);"
             ),
             format!("    let value: u16 = {dest};"),
-            "    if value < lower || value > upper { run_interrupt(0x05); return; }".into(),
+            "    if value < lower || value > upper { run_interrupt(0x05); return -1; }".into(),
             "}".into(),
         ])
     }
@@ -1624,6 +1718,10 @@ impl RRenderer {
         l.push("        i += 1;".into());
         l.push("        if lv != rv { break; }".into());
         l.push("    }".into());
+        l.push(format!(
+            "    JIT_BUDGET((i as u32).wrapping_mul({})); // rep iterations debit virtual time",
+            if advance_si { 3 } else { 2 }
+        ));
         l.push("    set_cx(count.wrapping_sub(i));".into());
         l.push("    if i > 0 {".into());
         l.push("        let l32 = lv as u32; let r32 = rv as u32;".into());
@@ -1652,6 +1750,7 @@ impl RRenderer {
             "    let mut last_byte: u8 = 0;".into(),
             "    let index = unsafe { scanMemoryForAl(seg_off(es(), di()) as *const u8, al(), count, delta, &mut last_byte) };".into(),
             "    let advance = if index < count { index + 1 } else { index };".into(),
+            "    JIT_BUDGET((advance as u32).wrapping_mul(2)); // rep iterations debit virtual time".into(),
             "    if advance > 0 {".into(),
             "        let l32 = al() as u32; let r32 = last_byte as u32;".into(),
             "        let res = l32.wrapping_sub(r32) as u8;".into(),
@@ -1682,8 +1781,7 @@ impl RRenderer {
         Ok(vec![
             "set_cx(cx().wrapping_sub(1));".into(),
             format!("if {cond} {{"),
-            format!("    pc = 0x{target:04X};"),
-            "    continue;".into(),
+            format!("    return 0x{target:04X};"),
             "}".into(),
         ])
     }
@@ -1820,8 +1918,7 @@ impl RRenderer {
                     "{".into(),
                     "    set_sp((sp().wrapping_sub(2)) & 0xFFFF);".into(),
                     format!("    memw_write(ss(), sp(), {ret_arg});"),
-                    format!("    pc = 0x{t:04X};"),
-                    "    continue;".into(),
+                    format!("    return 0x{t:04X};"),
                     "}".into(),
                 ]);
             }
@@ -1923,24 +2020,23 @@ impl RRenderer {
 
         match mnem.as_str() {
             "xor" if dest == src => {
-                // `xor r,r` -> xor8/xor16 (sets flags itself); `xor [m],[m]` -> 0.
-                if dest.starts_with("memb(") || dest.starts_with("memw(") {
-                    let mut lines = self.store(&dest, "0")?;
-                    for f in [
-                        "set_CF(0);",
-                        "set_OF(0);",
-                        "set_ZF(1);",
-                        "set_PF(1);",
-                        "set_SF(0);",
-                    ] {
-                        lines.push(f.into());
-                    }
-                    Ok(lines)
+                // `xor x,x` zeroes the operand; flags of a zero result:
+                // CF=0 OF=0 ZF=1 SF=0 PF=parity8(0)=1.
+                let mut lines = if dest.starts_with("memb(") || dest.starts_with("memw(") {
+                    self.store(&dest, "0")?
                 } else {
-                    let l = dest.to_lowercase();
-                    let helper = if is_byte_reg(&l) { "xor8" } else { "xor16" };
-                    Ok(vec![format!("unsafe {{ {helper}({l}_ptr(), {l}()); }}")])
+                    vec![format!("set_{}(0);", dest.to_lowercase())]
+                };
+                for f in [
+                    "set_CF(0);",
+                    "set_OF(0);",
+                    "set_ZF(1);",
+                    "set_PF(1);",
+                    "set_SF(0);",
+                ] {
+                    lines.push(f.into());
                 }
+                Ok(lines)
             }
             "add" | "adc" | "sub" | "sbb" => {
                 let srcv = self.rvalue(&src)?;
@@ -2105,10 +2201,11 @@ impl RRenderer {
             "neg" => self.handle_neg(insn),
             "enter" => self.handle_enter(insn),
             "bound" => self.handle_bound(insn),
-            // hlt: wait for the next interrupt. SAFEPOINT services pending IRQs
-            // (the `sti; hlt` idle-loop idiom); the C backend treated hlt as a block
-            // terminator, so nothing else follows in-block.
-            "hlt" => self.simple(&["SAFEPOINT();"]),
+            // hlt: wait for the next interrupt (the `sti; hlt` idle-loop
+            // idiom). HLT_WAIT lets machine time flow at host pace while the
+            // guest retires nothing, then services pending IRQs; the C backend
+            // treated hlt as a block terminator, so nothing else follows in-block.
+            "hlt" => self.simple(&["HLT_WAIT();"]),
             "cbw" => self.simple(&["set_ax(((al() as i8) as i16) as u16);"]),
             "cwd" => self.simple(&["set_dx(if (ax() & 0x8000) != 0 { 0xFFFF } else { 0 });"]),
             other => uns(format!("mnemonic:{other}")),
@@ -2117,12 +2214,16 @@ impl RRenderer {
 
     // ---- state machine (mirror render_block_state_machine) -----------------
 
+    /// Render one basic block as the body of its per-block `fn … -> c_int`.
+    /// Control transfers `return` the next pc (or -1: dispatch returns) instead
+    /// of mutating a shared `pc` — each block being its own small fn keeps
+    /// rustc's per-body analyses (borrowck is superlinear) off the JIT path.
     fn render_block(
         &mut self,
         block: &BasicBlock,
         succ: &HashMap<i64, Vec<i64>>,
     ) -> R<Vec<String>> {
-        let indent = "                ";
+        let indent = "    ";
         let mut lines: Vec<String> = Vec::new();
         let insns = &block.instructions;
         let n = insns.len();
@@ -2131,7 +2232,14 @@ impl RRenderer {
         for (idx, insn) in insns.iter().enumerate() {
             let ip = (i64f(insn, "address").unwrap_or(0) + self.cs_base) & 0xFFFF;
             lines.push(format!("{indent}set_ip(0x{ip:04X});"));
-            lines.push(format!("{indent}SAFEPOINT();"));
+            if idx == 0 {
+                // One safepoint poll per basic block, debiting the block's
+                // summed per-class instruction weights (insn_weight): IRQs
+                // deliver on block boundaries (still instruction boundaries),
+                // and the budget is what advances the virtual clock.
+                let cost: u32 = insns.iter().map(insn_weight).sum();
+                lines.push(format!("{indent}JIT_BUDGET({cost});"));
+            }
 
             let is_last = idx == n - 1;
             let mnem = s(insn, "mnemonic").to_string();
@@ -2142,7 +2250,7 @@ impl RRenderer {
                 lines.push(format!(
                     "{indent}jump_table_((((cs() as u32) << 4).wrapping_add(({expr}) as u32)) & 0xFFFFF, expected_retip);"
                 ));
-                lines.push(format!("{indent}return;"));
+                lines.push(format!("{indent}return -1;"));
                 return Ok(lines);
             }
             if is_last
@@ -2155,14 +2263,13 @@ impl RRenderer {
                 lines.push(format!(
                     "{indent}jump_table_((((cs() as u32) << 4).wrapping_add({op}() as u32)) & 0xFFFFF, expected_retip);"
                 ));
-                lines.push(format!("{indent}return;"));
+                lines.push(format!("{indent}return -1;"));
                 return Ok(lines);
             }
             if is_last && mnem == "jmp" {
                 match parse_hex16(&op_str) {
                     Some(target) => {
-                        lines.push(format!("{indent}pc = 0x{target:04X};"));
-                        lines.push(format!("{indent}continue;"));
+                        lines.push(format!("{indent}return 0x{target:04X};"));
                         return Ok(lines);
                     }
                     None => return uns(format!("jmp {op_str}")),
@@ -2188,18 +2295,16 @@ impl RRenderer {
                 match fall {
                     Some(f) => {
                         lines.push(format!("{indent}if {cond} {{"));
-                        lines.push(format!("{indent}    pc = 0x{target:04X};"));
+                        lines.push(format!("{indent}    return 0x{target:04X};"));
                         lines.push(format!("{indent}}} else {{"));
-                        lines.push(format!("{indent}    pc = 0x{f:04X};"));
+                        lines.push(format!("{indent}    return 0x{f:04X};"));
                         lines.push(format!("{indent}}}"));
-                        lines.push(format!("{indent}continue;"));
                     }
                     None => {
                         lines.push(format!("{indent}if {cond} {{"));
-                        lines.push(format!("{indent}    pc = 0x{target:04X};"));
-                        lines.push(format!("{indent}    continue;"));
+                        lines.push(format!("{indent}    return 0x{target:04X};"));
                         lines.push(format!("{indent}}}"));
-                        lines.push(format!("{indent}return;"));
+                        lines.push(format!("{indent}return -1;"));
                     }
                 }
                 return Ok(lines);
@@ -2212,7 +2317,7 @@ impl RRenderer {
                     last = l.trim().to_string();
                 }
                 if !last.starts_with("return") && !last.ends_with('}') {
-                    lines.push(format!("{indent}return;"));
+                    lines.push(format!("{indent}return -1;"));
                 }
                 return Ok(lines);
             }
@@ -2232,7 +2337,7 @@ impl RRenderer {
             // this the block would wrongly fall through to the next pc.
             if terminates(&last) {
                 if !last.starts_with("return") {
-                    lines.push(format!("{indent}return;"));
+                    lines.push(format!("{indent}return -1;"));
                 }
                 return Ok(lines);
             }
@@ -2240,10 +2345,9 @@ impl RRenderer {
             if is_last {
                 let ss = succs(block.start);
                 if let Some(&first) = ss.first() {
-                    lines.push(format!("{indent}pc = 0x{first:04X};"));
-                    lines.push(format!("{indent}continue;"));
+                    lines.push(format!("{indent}return 0x{first:04X};"));
                 } else {
-                    lines.push(format!("{indent}return;"));
+                    lines.push(format!("{indent}return -1;"));
                 }
             }
         }
@@ -2277,25 +2381,35 @@ impl RRenderer {
                 continue;
             }
             self.seen_cases.insert(addr);
-            self.dispatch_cases.push(format!(
-                "            0x{addr:04X} => {{ // {impl_}@{addr:04X}"
-            ));
             match blocks.get(&addr) {
                 None => {
+                    // Entry alias with no decoded block of its own: forward to
+                    // the function's first real block (or leave the dispatcher).
                     if !block_addrs.is_empty() {
-                        self.dispatch_cases
-                            .push(format!("{indent}    pc = 0x{first_real:04X};"));
-                        self.dispatch_cases.push(format!("{indent}    continue;"));
+                        self.dispatch_cases.push(format!(
+                            "{indent}0x{addr:04X} => 0x{first_real:04X}, // {impl_}@{addr:04X}"
+                        ));
                     } else {
-                        self.dispatch_cases.push(format!("{indent}    return;"));
+                        self.dispatch_cases
+                            .push(format!("{indent}0x{addr:04X} => -1, // {impl_}@{addr:04X}"));
                     }
                 }
                 Some(block) => {
                     let body = self.render_block(block, &succ)?;
-                    self.dispatch_cases.extend(body);
+                    let blk = self.block_name(addr);
+                    self.dispatch_cases.push(format!(
+                        "{indent}0x{addr:04X} => {blk}(r, expected_retip), // {impl_}@{addr:04X}"
+                    ));
+                    self.block_fns.push(format!("// {impl_}@{addr:04X}"));
+                    self.block_fns.push(format!(
+                        "fn {blk}(r: &mut Regs, expected_retip: u16) -> c_int {{"
+                    ));
+                    self.block_fns.extend(body.iter().map(|l| localize_regs(l)));
+                    self.block_fns.push("    return -1;".into());
+                    self.block_fns.push("}".into());
+                    self.block_fns.push(String::new());
                 }
             }
-            self.dispatch_cases.push("            }".into());
         }
         Ok(())
     }
@@ -2307,8 +2421,13 @@ impl RRenderer {
                 "pub extern \"C\" fn {}(mut pc: c_int, expected_retip: u16, _file: *const c_char, _func: *const c_char, _line: c_int) {{",
                 self.dispatch_name()
             ),
+            // The block-local register cache lives for the whole dispatch:
+            // blocks hand registers to each other in host registers, spilling
+            // to the shared `cpu` only around runtime calls and at exit.
+            "    let r = &mut Regs::load();".into(),
             "    loop {".into(),
-            "        match pc {".into(),
+            "        // Each arm runs one basic block and yields the next pc (-1: done).".into(),
+            "        pc = match pc {".into(),
         ];
         lines.extend(self.dispatch_cases.iter().cloned());
         let default_popped = if self.cs_base != 0 {
@@ -2318,7 +2437,7 @@ impl RRenderer {
             )
         } else {
             format!(
-                "                let popped_ip = ((pc as u32).wrapping_add(0x{:05X}).wrapping_sub((cs() as u32) << 4)) as u16;",
+                "                let popped_ip = ((pc as u32).wrapping_add(0x{:05X}).wrapping_sub((r.cs() as u32) << 4)) as u16;",
                 self.load_base
             )
         };
@@ -2326,9 +2445,13 @@ impl RRenderer {
             "            _ => {".into(),
             "                // Not a case in this chunk's switch — a cross-binary RET/jmp.".into(),
             default_popped,
-            "                near_ret_tail_(popped_ip, expected_retip);".into(),
+            "                r.near_ret_tail_(popped_ip, expected_retip);".into(),
             "                return;".into(),
             "            }".into(),
+            "        };".into(),
+            "        if pc < 0 {".into(),
+            "            r.spill();".into(),
+            "            return;".into(),
             "        }".into(),
             "    }".into(),
             "}".into(),
@@ -2404,6 +2527,7 @@ pub fn emit_chunk_known(
         cs_base: 0,
         load_base,
         dispatch_cases: Vec::new(),
+        block_fns: Vec::new(),
         seen_cases: BTreeSet::new(),
         known_funcs,
     };
@@ -2457,6 +2581,7 @@ pub fn emit_chunk_known(
     ];
     out.extend(dispatch);
     out.push(String::new());
+    out.extend(r.block_fns.iter().cloned());
     out.extend(wrappers);
     Ok(out.join("\n"))
 }

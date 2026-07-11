@@ -23,9 +23,10 @@
 //!                func_names pokes (no label channel in the flat state
 //!                machine); the semantic core (pc transfer, name prefix on the
 //!                emitted _impl/dispatch symbols) is asserted.
-//!              - assert_jump_table's `!contains("pc =")` now applies to the
-//!                jump-table ARM only (the whole chunk always carries pc
-//!                assignments in the ret epilogue/boilerplate).
+//!              - assert_jump_table's no-direct-pc-transfer check
+//!                (`!contains("return 0x")`) applies to the jump-table BLOCK
+//!                fn only (other block fns yield next-pc `return 0x…;`
+//!                values in their ret epilogues).
 //!   collapsed: the Rust backend does not specialize int 21h per AH (every
 //!              int 21h emits `dos_api();` after in-order register writes) nor
 //!              int 10h per AH (`run_interrupt(0x10);`). Families are
@@ -78,31 +79,19 @@ fn render_plain(func: &Value, known_addrs: &[i64]) -> String {
     render_rs(func, known_addrs, "")
 }
 
-/// Slice out one dispatch-match arm (`0xNNNN => { ... }`) from a chunk text.
-/// Arms close with a brace at 12-space indent; inner blocks are deeper.
-fn arm(src: &str, addr: i64) -> String {
-    let key = format!("0x{addr:04X} => {{");
-    src.split(&key)
-        .nth(1)
-        .unwrap_or_else(|| panic!("arm {key} must exist in:\n{src}"))
-        .split("\n            }")
-        .next()
-        .unwrap()
-        .to_string()
-}
-
-/// The Rust jump-table contract: the arm computes the 20-bit linear target
-/// with wrapping arithmetic, calls the noreturn jump_table_ helper, and makes
-/// no direct pc transfer of its own. (All jump-table fixtures start at 0x0000.)
+/// The Rust jump-table contract: the block fn computes the 20-bit linear
+/// target with wrapping arithmetic, calls the noreturn jump_table_ helper, and
+/// makes no direct pc transfer of its own (no `return 0x…;` next-pc yield).
+/// (All jump-table fixtures start at 0x0000; `blk` slices the per-block fn.)
 fn assert_jump_table(src: &str) {
-    let body = arm(src, 0x0000);
+    let body = blk(src, 0x0000);
     assert!(
-        body.contains("jump_table_((((cs() as u32) << 4).wrapping_add("),
+        body.contains("r.jump_table_((((r.cs() as u32) << 4).wrapping_add("),
         "{body}"
     );
     assert!(body.contains(") & 0xFFFFF, expected_retip);"), "{body}");
-    assert!(body.contains("return;"), "{body}");
-    assert!(!body.contains("pc ="), "{body}");
+    assert!(body.contains("return -1;"), "{body}");
+    assert!(!body.contains("return 0x"), "{body}");
 }
 
 // ============================================================================
@@ -120,10 +109,10 @@ fn ir_to_c__call_to_known_address_emits_function_call() {
     let src = render_app(&func, &[0x0000, 0x05F9]);
     // push the cs-relative return IP, then transfer to the sibling arm
     assert!(
-        src.contains("memw_write(ss(), sp(), ((0x3u32).wrapping_add(0x10100).wrapping_sub((cs() as u32) << 4)) as u16);"),
+        src.contains("r.memw_write(r.ss(), r.sp(), ((0x3u32).wrapping_add(0x10100).wrapping_sub((r.cs() as u32) << 4)) as u16);"),
         "{src}"
     );
-    assert!(src.contains("pc = 0x05F9;"), "{src}");
+    assert!(src.contains("return 0x05F9;"), "{src}");
 }
 
 // The C renderer aborted (process::exit(2)) on a direct call to an unknown
@@ -141,10 +130,10 @@ fn ir_to_c__call_to_unknown_address_dispatches_via_call_table() {
     });
     let src = render_app(&func, &[0x0000]);
     assert!(
-        src.contains("call_table_(((0x3u32).wrapping_add(0x10100).wrapping_sub((cs() as u32) << 4)) as u16, (((cs() as u32) << 4).wrapping_add(0x1234)) & 0xFFFFF);"),
+        src.contains("r.call_table_(((0x3u32).wrapping_add(0x10100).wrapping_sub((r.cs() as u32) << 4)) as u16, (((r.cs() as u32) << 4).wrapping_add(0x1234)) & 0xFFFFF);"),
         "{src}"
     );
-    assert!(!src.contains("pc = 0x1234;"), "{src}");
+    assert!(!src.contains("return 0x1234;"), "{src}");
 }
 
 #[test]
@@ -157,13 +146,16 @@ fn ir_to_c__ret_instruction_emits_return_statement() {
     });
     let src = render_app(&func, &[]);
     // near ret pops the return IP and re-enters the dispatch loop with it
-    assert!(src.contains("let popped_ip = memw(ss(), sp());"), "{src}");
     assert!(
-        src.contains("set_sp((sp().wrapping_add(2)) & 0xFFFF);"),
+        src.contains("let popped_ip = r.memw(r.ss(), r.sp());"),
         "{src}"
     );
     assert!(
-        src.contains("pc = (((cs() as u32) << 4).wrapping_add(popped_ip as u32).wrapping_sub(0x10100)) as i32;"),
+        src.contains("r.set_sp((r.sp().wrapping_add(2)) & 0xFFFF);"),
+        "{src}"
+    );
+    assert!(
+        src.contains("return (((r.cs() as u32) << 4).wrapping_add(popped_ip as u32).wrapping_sub(0x10100)) as i32;"),
         "{src}"
     );
 }
@@ -180,14 +172,14 @@ fn ir_to_c__and_instruction_is_rendered() {
     });
     let src = render_app(&func, &[]);
     assert!(
-        src.contains("let tmp: u8 = (((al()) as u32 & (dh()) as u32) & 0xFF) as u8;"),
+        src.contains("let tmp: u8 = (((r.al()) as u32 & (r.dh()) as u32) & 0xFF) as u8;"),
         "{src}"
     );
     assert!(
-        src.contains("let tmp: u8 = (((al()) as u32 & (0x44) as u32) & 0xFF) as u8;"),
+        src.contains("let tmp: u8 = (((r.al()) as u32 & (0x44) as u32) & 0xFF) as u8;"),
         "{src}"
     );
-    assert!(src.contains("set_al(tmp);"), "{src}");
+    assert!(src.contains("r.set_al(tmp);"), "{src}");
 }
 
 // ----------------------------------------------------------------------------
@@ -207,8 +199,8 @@ fn ir_to_c__dos_interrupt_with_known_ah_emits_dos_api() {
         ],
     });
     let src = render_app(&func, &[]);
-    assert!(src.contains("set_ah(0x9);"), "{src}");
-    assert!(src.contains("dos_api();"), "{src}");
+    assert!(src.contains("r.set_ah(0x9);"), "{src}");
+    assert!(src.contains("r.dos_api();"), "{src}");
 }
 
 #[test]
@@ -221,7 +213,7 @@ fn ir_to_c__dos_interrupt_without_ah_uses_generic_call() {
         ],
     });
     let src = render_app(&func, &[]);
-    assert!(src.contains("dos_api();"), "{src}");
+    assert!(src.contains("r.dos_api();"), "{src}");
 }
 
 #[test]
@@ -237,13 +229,13 @@ fn ir_to_c__dos_interrupt_preserves_unrelated_registers() {
         ],
     });
     let src = render_app(&func, &[]);
-    assert!(src.contains("set_cx(0x1234);"), "{src}");
-    assert!(src.contains("set_ah(0x2);"), "{src}");
-    assert!(src.contains("set_dl(0x41);"), "{src}");
+    assert!(src.contains("r.set_cx(0x1234);"), "{src}");
+    assert!(src.contains("r.set_ah(0x2);"), "{src}");
+    assert!(src.contains("r.set_dl(0x41);"), "{src}");
     // all register writes execute, in program order, before the DOS call
-    let cx = src.find("set_cx(0x1234);").unwrap();
-    let dl = src.find("set_dl(0x41);").unwrap();
-    let call = src.find("dos_api();").unwrap();
+    let cx = src.find("r.set_cx(0x1234);").unwrap();
+    let dl = src.find("r.set_dl(0x41);").unwrap();
+    let call = src.find("r.dos_api();").unwrap();
     assert!(cx < dl && dl < call, "{src}");
 }
 
@@ -257,8 +249,8 @@ fn ir_to_c__interrupt_emits_run_interrupt() {
         ],
     });
     let src = render_app(&func, &[]);
-    assert!(src.contains("set_ip(0x0000);"), "{src}");
-    assert!(src.contains("run_interrupt(0x60);"), "{src}");
+    assert!(src.contains("r.set_ip(0x0000);"), "{src}");
+    assert!(src.contains("r.run_interrupt(0x60);"), "{src}");
 }
 
 #[test]
@@ -271,8 +263,8 @@ fn ir_to_c__interrupt_1a_emits_run_interrupt() {
         ],
     });
     let src = render_app(&func, &[]);
-    assert!(src.contains("set_ip(0x0000);"), "{src}");
-    assert!(src.contains("run_interrupt(0x1A);"), "{src}");
+    assert!(src.contains("r.set_ip(0x0000);"), "{src}");
+    assert!(src.contains("r.run_interrupt(0x1A);"), "{src}");
 }
 
 #[test]
@@ -285,7 +277,7 @@ fn ir_to_c__mov_ax_without_interrupt_is_emitted() {
         ],
     });
     let src = render_app(&func, &[]);
-    assert!(src.contains("set_ax(0x1234);"), "{src}");
+    assert!(src.contains("r.set_ax(0x1234);"), "{src}");
 }
 
 #[test]
@@ -301,10 +293,13 @@ fn ir_to_c__lds_loads_far_pointer_for_dos_call() {
     });
     let src = render_app(&func, &[]);
     // seg word read from [mem+2] BEFORE the offset overwrites dx / ds changes
-    assert!(src.contains("let _far_seg = memw(cs(), 0x08BB);"), "{src}");
-    assert!(src.contains("set_dx(memw(cs(), 0x08B9));"), "{src}");
-    assert!(src.contains("set_ds(_far_seg);"), "{src}");
-    assert!(src.contains("dos_api();"), "{src}");
+    assert!(
+        src.contains("let _far_seg = r.memw(r.cs(), 0x08BB);"),
+        "{src}"
+    );
+    assert!(src.contains("r.set_dx(r.memw(r.cs(), 0x08B9));"), "{src}");
+    assert!(src.contains("r.set_ds(_far_seg);"), "{src}");
+    assert!(src.contains("r.dos_api();"), "{src}");
 }
 
 #[test]
@@ -317,9 +312,12 @@ fn ir_to_c__les_loads_far_pointer() {
         ],
     });
     let src = render_app(&func, &[]);
-    assert!(src.contains("let _far_seg = memw(cs(), 0x0F62);"), "{src}");
-    assert!(src.contains("set_di(memw(cs(), 0x0F60));"), "{src}");
-    assert!(src.contains("set_es(_far_seg);"), "{src}");
+    assert!(
+        src.contains("let _far_seg = r.memw(r.cs(), 0x0F62);"),
+        "{src}"
+    );
+    assert!(src.contains("r.set_di(r.memw(r.cs(), 0x0F60));"), "{src}");
+    assert!(src.contains("r.set_es(_far_seg);"), "{src}");
 }
 
 // ----------------------------------------------------------------------------
@@ -339,8 +337,8 @@ fn ir_to_c__bios_video_mode_interrupt_emits_run_interrupt() {
         ],
     });
     let src = render_app(&func, &[]);
-    assert!(src.contains("set_ax(0x13);"), "{src}");
-    assert!(src.contains("run_interrupt(0x10);"), "{src}");
+    assert!(src.contains("r.set_ax(0x13);"), "{src}");
+    assert!(src.contains("r.run_interrupt(0x10);"), "{src}");
 }
 
 // ============================================================================
@@ -356,7 +354,7 @@ fn jump_function_entry__jmp_known_function_entry_without_block_sets_pc() {
         ],
     });
     let src = render_plain(&func, &[0x0000, 0x0100]);
-    assert!(src.contains("pc = 0x0100;"), "{src}");
+    assert!(src.contains("return 0x0100;"), "{src}");
     assert!(!src.contains("func_0100()"), "{src}");
 }
 
@@ -371,9 +369,12 @@ fn jump_function_entry__jmp_known_function_entry_with_block_sets_pc() {
         ],
     });
     let src = render_plain(&func, &[0x0000, 0x0006]);
-    assert!(src.contains("pc = 0x0006;"), "{src}");
+    assert!(src.contains("return 0x0006;"), "{src}");
     // the target block is its own dispatch arm, not a called function
-    assert!(src.contains("0x0006 => {"), "{src}");
+    assert!(
+        src.contains("0x0006 => blk_0006(r, expected_retip),"),
+        "{src}"
+    );
     assert!(!src.contains("func_0006()"), "{src}");
 }
 
@@ -392,7 +393,7 @@ fn jump_table__jmp_word_ptr_cs_uses_jump_table() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("jump_table_((((cs() as u32) << 4).wrapping_add((memw(cs(), 0x10C)) as u32)) & 0xFFFFF, expected_retip);"),
+        src.contains("r.jump_table_((((r.cs() as u32) << 4).wrapping_add((r.memw(r.cs(), 0x10C)) as u32)) & 0xFFFFF, expected_retip);"),
         "{src}"
     );
     assert_jump_table(&src);
@@ -410,7 +411,7 @@ fn jump_table__jmp_word_ptr_cs_with_bp_index_uses_jump_table() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("jump_table_((((cs() as u32) << 4).wrapping_add((memw(cs(), (((bp() as u32).wrapping_add(0x10Cu32)) & 0xFFFF) as u16)) as u32)) & 0xFFFFF, expected_retip);"),
+        src.contains("r.jump_table_((((r.cs() as u32) << 4).wrapping_add((r.memw(r.cs(), (((r.bp() as u32).wrapping_add(0x10Cu32)) & 0xFFFF) as u16)) as u32)) & 0xFFFFF, expected_retip);"),
         "{src}"
     );
     assert_jump_table(&src);
@@ -428,7 +429,7 @@ fn jump_table__jmp_word_ptr_cs_with_bx_register_uses_jump_table() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("jump_table_((((cs() as u32) << 4).wrapping_add((memw(cs(), bx())) as u32)) & 0xFFFFF, expected_retip);"),
+        src.contains("r.jump_table_((((r.cs() as u32) << 4).wrapping_add((r.memw(r.cs(), r.bx())) as u32)) & 0xFFFFF, expected_retip);"),
         "{src}"
     );
     assert_jump_table(&src);
@@ -444,7 +445,7 @@ fn jump_table__jmp_known_function_sets_pc() {
         ],
     });
     let src = render_plain(&func, &[0x0000, 0x0100]);
-    assert!(src.contains("pc = 0x0100;"), "{src}");
+    assert!(src.contains("return 0x0100;"), "{src}");
     assert!(!src.contains("func_0100()"), "{src}");
     assert!(!src.contains("jump_table_"), "{src}");
 }
@@ -461,7 +462,7 @@ fn jump_table__jmp_word_ptr_es_with_bx_uses_jump_table() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("jump_table_((((cs() as u32) << 4).wrapping_add((memw(es(), bx())) as u32)) & 0xFFFFF, expected_retip);"),
+        src.contains("r.jump_table_((((r.cs() as u32) << 4).wrapping_add((r.memw(r.es(), r.bx())) as u32)) & 0xFFFFF, expected_retip);"),
         "{src}"
     );
     assert_jump_table(&src);
@@ -479,7 +480,7 @@ fn jump_table__jmp_word_ptr_es_with_offset_uses_jump_table() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("jump_table_((((cs() as u32) << 4).wrapping_add((memw(es(), 0x10C)) as u32)) & 0xFFFFF, expected_retip);"),
+        src.contains("r.jump_table_((((r.cs() as u32) << 4).wrapping_add((r.memw(r.es(), 0x10C)) as u32)) & 0xFFFFF, expected_retip);"),
         "{src}"
     );
     assert_jump_table(&src);
@@ -497,7 +498,7 @@ fn jump_table__jmp_word_ptr_without_segment_uses_ds() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("jump_table_((((cs() as u32) << 4).wrapping_add((memw(ds(), 0x10C)) as u32)) & 0xFFFFF, expected_retip);"),
+        src.contains("r.jump_table_((((r.cs() as u32) << 4).wrapping_add((r.memw(r.ds(), 0x10C)) as u32)) & 0xFFFFF, expected_retip);"),
         "{src}"
     );
     assert_jump_table(&src);
@@ -515,7 +516,7 @@ fn jump_table__jmp_word_ptr_bp_defaults_to_ss() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("jump_table_((((cs() as u32) << 4).wrapping_add((memw(ss(), (((bp() as u32).wrapping_add(0x10Cu32)) & 0xFFFF) as u16)) as u32)) & 0xFFFFF, expected_retip);"),
+        src.contains("r.jump_table_((((r.cs() as u32) << 4).wrapping_add((r.memw(r.ss(), (((r.bp() as u32).wrapping_add(0x10Cu32)) & 0xFFFF) as u16)) as u32)) & 0xFFFFF, expected_retip);"),
         "{src}"
     );
     assert_jump_table(&src);
@@ -533,7 +534,7 @@ fn jump_table__jmp_word_ptr_cs_with_negative_offset_uses_jump_table() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("jump_table_((((cs() as u32) << 4).wrapping_add((memw(cs(), (((bx() as u32).wrapping_sub(0x10u32)) & 0xFFFF) as u16)) as u32)) & 0xFFFFF, expected_retip);"),
+        src.contains("r.jump_table_((((r.cs() as u32) << 4).wrapping_add((r.memw(r.cs(), (((r.bx() as u32).wrapping_sub(0x10u32)) & 0xFFFF) as u16)) as u32)) & 0xFFFFF, expected_retip);"),
         "{src}"
     );
     assert_jump_table(&src);
@@ -558,7 +559,7 @@ fn jump_table_rcb__jmp_word_ptr_es_rcb_field_uses_rcb_read16() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("jump_table_((((cs() as u32) << 4).wrapping_add((rcb_read16(DATA_BUF1_OFF)) as u32)) & 0xFFFFF, expected_retip);"),
+        src.contains("r.jump_table_((((r.cs() as u32) << 4).wrapping_add((r.rcb_read16(DATA_BUF1_OFF)) as u32)) & 0xFFFFF, expected_retip);"),
         "{src}"
     );
     assert_jump_table(&src);
@@ -577,7 +578,7 @@ fn jump_table_rcb__ljmp_es_rcb_fields_use_rcb_read16() {
     let src = render_plain(&func, &[]);
     assert!(
         src.contains(
-            "long_jump_(rcb_read16(PREV_TIMER_VECTOR_SEG), rcb_read16(PREV_TIMER_VECTOR_OFF));"
+            "r.long_jump_(r.rcb_read16(PREV_TIMER_VECTOR_SEG), r.rcb_read16(PREV_TIMER_VECTOR_OFF));"
         ),
         "{src}"
     );
@@ -595,7 +596,7 @@ fn jump_table_rcb__jmp_word_ptr_es_lowercase_hex() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("jump_table_((((cs() as u32) << 4).wrapping_add((rcb_read16(DATA_BUF1_OFF)) as u32)) & 0xFFFFF, expected_retip);"),
+        src.contains("r.jump_table_((((r.cs() as u32) << 4).wrapping_add((r.rcb_read16(DATA_BUF1_OFF)) as u32)) & 0xFFFFF, expected_retip);"),
         "{src}"
     );
     assert_jump_table(&src);
@@ -617,8 +618,11 @@ fn label_goto__jmp_to_label_sets_pc() {
         ],
     });
     let src = render_plain(&func, &[0x0000]);
-    assert!(src.contains("pc = 0x0340;"), "{src}");
-    assert!(src.contains("0x0340 => {"), "{src}");
+    assert!(src.contains("return 0x0340;"), "{src}");
+    assert!(
+        src.contains("0x0340 => blk_0340(r, expected_retip),"),
+        "{src}"
+    );
     assert!(!src.contains("label_0340"), "{src}");
 }
 
@@ -637,13 +641,13 @@ fn lahf_sahf__lahf_sahf_translate_flags() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("set_ah((SF() << 7) | (ZF() << 6) | (PF() << 2) | 0x02 | CF());"),
+        src.contains("r.set_ah((r.SF() << 7) | (r.ZF() << 6) | (r.PF() << 2) | 0x02 | r.CF());"),
         "{src}"
     );
-    assert!(src.contains("set_SF((ah() >> 7) & 1);"), "{src}");
-    assert!(src.contains("set_ZF((ah() >> 6) & 1);"), "{src}");
-    assert!(src.contains("set_PF((ah() >> 2) & 1);"), "{src}");
-    assert!(src.contains("set_CF(ah() & 1);"), "{src}");
+    assert!(src.contains("r.set_SF((r.ah() >> 7) & 1);"), "{src}");
+    assert!(src.contains("r.set_ZF((r.ah() >> 6) & 1);"), "{src}");
+    assert!(src.contains("r.set_PF((r.ah() >> 2) & 1);"), "{src}");
+    assert!(src.contains("r.set_CF(r.ah() & 1);"), "{src}");
 }
 
 // ============================================================================
@@ -661,7 +665,7 @@ fn lcall__lcall_cs_indirect() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("lcall_table_(((0x5u32).wrapping_add(0x10100).wrapping_sub((cs() as u32) << 4)) as u16, memw(cs(), 0xFF12), memw(cs(), 0xFF10));"),
+        src.contains("r.lcall_table_(((0x5u32).wrapping_add(0x10100).wrapping_sub((r.cs() as u32) << 4)) as u16, r.memw(r.cs(), 0xFF12), r.memw(r.cs(), 0xFF10));"),
         "{src}"
     );
 }
@@ -678,7 +682,7 @@ fn lcall__lcall_cs_indirect_other_offset() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("lcall_table_(((0x5u32).wrapping_add(0x10100).wrapping_sub((cs() as u32) << 4)) as u16, memw(cs(), 0xFF0E), memw(cs(), 0xFF0C));"),
+        src.contains("r.lcall_table_(((0x5u32).wrapping_add(0x10100).wrapping_sub((r.cs() as u32) << 4)) as u16, r.memw(r.cs(), 0xFF0E), r.memw(r.cs(), 0xFF0C));"),
         "{src}"
     );
 }
@@ -695,7 +699,7 @@ fn lcall__lcall_indirect_register() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("lcall_table_(((0x5u32).wrapping_add(0x10100).wrapping_sub((cs() as u32) << 4)) as u16, memw(ds(), (((bx() as u32).wrapping_add(0x2u32)) & 0xFFFF) as u16), memw(ds(), bx()));"),
+        src.contains("r.lcall_table_(((0x5u32).wrapping_add(0x10100).wrapping_sub((r.cs() as u32) << 4)) as u16, r.memw(r.ds(), (((r.bx() as u32).wrapping_add(0x2u32)) & 0xFFFF) as u16), r.memw(r.ds(), r.bx()));"),
         "{src}"
     );
 }
@@ -714,7 +718,7 @@ fn lcall__call_after_push_cs_pop_ds_is_near() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("call_table_(((0x7u32).wrapping_add(0x10100).wrapping_sub((cs() as u32) << 4)) as u16, (((cs() as u32) << 4).wrapping_add((memw(cs(), 0x1000)) as u32)) & 0xFFFFF);"),
+        src.contains("r.call_table_(((0x7u32).wrapping_add(0x10100).wrapping_sub((r.cs() as u32) << 4)) as u16, (((r.cs() as u32) << 4).wrapping_add((r.memw(r.cs(), 0x1000)) as u32)) & 0xFFFFF);"),
         "{src}"
     );
     assert!(!src.contains("lcall_table_"), "{src}");
@@ -734,7 +738,7 @@ fn lcall__call_after_push_cs_with_intervening_instruction_is_near() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("call_table_(((0x8u32).wrapping_add(0x10100).wrapping_sub((cs() as u32) << 4)) as u16, (((cs() as u32) << 4).wrapping_add((memw(cs(), 0x1000)) as u32)) & 0xFFFFF);"),
+        src.contains("r.call_table_(((0x8u32).wrapping_add(0x10100).wrapping_sub((r.cs() as u32) << 4)) as u16, (((r.cs() as u32) << 4).wrapping_add((r.memw(r.cs(), 0x1000)) as u32)) & 0xFFFFF);"),
         "{src}"
     );
     assert!(!src.contains("lcall_table_"), "{src}");
@@ -753,22 +757,22 @@ fn lodsb__rep_lodsb_loads_last_byte_and_updates_regs() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("if cx() != 0 {"), "{src}");
+    assert!(src.contains("if r.cx() != 0 {"), "{src}");
     assert!(
-        src.contains("let delta: i32 = if DF() != 0 { -1 } else { 1 };"),
+        src.contains("let delta: i32 = if r.DF() != 0 { -1 } else { 1 };"),
         "{src}"
     );
     assert!(
         src.contains(
-            "set_al(memb(ds(), ((si() as i32 + (cx() as i32 - 1) * delta) & 0xFFFF) as u16));"
+            "r.set_al(r.memb(r.ds(), ((r.si() as i32 + (r.cx() as i32 - 1) * delta) & 0xFFFF) as u16));"
         ),
         "{src}"
     );
     assert!(
-        src.contains("set_si(((si() as i32 + cx() as i32 * delta) & 0xFFFF) as u16);"),
+        src.contains("r.set_si(((r.si() as i32 + r.cx() as i32 * delta) & 0xFFFF) as u16);"),
         "{src}"
     );
-    assert!(src.contains("set_cx(0);"), "{src}");
+    assert!(src.contains("r.set_cx(0);"), "{src}");
 }
 
 #[test]
@@ -782,7 +786,7 @@ fn lodsb__lodsb_respects_source_segment_override() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("set_al(memb(cs(), si()));"), "{src}");
+    assert!(src.contains("r.set_al(r.memb(r.cs(), r.si()));"), "{src}");
 }
 
 // ============================================================================
@@ -798,9 +802,9 @@ fn long_jump__ljmp_uses_long_jump() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("long_jump_(0x2000, 0x1000);"), "{src}");
-    let body = arm(&src, 0x0000);
-    assert!(body.contains("return;"), "{body}");
+    assert!(src.contains("r.long_jump_(0x2000, 0x1000);"), "{src}");
+    let body = blk(&src, 0x0000);
+    assert!(body.contains("return -1;"), "{body}");
 }
 
 #[test]
@@ -814,11 +818,11 @@ fn long_jump__ljmp_memory_operand() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("long_jump_(memw(cs(), 0x8AF), memw(cs(), 0x8AD));"),
+        src.contains("r.long_jump_(r.memw(r.cs(), 0x8AF), r.memw(r.cs(), 0x8AD));"),
         "{src}"
     );
-    let body = arm(&src, 0x0000);
-    assert!(body.contains("return;"), "{body}");
+    let body = blk(&src, 0x0000);
+    assert!(body.contains("return -1;"), "{body}");
 }
 
 #[test]
@@ -833,7 +837,7 @@ fn long_jump__ljmp_memory_operand_no_segment_prefix() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("long_jump_(memw(ds(), 0x2FFE), memw(ds(), 0x2FFC));"),
+        src.contains("r.long_jump_(r.memw(r.ds(), 0x2FFE), r.memw(r.ds(), 0x2FFC));"),
         "{src}"
     );
 }
@@ -860,15 +864,16 @@ fn loop_break__loop_with_conditional_break() {
     });
     let src = render_plain(&func, &[]);
     // the conditional break out of the loop
-    assert!(src.contains("if ZF() == 1 {"), "{src}");
-    assert!(src.contains("pc = 0x000A;"), "{src}");
+    assert!(src.contains("if r.ZF() == 1 {"), "{src}");
+    assert!(src.contains("return 0x000A;"), "{src}");
     // loop = dec cx + conditional back edge to the header
-    assert!(src.contains("set_cx(cx().wrapping_sub(1));"), "{src}");
-    assert!(src.contains("if cx() != 0 {"), "{src}");
-    assert!(src.contains("pc = 0x0000;"), "{src}");
+    assert!(src.contains("r.set_cx(r.cx().wrapping_sub(1));"), "{src}");
+    assert!(src.contains("if r.cx() != 0 {"), "{src}");
+    assert!(src.contains("return 0x0000;"), "{src}");
     // both rets emit their own pop-return epilogue
     assert_eq!(
-        src.matches("let popped_ip = memw(ss(), sp());").count(),
+        src.matches("let popped_ip = r.memw(r.ss(), r.sp());")
+            .count(),
         2,
         "{src}"
     );
@@ -890,15 +895,18 @@ fn loop_break__loop_conditional_return() {
     });
     let src = render_plain(&func, &[]);
     // the conditional exit: jne branches around the ret
-    assert!(src.contains("if ZF() == 0 {"), "{src}");
-    assert!(src.contains("pc = 0x000E;"), "{src}");
-    assert!(src.contains("let popped_ip = memw(ss(), sp());"), "{src}");
-    // the dec step and the back edge
+    assert!(src.contains("if r.ZF() == 0 {"), "{src}");
+    assert!(src.contains("return 0x000E;"), "{src}");
     assert!(
-        src.contains("set_cx((old.wrapping_sub(1) & 0xFFFF) as u16);"),
+        src.contains("let popped_ip = r.memw(r.ss(), r.sp());"),
         "{src}"
     );
-    assert!(src.contains("pc = 0x0000;"), "{src}");
+    // the dec step and the back edge
+    assert!(
+        src.contains("r.set_cx((old.wrapping_sub(1) & 0xFFFF) as u16);"),
+        "{src}"
+    );
+    assert!(src.contains("return 0x0000;"), "{src}");
 }
 
 #[test]
@@ -911,9 +919,9 @@ fn loop_break__xor_self_clears_with_flags() {
         ],
     });
     let src = render_plain(&func, &[]);
-    // self-xor lowers to the flag-setting helper — no inline flag writes
-    assert!(src.contains("xor8(ah_ptr(), ah());"), "{src}");
-    assert!(!src.contains("set_ZF"), "{src}");
+    // self-xor zeroes the register and sets the zero-result flags inline
+    assert!(src.contains("r.set_ah(0);"), "{src}");
+    assert!(src.contains("r.set_ZF(1);"), "{src}");
 }
 
 #[test]
@@ -934,13 +942,13 @@ fn loop_break__loop_invalidates_cx_before_dos_int() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("set_cx(0x5);"), "{src}");
-    assert!(src.contains("set_cx(cx().wrapping_sub(1));"), "{src}");
-    assert!(src.contains("pc = 0x0003;"), "{src}");
-    assert!(src.contains("set_ah(0x40);"), "{src}");
-    assert!(src.contains("dos_api();"), "{src}");
+    assert!(src.contains("r.set_cx(0x5);"), "{src}");
+    assert!(src.contains("r.set_cx(r.cx().wrapping_sub(1));"), "{src}");
+    assert!(src.contains("return 0x0003;"), "{src}");
+    assert!(src.contains("r.set_ah(0x40);"), "{src}");
+    assert!(src.contains("r.dos_api();"), "{src}");
     assert!(
-        src.find("set_ah(0x40);").unwrap() < src.find("dos_api();").unwrap(),
+        src.find("r.set_ah(0x40);").unwrap() < src.find("r.dos_api();").unwrap(),
         "{src}"
     );
 }
@@ -959,19 +967,19 @@ fn movsb_stosb__movsb_copies_byte_and_increments() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("let delta: i32 = if DF() != 0 { -1 } else { 1 };"),
+        src.contains("let delta: i32 = if r.DF() != 0 { -1 } else { 1 };"),
         "{src}"
     );
     assert!(
-        src.contains("memb_write(es(), di(), memb(ds(), si()));"),
+        src.contains("r.memb_write(r.es(), r.di(), r.memb(r.ds(), r.si()));"),
         "{src}"
     );
     assert!(
-        src.contains("set_si(((si() as i32 + delta) & 0xFFFF) as u16);"),
+        src.contains("r.set_si(((r.si() as i32 + delta) & 0xFFFF) as u16);"),
         "{src}"
     );
     assert!(
-        src.contains("set_di(((di() as i32 + delta) & 0xFFFF) as u16);"),
+        src.contains("r.set_di(((r.di() as i32 + delta) & 0xFFFF) as u16);"),
         "{src}"
     );
 }
@@ -986,7 +994,7 @@ fn movsb_stosb__rep_movsb_loops_and_updates_regs() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("rep_movsb_block(es(), ds());"), "{src}");
+    assert!(src.contains("r.rep_movsb_block(r.es(), r.ds());"), "{src}");
 }
 
 #[test]
@@ -1000,12 +1008,15 @@ fn movsb_stosb__stosb_stores_byte_and_increments() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("let delta: i32 = if DF() != 0 { -1 } else { 1 };"),
+        src.contains("let delta: i32 = if r.DF() != 0 { -1 } else { 1 };"),
         "{src}"
     );
-    assert!(src.contains("memb_write(es(), di(), al());"), "{src}");
     assert!(
-        src.contains("set_di(((di() as i32 + delta) & 0xFFFF) as u16);"),
+        src.contains("r.memb_write(r.es(), r.di(), r.al());"),
+        "{src}"
+    );
+    assert!(
+        src.contains("r.set_di(((r.di() as i32 + delta) & 0xFFFF) as u16);"),
         "{src}"
     );
 }
@@ -1020,7 +1031,7 @@ fn movsb_stosb__rep_stosb_uses_block_helper_and_updates_regs() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("rep_stosb_block(es());"), "{src}");
+    assert!(src.contains("r.rep_stosb_block(r.es());"), "{src}");
 }
 
 #[test]
@@ -1038,7 +1049,7 @@ fn movsb_stosb__movsb_respects_source_segment_override() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("memb_write(es(), di(), memb(cs(), si()));"),
+        src.contains("r.memb_write(r.es(), r.di(), r.memb(r.cs(), r.si()));"),
         "{src}"
     );
 }
@@ -1057,19 +1068,19 @@ fn movsw__movsw_copies_word_and_increments() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("let delta: i32 = if DF() != 0 { -2 } else { 2 };"),
+        src.contains("let delta: i32 = if r.DF() != 0 { -2 } else { 2 };"),
         "{src}"
     );
     assert!(
-        src.contains("memw_write(es(), di(), memw(ds(), si()));"),
+        src.contains("r.memw_write(r.es(), r.di(), r.memw(r.ds(), r.si()));"),
         "{src}"
     );
     assert!(
-        src.contains("set_si(((si() as i32 + delta) & 0xFFFF) as u16);"),
+        src.contains("r.set_si(((r.si() as i32 + delta) & 0xFFFF) as u16);"),
         "{src}"
     );
     assert!(
-        src.contains("set_di(((di() as i32 + delta) & 0xFFFF) as u16);"),
+        src.contains("r.set_di(((r.di() as i32 + delta) & 0xFFFF) as u16);"),
         "{src}"
     );
 }
@@ -1084,7 +1095,7 @@ fn movsw__rep_movsw_loops_and_updates_regs() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("rep_movsw_block(es(), ds());"), "{src}");
+    assert!(src.contains("r.rep_movsw_block(r.es(), r.ds());"), "{src}");
 }
 
 // ============================================================================
@@ -1117,10 +1128,10 @@ fn not__not_inverts_and_sets_zero_flag() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("set_al(((!((al()) as u32)) & 0xFF) as u8);"),
+        src.contains("r.set_al(((!((r.al()) as u32)) & 0xFF) as u8);"),
         "{src}"
     );
-    assert!(src.contains("set_ZF(((al()) == 0) as u8);"), "{src}");
+    assert!(src.contains("r.set_ZF(((r.al()) == 0) as u8);"), "{src}");
 }
 
 #[test]
@@ -1134,11 +1145,13 @@ fn not__not_memory_uses_write_helper() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("memb_write(cs(), 0xFF27, ((!((memb(cs(), 0xFF27)) as u32)) & 0xFF) as u8);"),
+        src.contains(
+            "r.memb_write(r.cs(), 0xFF27, ((!((r.memb(r.cs(), 0xFF27)) as u32)) & 0xFF) as u8);"
+        ),
         "{src}"
     );
     assert!(
-        src.contains("set_ZF(((memb(cs(), 0xFF27)) == 0) as u8);"),
+        src.contains("r.set_ZF(((r.memb(r.cs(), 0xFF27)) == 0) as u8);"),
         "{src}"
     );
 }
@@ -1160,7 +1173,7 @@ fn prefix__name_prefix_applied() {
     let src = render_rs(&func, &[0x0000], "foo_");
     assert!(src.contains("fn foo_dispatch("), "{src}");
     assert!(src.contains("fn foo_func_0000_impl("), "{src}");
-    assert!(src.contains("pc = 0x0100;"), "{src}");
+    assert!(src.contains("return 0x0100;"), "{src}");
     assert!(!src.contains("foo_func_0100()"), "{src}");
 }
 
@@ -1178,10 +1191,13 @@ fn push_pop__push_register() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("set_sp((sp().wrapping_sub(2)) & 0xFFFF);"),
+        src.contains("r.set_sp((r.sp().wrapping_sub(2)) & 0xFFFF);"),
         "{src}"
     );
-    assert!(src.contains("memw_write(ss(), sp(), ax());"), "{src}");
+    assert!(
+        src.contains("r.memw_write(r.ss(), r.sp(), r.ax());"),
+        "{src}"
+    );
 }
 
 #[test]
@@ -1195,10 +1211,13 @@ fn push_pop__push_immediate() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("set_sp((sp().wrapping_sub(2)) & 0xFFFF);"),
+        src.contains("r.set_sp((r.sp().wrapping_sub(2)) & 0xFFFF);"),
         "{src}"
     );
-    assert!(src.contains("memw_write(ss(), sp(), 0x1234);"), "{src}");
+    assert!(
+        src.contains("r.memw_write(r.ss(), r.sp(), 0x1234);"),
+        "{src}"
+    );
 }
 
 #[test]
@@ -1211,17 +1230,20 @@ fn push_pop__push_sp_uses_pre_decrement_value() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("let push_value = sp();"), "{src}");
+    assert!(src.contains("let push_value = r.sp();"), "{src}");
     assert!(
-        src.contains("set_sp((sp().wrapping_sub(2)) & 0xFFFF);"),
+        src.contains("r.set_sp((r.sp().wrapping_sub(2)) & 0xFFFF);"),
         "{src}"
     );
-    assert!(src.contains("memw_write(ss(), sp(), push_value);"), "{src}");
+    assert!(
+        src.contains("r.memw_write(r.ss(), r.sp(), push_value);"),
+        "{src}"
+    );
     // the capture happens BEFORE the decrement (286+ semantics)
     assert!(
-        src.find("let push_value = sp();").unwrap()
+        src.find("let push_value = r.sp();").unwrap()
             < src
-                .find("set_sp((sp().wrapping_sub(2)) & 0xFFFF);")
+                .find("r.set_sp((r.sp().wrapping_sub(2)) & 0xFFFF);")
                 .unwrap(),
         "{src}"
     );
@@ -1238,11 +1260,11 @@ fn push_pop__push_memory() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("set_sp((sp().wrapping_sub(2)) & 0xFFFF);"),
+        src.contains("r.set_sp((r.sp().wrapping_sub(2)) & 0xFFFF);"),
         "{src}"
     );
     assert!(
-        src.contains("memw_write(ss(), sp(), memw(es(), di()));"),
+        src.contains("r.memw_write(r.ss(), r.sp(), r.memw(r.es(), r.di()));"),
         "{src}"
     );
 }
@@ -1257,9 +1279,9 @@ fn push_pop__pop_register() {
         ],
     });
     let src = render_plain(&func, &[]);
-    assert!(src.contains("set_ax(memw(ss(), sp()));"), "{src}");
+    assert!(src.contains("r.set_ax(r.memw(r.ss(), r.sp()));"), "{src}");
     assert!(
-        src.contains("set_sp((sp().wrapping_add(2)) & 0xFFFF);"),
+        src.contains("r.set_sp((r.sp().wrapping_add(2)) & 0xFFFF);"),
         "{src}"
     );
 }
@@ -1276,11 +1298,11 @@ fn push_pop__pop_memory() {
     let src = render_plain(&func, &[]);
     // bp-based operands default to SS; -2 renders as the wrapping +0xFFFE
     assert!(
-        src.contains("memw_write(ss(), (((bp() as u32).wrapping_add(0xFFFEu32)) & 0xFFFF) as u16, memw(ss(), sp()));"),
+        src.contains("r.memw_write(r.ss(), (((r.bp() as u32).wrapping_add(0xFFFEu32)) & 0xFFFF) as u16, r.memw(r.ss(), r.sp()));"),
         "{src}"
     );
     assert!(
-        src.contains("set_sp((sp().wrapping_add(2)) & 0xFFFF);"),
+        src.contains("r.set_sp((r.sp().wrapping_add(2)) & 0xFFFF);"),
         "{src}"
     );
 }
@@ -1296,11 +1318,11 @@ fn push_pop__pop_memory_with_segment_override() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("memw_write(es(), di(), memw(ss(), sp()));"),
+        src.contains("r.memw_write(r.es(), r.di(), r.memw(r.ss(), r.sp()));"),
         "{src}"
     );
     assert!(
-        src.contains("set_sp((sp().wrapping_add(2)) & 0xFFFF);"),
+        src.contains("r.set_sp((r.sp().wrapping_add(2)) & 0xFFFF);"),
         "{src}"
     );
 }
@@ -1317,13 +1339,16 @@ fn push_pop__push_pop_pair_preserves_stack_effect() {
     });
     let src = render_plain(&func, &[]);
     assert!(
-        src.contains("set_sp((sp().wrapping_sub(2)) & 0xFFFF);"),
+        src.contains("r.set_sp((r.sp().wrapping_sub(2)) & 0xFFFF);"),
         "{src}"
     );
-    assert!(src.contains("memw_write(ss(), sp(), cs());"), "{src}");
-    assert!(src.contains("set_es(memw(ss(), sp()));"), "{src}");
     assert!(
-        src.contains("set_sp((sp().wrapping_add(2)) & 0xFFFF);"),
+        src.contains("r.memw_write(r.ss(), r.sp(), r.cs());"),
+        "{src}"
+    );
+    assert!(src.contains("r.set_es(r.memw(r.ss(), r.sp()));"), "{src}");
+    assert!(
+        src.contains("r.set_sp((r.sp().wrapping_add(2)) & 0xFFFF);"),
         "{src}"
     );
 }

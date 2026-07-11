@@ -93,10 +93,10 @@ fn while_loop__top_checked_condition_and_body() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert!(src.contains("if SF() == OF()"), "{src}");
-    assert!(src.contains("set_ax(bx());"), "{src}");
+    assert!(src.contains("if r.SF() == r.OF()"), "{src}");
+    assert!(src.contains("r.set_ax(r.bx());"), "{src}");
     // loop back edge to the cmp header
-    assert!(src.contains("pc = 0x0000;"), "{src}");
+    assert!(src.contains("return 0x0000;"), "{src}");
 }
 
 #[test]
@@ -115,12 +115,12 @@ fn while_loop__loop_instruction_decrements_cx() {
     let src = render_rs(&func, &[], "");
     // inc si (full flag block off `old`)
     assert!(
-        src.contains("set_si((old.wrapping_add(1) & 0xFFFF) as u16);"),
+        src.contains("r.set_si((old.wrapping_add(1) & 0xFFFF) as u16);"),
         "{src}"
     );
     // loop = dec cx + branch on cx != 0 back to the header
     assert!(src.contains("wrapping_sub(1)"), "{src}");
-    assert!(src.contains("pc = 0x0000;"), "{src}");
+    assert!(src.contains("return 0x0000;"), "{src}");
 }
 
 #[test]
@@ -140,10 +140,10 @@ fn while_loop__nested_if_conditions_present() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert!(src.contains("if SF() == OF()"), "{src}");
-    assert!(src.contains("if ZF() == 1"), "{src}");
+    assert!(src.contains("if r.SF() == r.OF()"), "{src}");
+    assert!(src.contains("if r.ZF() == 1"), "{src}");
     assert!(
-        src.contains("set_bx((old.wrapping_add(1) & 0xFFFF) as u16);"),
+        src.contains("r.set_bx((old.wrapping_add(1) & 0xFFFF) as u16);"),
         "{src}"
     );
 }
@@ -163,14 +163,14 @@ fn while_loop__initialization_before_loop_rendered_first() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    // The init executes in the entry block, before the loop-header arm.
+    // The init executes in the entry block, not in the loop-header block.
+    let entry = blk(&src, 0x0000);
     assert!(
-        src.contains("set_cx(0x0);") || src.contains("set_cx(0);"),
+        entry.contains("r.set_cx(0x0);") || entry.contains("r.set_cx(0);"),
         "{src}"
     );
-    let init = src.find("set_cx(0").unwrap();
-    let header_arm = src.find("0x0004 => {").expect("loop header arm");
-    assert!(init < header_arm, "{src}");
+    let header = blk(&src, 0x0004);
+    assert!(!header.contains("r.set_cx(0"), "{src}");
 }
 
 #[test]
@@ -185,11 +185,11 @@ fn while_loop__do_while_back_edge_on_zf() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert!(src.contains("set_dl(0xFF);"), "{src}");
-    assert!(src.contains("dos_api();"), "{src}");
+    assert!(src.contains("r.set_dl(0xFF);"), "{src}");
+    assert!(src.contains("r.dos_api();"), "{src}");
     // the back edge re-enters the loop head on ZF == 0
-    assert!(src.contains("if ZF() == 0"), "{src}");
-    assert!(src.contains("pc = 0x0000;"), "{src}");
+    assert!(src.contains("if r.ZF() == 0"), "{src}");
+    assert!(src.contains("return 0x0000;"), "{src}");
 }
 
 #[test]
@@ -208,12 +208,12 @@ fn while_loop__conditional_back_edge() {
     });
     let src = render_rs(&func, &[], "");
     assert!(
-        src.contains("set_dx((old.wrapping_add(1) & 0xFFFF) as u16);"),
+        src.contains("r.set_dx((old.wrapping_add(1) & 0xFFFF) as u16);"),
         "{src}"
     );
     // jae takes the back edge on CF == 0
-    assert!(src.contains("if CF() == 0"), "{src}");
-    assert!(src.contains("pc = 0x0000;"), "{src}");
+    assert!(src.contains("if r.CF() == 0"), "{src}");
+    assert!(src.contains("return 0x0000;"), "{src}");
 }
 
 #[test]
@@ -232,11 +232,11 @@ fn while_loop__cond_prev_annotation_respected() {
     });
     let src = render_rs(&func, &[], "");
     assert!(
-        src.contains("set_bx((old.wrapping_add(1) & 0xFFFF) as u16);"),
+        src.contains("r.set_bx((old.wrapping_add(1) & 0xFFFF) as u16);"),
         "{src}"
     );
-    assert!(src.contains("if ZF() == 1"), "{src}");
-    assert!(src.contains("pc = 0x0000;"), "{src}");
+    assert!(src.contains("if r.ZF() == 1"), "{src}");
+    assert!(src.contains("return 0x0000;"), "{src}");
 }
 
 #[test]
@@ -253,11 +253,11 @@ fn while_loop__dec_dx_jne_branches_on_zf() {
     });
     let src = render_rs(&func, &[], "");
     assert!(
-        src.contains("set_dx((old.wrapping_sub(1) & 0xFFFF) as u16);"),
+        src.contains("r.set_dx((old.wrapping_sub(1) & 0xFFFF) as u16);"),
         "{src}"
     );
-    assert!(src.contains("if ZF() == 0"), "{src}");
-    assert!(src.contains("pc = 0x0005;"), "{src}");
+    assert!(src.contains("if r.ZF() == 0"), "{src}");
+    assert!(src.contains("return 0x0005;"), "{src}");
 }
 
 // ===========================================================================
@@ -274,8 +274,8 @@ fn xlatb__loads_table_byte() {
     });
     let src = render_rs(&func, &[], "");
     // al <- [ds:(bx+al) & 0xFFFF]
-    assert!(src.contains("memb(ds()"), "{src}");
-    assert!(src.contains("set_al("), "{src}");
+    assert!(src.contains("r.memb(r.ds()"), "{src}");
+    assert!(src.contains("r.set_al("), "{src}");
     assert!(src.contains("& 0xFFFF"), "{src}");
 }
 
@@ -290,7 +290,7 @@ fn xlatb__respects_segment_override() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert!(src.contains("memb(cs()"), "{src}");
+    assert!(src.contains("r.memb(r.cs()"), "{src}");
 }
 
 // ===========================================================================
@@ -312,7 +312,7 @@ fn jcc_after_push__condition_survives_push() {
         ],
     });
     let src = render_rs(&func, &[0x0008], "app_");
-    assert!(src.contains("if ZF() == 1"), "{src}");
+    assert!(src.contains("if r.ZF() == 1"), "{src}");
 }
 
 // ===========================================================================
@@ -386,7 +386,7 @@ fn lodsb_jmp_jcc__jmp_over_lodsb_drops_prev_condition() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert!(src.contains("if ZF() == 0"), "{src}");
+    assert!(src.contains("if r.ZF() == 0"), "{src}");
     assert!(!src.contains("unsupported jcc"), "{src}");
 }
 
@@ -410,10 +410,11 @@ fn loop_exit_consumed__exit_block_rendered_once() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert_eq!(src.matches("set_bx(bx());").count(), 1, "{src}");
+    assert_eq!(src.matches("r.set_bx(r.bx());").count(), 1, "{src}");
     // both ret instructions emit their own pop-return epilogue
     assert_eq!(
-        src.matches("let popped_ip = memw(ss(), sp());").count(),
+        src.matches("let popped_ip = r.memw(r.ss(), r.sp());")
+            .count(),
         2,
         "{src}"
     );
@@ -437,16 +438,16 @@ fn loop_header_work__header_instructions_preserved() {
     });
     let src = render_rs(&func, &[], "");
     assert!(
-        src.contains("let delta: i32 = if DF() != 0 { -1 } else { 1 };"),
+        src.contains("let delta: i32 = if r.DF() != 0 { -1 } else { 1 };"),
         "{src}"
     );
-    assert!(src.contains("set_al(memb(ds(), si()));"), "{src}");
+    assert!(src.contains("r.set_al(r.memb(r.ds(), r.si()));"), "{src}");
     assert!(
-        src.contains("set_si(((si() as i32 + delta) & 0xFFFF) as u16);"),
+        src.contains("r.set_si(((r.si() as i32 + delta) & 0xFFFF) as u16);"),
         "{src}"
     );
     assert!(
-        src.contains("set_cx((old.wrapping_add(1) & 0xFFFF) as u16);"),
+        src.contains("r.set_cx((old.wrapping_add(1) & 0xFFFF) as u16);"),
         "{src}"
     );
 }
@@ -467,8 +468,8 @@ fn or_jcc_preserved__or_followed_by_jcc_preserved() {
     });
     let src = render_rs(&func, &[], "");
     // the or writes ax and its flags are USED by the je — not dropped
-    assert!(src.contains("| (bx()) as u32"), "{src}");
-    assert!(src.contains("if ZF() == 1"), "{src}");
+    assert!(src.contains("| (r.bx()) as u32"), "{src}");
+    assert!(src.contains("if r.ZF() == 1"), "{src}");
 }
 
 // ===========================================================================
@@ -545,9 +546,11 @@ fn abi_runtime_calls(src: &str) -> BTreeSet<String> {
     .into_iter()
     .collect();
     // The translator's own coined names: `<chunkname>_func_NNNN_impl`,
-    // `<chunkname>_dispatch` (chunk names carry several `_`-separated segments,
-    // e.g. jit_17330_0000_<sha>_func_0000_impl).
-    let coined = Regex::new(r"^(\w+_)*(func_[0-9A-Fa-f]+_impl|dispatch)$").unwrap();
+    // `<chunkname>_blk_NNNN` (per-block fns), `<chunkname>_dispatch` (chunk
+    // names carry several `_`-separated segments, e.g.
+    // jit_17330_0000_<sha>_func_0000_impl).
+    let coined =
+        Regex::new(r"^(\w+_)*(func_[0-9A-Fa-f]+_impl|blk_[0-9A-Fa-f]+|dispatch)$").unwrap();
 
     let mut out = BTreeSet::new();
     for c in call_re.captures_iter(&src) {
@@ -663,12 +666,15 @@ fn runtime_abi_contract__generated_artifacts_respect_abi_if_present() {
 }
 
 // ===========================================================================
-// Instrumentation invariant: every instruction gets `set_ip(0xNNNN);` followed
-// by `SAFEPOINT();` — including loop back-edge blocks.
+// Instrumentation invariant: every instruction gets `set_ip(0xNNNN);`, and
+// every basic block opens with one `JIT_BUDGET(n);` poll (n = the block's
+// summed per-class instruction weights) right after the block-head set_ip —
+// including loop back-edge blocks, so tight loops still hit the safepoint
+// slow path.
 // ===========================================================================
 
 #[test]
-fn safe_point_insertion__every_instruction_pairs_ip_and_safepoint() {
+fn safe_point_insertion__block_head_budget_poll_after_ip() {
     let func = json!({
         "start": 0x0000,
         "instructions": [
@@ -681,17 +687,19 @@ fn safe_point_insertion__every_instruction_pairs_ip_and_safepoint() {
     let ip_lines: Vec<usize> = lines
         .iter()
         .enumerate()
-        .filter(|(_, l)| l.starts_with("set_ip(0x"))
+        .filter(|(_, l)| l.starts_with("r.set_ip(0x"))
         .map(|(i, _)| i)
         .collect();
     assert_eq!(ip_lines.len(), 2, "{src}");
-    for i in ip_lines {
-        assert_eq!(lines[i + 1], "SAFEPOINT();", "{src}");
-    }
+    // one poll for the whole 2-instruction block (weights: mov reg,reg 1 +
+    // ret 3), directly after the head set_ip
+    assert_eq!(lines[ip_lines[0] + 1], "r.budget(4);", "{src}");
+    assert_eq!(src.matches("r.budget(").count(), 1, "{src}");
+    assert_eq!(src.matches("SAFEPOINT();").count(), 0, "{src}");
 }
 
 #[test]
-fn safe_point_insertion__loop_back_edge_block_has_safepoint() {
+fn safe_point_insertion__loop_back_edge_block_has_budget_poll() {
     let func = json!({
         "start": 0x0000,
         "instructions": [
@@ -704,16 +712,11 @@ fn safe_point_insertion__loop_back_edge_block_has_safepoint() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    // the body block (inc cx + back edge) is its own arm and is instrumented
-    let arm = src
-        .split("0x0008 => {")
-        .nth(1)
-        .expect("body arm present")
-        .split("=> {")
-        .next()
-        .unwrap();
-    assert!(arm.contains("SAFEPOINT();"), "{arm}");
-    assert!(arm.contains("pc = 0x0003;"), "{arm}");
+    // the body block (inc cx + back edge) is its own block fn and is
+    // instrumented (weights: inc 1 + jmp 2)
+    let arm = blk(&src, 0x0008);
+    assert!(arm.contains("r.budget(3);"), "{arm}");
+    assert!(arm.contains("return 0x0003;"), "{arm}");
 }
 
 // ===========================================================================
@@ -732,5 +735,5 @@ fn shared_block_after_uncond_jmp__rendered_once() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert_eq!(src.matches("set_ip(0x0002);").count(), 1, "{src}");
+    assert_eq!(src.matches("r.set_ip(0x0002);").count(), 1, "{src}");
 }

@@ -46,20 +46,34 @@ extern "C" fn opl2_port_read(port: u16) -> u8 {
     unsafe {
         let o = &mut *s();
         if port == 0x388 {
+            // YM3812 status: bit7 = IRQ (set when EITHER unmasked timer
+            // overflows), bit6 = timer-1 overflow, bit5 = timer-2 overflow;
+            // D4-D0 read as 0 (there is no "busy" status bit — the required
+            // write delay is a bus-timing constraint, not a flag). The
+            // canonical AdLib timer/presence check starts timer 1 and waits
+            // for (status & 0xE0) == 0xC0. The old model set the WRONG bits —
+            // timer-1 raised bit7 (0x80) alone and timer-2 raised bit6 (0x40),
+            // with no combined-IRQ bit — so that handshake never matched its
+            // expected 0xC0 and a driver polling for it could spin. Zeliard is
+            // configured for AdLib (resource.cfg: MSCADLIB.DRV/SNDADLIB.DRV),
+            // so every shop's music-init runs this path; entering a building
+            // (verified: the church) now works. bit0's phantom "busy" flag is
+            // also removed — no such YM3812 status bit exists.
             let now_us = shim_scaled_monotonic_ns() / 1000;
+            let mask = o.registers[0x04];
             if o.timer1_expire_us != 0 && now_us >= o.timer1_expire_us {
-                o.status |= 0x80;
+                if mask & 0x40 == 0 {
+                    o.status |= 0xC0; // IRQ | T1
+                }
                 o.timer1_expire_us = 0;
             }
             if o.timer2_expire_us != 0 && now_us >= o.timer2_expire_us {
-                o.status |= 0x40;
+                if mask & 0x20 == 0 {
+                    o.status |= 0xA0; // IRQ | T2
+                }
                 o.timer2_expire_us = 0;
             }
-            let mut status = o.status;
-            if now_us < o.busy_until_us {
-                status |= 0x01; // busy flag
-            }
-            return status;
+            return o.status;
         }
         // port == 0x389
         o.registers[o.address as usize]
@@ -75,21 +89,19 @@ extern "C" fn opl2_port_write(port: u16, value: u8) {
             return;
         }
         // port == 0x389
-        o.registers[o.address as usize] = value;
         let now_us = shim_scaled_monotonic_ns() / 1000;
         o.busy_until_us = now_us + OPL2_BUSY_DURATION_US;
+        if o.address == 0x04 && value & 0x80 != 0 {
+            // IRQ-RESET write: clears the status flag bits; every other bit
+            // of this write is IGNORED (the register keeps its old value —
+            // the mask/start bits do not change). YM3812 datasheet semantics.
+            o.status &= !0xE0;
+            return;
+        }
+        o.registers[o.address as usize] = value;
         if o.address == 0x04 {
-            if value & 0x80 != 0 {
-                o.status &= !0xC0; // reset timer overflow flags
-                o.timer1_expire_us = 0;
-                o.timer2_expire_us = 0;
-            }
-            if value & 0x20 != 0 {
-                o.status &= !0x80; // mask timer 1 flag
-            }
-            if value & 0x40 != 0 {
-                o.status &= !0x40; // mask timer 2 flag
-            }
+            // bit0/bit1 start (or stop) timer 1/2; the mask bits (bit6/bit5)
+            // gate flag SETTING and are consulted live at expiry.
             if value & 0x01 != 0 {
                 let timer_val = o.registers[0x02];
                 let mut delay = (256 - timer_val as u64) * OPL2_TIMER1_TICK_US;

@@ -342,18 +342,33 @@ fn test_inb_joystick_port_returns_ff() {
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 #[test]
-fn test_inb_vga_status_toggles_bit3() {
+fn test_inb_vga_status_follows_cga_raster() {
     let _g = guard();
     let lib = ShimLib::load();
     unsafe {
         let inb: unsafe extern "C" fn(u16) -> u8 = lib.func("inb");
-        let first = inb(0x3DA);
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let second = inb(0x3DA);
-        assert!((first ^ second) & 0x08 != 0);
-        assert!((first ^ second) & 0x01 != 0);
-        assert_eq!((first & 0x08) == 0, (first & 0x01) != 0);
-        assert_eq!((second & 0x08) == 0, (second & 0x01) != 0);
+        // The status register is a pure function of VIRTUAL time (the 6845
+        // raster position on the shared 14.318MHz crystal): line period
+        // 63,695ns × 262 lines/frame; 200 visible lines with a ~44.7µs
+        // active region; vsync pulse = lines 224..240. Park the clock at
+        // known raster positions and read the bits.
+        let vnow = lib.global_ptr::<u64>("virtual_now_accum_ns");
+        const LINE_NS: u64 = 63_695;
+        const FRAME_NS: u64 = LINE_NS * 262;
+        let base = (*vnow / FRAME_NS + 2) * FRAME_NS;
+        // visible line, active display: no retrace bits
+        *vnow = base + 100 * LINE_NS + 10_000;
+        assert_eq!(inb(0x3DA) & 0x09, 0x00);
+        // visible line, horizontal blank: display-disable only
+        *vnow = base + 100 * LINE_NS + 50_000;
+        assert_eq!(inb(0x3DA) & 0x09, 0x01);
+        // vertical blank before the sync pulse: display-disable only
+        *vnow = base + 210 * LINE_NS + 10_000;
+        assert_eq!(inb(0x3DA) & 0x09, 0x01);
+        // vsync pulse: BOTH bits (display is disabled during vsync too —
+        // the old square-wave model wrongly made them mutually exclusive)
+        *vnow = base + 230 * LINE_NS + 10_000;
+        assert_eq!(inb(0x3DA) & 0x09, 0x09);
     }
 }
 
@@ -388,13 +403,38 @@ fn test_opl2_ports_store_register() {
         let opl2 = lib.global_ptr::<Opl2State>("opl2");
 
         outb(0x388, 0x20);
-        assert!(inb(0x388) & 1 != 0);
         outb(0x389, 0x7F);
         assert_eq!((*opl2).address, 0x20);
         assert_eq!((*opl2).registers[0x20], 0x7F);
-        std::thread::sleep(std::time::Duration::from_millis(2));
         assert_eq!(inb(0x389), 0x7F);
-        assert_eq!(inb(0x388) & 1, 0);
+        // YM3812 status: D4-D0 read as 0 — there is no "busy" status bit
+        // (the write delay is a bus-timing constraint, not a flag).
+        assert_eq!(inb(0x388) & 0x1F, 0);
+
+        // The AdLib presence check, as the official driver performs it:
+        // mask both timers + IRQ-reset -> flags clear; latch timer 1 = 0xFF,
+        // start it unmasked; ≥80µs later (status & 0xE0) == 0xC0 (IRQ | T1).
+        // Timer expiry follows VIRTUAL time — advance the clock.
+        outb(0x388, 0x04);
+        outb(0x389, 0x60);
+        outb(0x388, 0x04);
+        outb(0x389, 0x80);
+        assert_eq!(inb(0x388) & 0xE0, 0);
+        outb(0x388, 0x02);
+        outb(0x389, 0xFF);
+        outb(0x388, 0x04);
+        outb(0x389, 0x21);
+        let vnow = lib.global_ptr::<u64>("virtual_now_accum_ns");
+        *vnow += 2_000_000;
+        assert_eq!(inb(0x388) & 0xE0, 0xC0);
+        // Cleanup mask + reset clears the flags (and ONLY the reset write's
+        // bit 7 acts — the register keeps the 0x60 mask value).
+        outb(0x388, 0x04);
+        outb(0x389, 0x60);
+        outb(0x388, 0x04);
+        outb(0x389, 0x80);
+        assert_eq!(inb(0x388) & 0xE0, 0);
+        assert_eq!((*opl2).registers[0x04], 0x60);
     }
 }
 

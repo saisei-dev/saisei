@@ -98,6 +98,7 @@ extern "C" {
         line: c_int,
     );
     fn safe_point_impl(file: *const c_char, func: *const c_char, line: c_int);
+    fn shim_idle_wait();
     fn save_manager_sr_log(fmt: *const c_char, ...);
     // C stdio stream globals (not exposed by the libc crate; glibc exports them).
     static mut stdout: *mut libc::FILE;
@@ -286,7 +287,7 @@ pub extern "C" fn dos_read_char_impl(file: *const c_char, func: *const c_char, l
             }
             return 0;
         }
-        safepoint();
+        unsafe { shim_idle_wait() };
     }
 }
 
@@ -435,7 +436,7 @@ pub extern "C" fn dos_buffered_input_impl(
         let mut ascii: u8 = 0;
         let mut scan: u8 = 0;
         if kbd_bios_pop(&mut ascii, &mut scan) == 0 {
-            safepoint();
+            unsafe { shim_idle_wait() };
             continue;
         }
         if ascii == 0x0D {
@@ -815,7 +816,7 @@ pub extern "C" fn dos_console_input_no_echo_impl(
             }
             return 0;
         }
-        safepoint();
+        unsafe { shim_idle_wait() };
     }
 }
 

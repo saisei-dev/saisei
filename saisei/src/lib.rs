@@ -436,6 +436,91 @@ pub fn build_with(root: &Path, game: &GameDef, features: &[String]) -> PathBuf {
     compile_game(root, game, &config_source, features)
 }
 
+/// `build --warm`: after building, drive the REAL program headless for
+/// `secs` seconds so the JIT populates the bundle's chunk cache with exactly
+/// the code the boot path executes (plus everything the per-segment
+/// speculative pre-compile discovers from it). No ahead-of-time decode and no
+/// heuristics — the warm cache is the byproduct of a real run, so a shipped
+/// bundle's first `saisei play` starts hot. The cache is content-addressed;
+/// re-warming is idempotent and killing the run mid-compile is safe.
+pub fn warm_game_cache(root: &Path, game: &GameDef, secs: u64) {
+    let binary_path = build(root, game);
+    let runtime_dir = copy_runtime(root, game);
+    let env = game_process_env(root, game);
+
+    println!(
+        "warm: running {} headless for {secs}s to populate the JIT cache",
+        game.key
+    );
+    let child = Command::new(format!(
+        "./{}",
+        binary_path.file_name().unwrap().to_string_lossy()
+    ))
+    .args(["--headless", "--speedup", "1"])
+    .current_dir(&runtime_dir)
+    .env_clear()
+    .envs(&env)
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => die(&format!("warm: failed to launch game: {e}")),
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                println!("warm: game exited early ({status}) — cache keeps what it reached");
+                break;
+            }
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(200)),
+            Err(_) => break,
+        }
+    }
+
+    // The runtime detaches one `saisei-jitc speculate` per segment; those
+    // children keep filling the cache after the game dies. Wait for the jit
+    // dir to go quiet (no new/updated files for 5s, capped at 10 minutes).
+    let jit_dir = root.join("build").join(&game.key).join("jit");
+    let newest_mtime = |dir: &Path| -> Option<std::time::SystemTime> {
+        std::fs::read_dir(dir)
+            .ok()?
+            .flatten()
+            .filter_map(|e| e.metadata().ok()?.modified().ok())
+            .max()
+    };
+    let quiesce_cap = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    while std::time::Instant::now() < quiesce_cap {
+        let before = newest_mtime(&jit_dir);
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        if newest_mtime(&jit_dir) == before {
+            break;
+        }
+        println!("warm: speculative compiles still running...");
+    }
+    let (mut chunks, mut bytes) = (0u64, 0u64);
+    if let Ok(rd) = std::fs::read_dir(&jit_dir) {
+        for e in rd.flatten() {
+            if e.path().extension().map_or(false, |x| x == "so") {
+                chunks += 1;
+                bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+        }
+    }
+    println!(
+        "warm: cache ready — {chunks} compiled chunk(s), {:.1} MB in {}",
+        bytes as f64 / 1e6,
+        jit_dir.display()
+    );
+}
+
 #[derive(Default)]
 struct RunOpts {
     headless: bool,
@@ -451,29 +536,9 @@ struct RunOpts {
     features: Vec<String>,
 }
 
-fn run_game(root: &Path, game: &GameDef, o: &RunOpts) -> ! {
-    let binary_path = build_with(root, game, &o.features);
-    let runtime_dir = copy_runtime(root, game);
-
-    let mut cmd = vec![format!(
-        "./{}",
-        binary_path.file_name().unwrap().to_string_lossy()
-    )];
-    if o.headless {
-        cmd.push("--headless".into());
-    }
-    cmd.push("--speedup".into());
-    cmd.push(format!("{}", o.speedup));
-    if let Some(r) = &o.restore_from {
-        cmd.push("--restore-from".into());
-        cmd.push(
-            std::fs::canonicalize(r)
-                .unwrap_or_else(|_| PathBuf::from(r))
-                .display()
-                .to_string(),
-        );
-    }
-
+/// The environment every game process gets (run, play, and the build --warm
+/// cache run): repo root, translator path, per-game JIT cache dir, git hash.
+fn game_process_env(root: &Path, game: &GameDef) -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> = std::env::vars().collect();
     env.insert("SAISEI_REPO_ROOT".into(), root.display().to_string());
     // Crash manifests carry the repo git hash (runtime_version in shims.rs);
@@ -504,6 +569,33 @@ fn run_game(root: &Path, game: &GameDef, o: &RunOpts) -> ! {
             .display()
             .to_string(),
     );
+    env
+}
+
+fn run_game(root: &Path, game: &GameDef, o: &RunOpts) -> ! {
+    let binary_path = build_with(root, game, &o.features);
+    let runtime_dir = copy_runtime(root, game);
+
+    let mut cmd = vec![format!(
+        "./{}",
+        binary_path.file_name().unwrap().to_string_lossy()
+    )];
+    if o.headless {
+        cmd.push("--headless".into());
+    }
+    cmd.push("--speedup".into());
+    cmd.push(format!("{}", o.speedup));
+    if let Some(r) = &o.restore_from {
+        cmd.push("--restore-from".into());
+        cmd.push(
+            std::fs::canonicalize(r)
+                .unwrap_or_else(|_| PathBuf::from(r))
+                .display()
+                .to_string(),
+        );
+    }
+
+    let mut env = game_process_env(root, game);
     if o.verbose {
         env.insert("SAISEI_VERBOSE".into(), "1".into());
     }
@@ -626,10 +718,20 @@ pub fn run() {
         "build" => {
             let mut program = None;
             let mut game_name = None;
+            let mut warm = false;
+            let mut warm_secs: u64 = 60;
             let mut it = rest.iter();
             while let Some(a) = it.next() {
                 match a.as_str() {
                     "--program" => program = it.next().cloned(),
+                    "--warm" => warm = true,
+                    "--warm-secs" => {
+                        warm = true;
+                        warm_secs = it
+                            .next()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or_else(|| die("--warm-secs needs a number of seconds"));
+                    }
                     other if other.starts_with("--") => die(&format!("unknown flag: {other}")),
                     other => game_name = Some(other.to_string()),
                 }
@@ -639,7 +741,11 @@ pub fn run() {
                 &game_name.unwrap_or_else(|| die("build needs a game name")),
                 program.as_deref(),
             );
-            build(&root, &game);
+            if warm {
+                warm_game_cache(&root, &game, warm_secs);
+            } else {
+                build(&root, &game);
+            }
         }
         "copy-runtime" => {
             let mut program = None;

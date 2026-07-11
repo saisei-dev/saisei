@@ -25,11 +25,11 @@ fn dos_get_version_rendered_before_if() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert!(src.contains("set_ah(0x30);"), "{src}");
-    assert!(src.contains("dos_api();"), "{src}");
-    assert!(src.contains("if CF() == 1"), "{src}");
+    assert!(src.contains("r.set_ah(0x30);"), "{src}");
+    assert!(src.contains("r.dos_api();"), "{src}");
+    assert!(src.contains("if r.CF() == 1"), "{src}");
     // The DOS call executes before the branch on its CF result.
-    assert!(src.find("dos_api();").unwrap() < src.find("if CF() == 1").unwrap());
+    assert!(src.find("r.dos_api();").unwrap() < src.find("if r.CF() == 1").unwrap());
 }
 
 #[test]
@@ -45,10 +45,15 @@ fn if_else_statement_is_structured() {
         ],
     });
     let src = render_rs(&func, &[0x0000, 0x1000, 0x2000], "g_");
-    // Both jcc arms exist and each branch reaches its own call target.
-    assert!(src.contains("if ZF() == 1"), "{src}");
-    assert!(src.contains("pc = 0x1000;"), "{src}");
-    assert!(src.contains("pc = 0x2000;"), "{src}");
+    // Both jcc arms exist: the branch block's if/else yields each successor pc…
+    let b0 = blk(&src, 0x0000);
+    assert!(b0.contains("if r.ZF() == 1"), "{src}");
+    assert!(b0.contains("return 0x0008;"), "{src}");
+    assert!(b0.contains("return 0x0002;"), "{src}");
+    // …and each branch's block reaches its own call target (intra-chunk call
+    // renders as `return 0x…;` — the next pc — in that per-block fn).
+    assert!(blk(&src, 0x0002).contains("return 0x1000;"), "{src}");
+    assert!(blk(&src, 0x0008).contains("return 0x2000;"), "{src}");
 }
 
 #[test]

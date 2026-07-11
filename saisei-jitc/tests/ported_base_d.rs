@@ -14,7 +14,7 @@
 //!              Rust backend) and terminates__on_noreturn_funcs (the private
 //!              _terminates/_NORETURN_FUNCS check re-expressed as the
 //!              observable state-machine behavior: a noreturn runtime call ends
-//!              its arm with `return;` and drops the unreachable tail).
+//!              its block with `return -1;` and drops the unreachable tail).
 //!              Purely C-structural assertions dropped from otherwise-ported
 //!              tests: switch__* (×4: the translate-time jump-table decode via
 //!              code_bytes and the C `switch`/case-label structuring have no
@@ -53,19 +53,6 @@ fn reloc_render(insn: Value, reloc_off: i64) -> String {
     render_rs_ir(&ir, &[], "").expect("emit_rust")
 }
 
-/// Slice out one dispatch-match arm (`0xNNNN => { ... }`) from a chunk text.
-/// Arms close with a brace at 12-space indent; inner blocks are deeper.
-fn arm(src: &str, addr: i64) -> String {
-    let key = format!("0x{addr:04X} => {{");
-    src.split(&key)
-        .nth(1)
-        .unwrap_or_else(|| panic!("arm {key} must exist in:\n{src}"))
-        .split("\n            }")
-        .next()
-        .unwrap()
-        .to_string()
-}
-
 // ===========================================================================
 // ===========================================================================
 
@@ -90,17 +77,17 @@ fn rcl__rotates_through_cf() {
         "{src}"
     );
     assert!(
-        src.contains("tmp = ((((tmp as u32) << 1) | (CF() as u32)) & 0xFFFF) as u16;"),
+        src.contains("tmp = ((((tmp as u32) << 1) | (r.CF() as u32)) & 0xFFFF) as u16;"),
         "{src}"
     );
-    assert!(src.contains("set_CF(new_cf);"), "{src}");
+    assert!(src.contains("r.set_CF(new_cf);"), "{src}");
     assert!(src.contains("if orig_count == 1 {"), "{src}");
     assert!(
-        src.contains("set_OF((((tmp >> 15) & 1) as u8) ^ CF());"),
+        src.contains("r.set_OF((((tmp >> 15) & 1) as u8) ^ r.CF());"),
         "{src}"
     );
     // rcl affects only CF/OF — no unconditional OF clear, no ZF/PF/SF writes
-    assert!(!src.contains("set_OF(0)"), "{src}");
+    assert!(!src.contains("r.set_OF(0)"), "{src}");
     assert!(!src.contains("set_ZF"), "{src}");
     assert!(!src.contains("set_PF"), "{src}");
     assert!(!src.contains("set_SF"), "{src}");
@@ -126,14 +113,14 @@ fn rcr__register_translate() {
     assert!(src.contains("let orig_count = count;"), "{src}");
     assert!(src.contains("let new_cf: u8 = (tmp & 1) as u8;"), "{src}");
     assert!(
-        src.contains("tmp = ((((tmp as u32) >> 1) | ((CF() as u32) << 15)) & 0xFFFF) as u16;"),
+        src.contains("tmp = ((((tmp as u32) >> 1) | ((r.CF() as u32) << 15)) & 0xFFFF) as u16;"),
         "{src}"
     );
     assert!(
-        src.contains("set_OF((((tmp >> 15) & 1) ^ ((tmp >> 14) & 1)) as u8);"),
+        src.contains("r.set_OF((((tmp >> 15) & 1) ^ ((tmp >> 14) & 1)) as u8);"),
         "{src}"
     );
-    assert!(!src.contains("set_OF(0)"), "{src}");
+    assert!(!src.contains("r.set_OF(0)"), "{src}");
     assert!(!src.contains("set_ZF"), "{src}");
     assert!(!src.contains("set_SF"), "{src}");
     assert!(!src.contains("set_PF"), "{src}");
@@ -153,7 +140,7 @@ fn relocation__lcall_immediate_segment_is_relocated() {
     );
     assert!(
         src.contains(
-            "lcall_table_(((0x15190u32).wrapping_add(0x10100).wrapping_sub((cs() as u32) << 4)) as u16, \
+            "r.lcall_table_(((0x15190u32).wrapping_add(0x10100).wrapping_sub((r.cs() as u32) << 4)) as u16, \
              0x1010, 0x0000);"
         ),
         "{src}"
@@ -169,7 +156,7 @@ fn relocation__lcall_immediate_segment_not_relocated_unchanged() {
     let src = render_rs(&func, &[], "");
     assert!(
         src.contains(
-            "lcall_table_(((0x105u32).wrapping_add(0x10100).wrapping_sub((cs() as u32) << 4)) as u16, \
+            "r.lcall_table_(((0x105u32).wrapping_add(0x10100).wrapping_sub((r.cs() as u32) << 4)) as u16, \
              0x06C0, 0x04A7);"
         ),
         "{src}"
@@ -184,7 +171,7 @@ fn relocation__ljmp_immediate_segment_is_relocated() {
                "bytes": "ea00010000"}),
         0x2003,
     );
-    assert!(src.contains("long_jump_(0x1010, 0x0100);"), "{src}");
+    assert!(src.contains("r.long_jump_(0x1010, 0x0100);"), "{src}");
 }
 
 // ===========================================================================
@@ -202,15 +189,15 @@ fn repe__cmpsb_translates_faithful_inline() {
     });
     let src = render_rs(&func, &[], "");
     assert!(
-        src.contains("let delta: i32 = if DF() != 0 { -1 } else { 1 };"),
+        src.contains("let delta: i32 = if r.DF() != 0 { -1 } else { 1 };"),
         "{src}"
     );
-    assert!(src.contains("lv = memb(ds(), si());"), "{src}");
-    assert!(src.contains("rv = memb(es(), di());"), "{src}");
+    assert!(src.contains("lv = r.memb(r.ds(), r.si());"), "{src}");
+    assert!(src.contains("rv = r.memb(r.es(), r.di());"), "{src}");
     assert!(src.contains("if lv != rv { break; }"), "{src}"); // ZF->0 ends repe
-    assert!(src.contains("set_cx(count.wrapping_sub(i));"), "{src}"); // remaining count
-    assert!(src.contains("set_ZF((res == 0) as u8);"), "{src}");
-    assert!(src.contains("set_CF((l32 < r32) as u8);"), "{src}");
+    assert!(src.contains("r.set_cx(count.wrapping_sub(i));"), "{src}"); // remaining count
+    assert!(src.contains("r.set_ZF((res == 0) as u8);"), "{src}");
+    assert!(src.contains("r.set_CF((l32 < r32) as u8);"), "{src}");
 }
 
 #[test]
@@ -262,14 +249,14 @@ fn repne__scasb_calls_scan_memory_for_al() {
     });
     let src = render_rs(&func, &[], "");
     assert!(
-        src.contains("let delta: i32 = if DF() != 0 { -1 } else { 1 };"),
+        src.contains("let delta: i32 = if r.DF() != 0 { -1 } else { 1 };"),
         "{src}"
     );
     assert!(src.contains("let mut last_byte: u8 = 0;"), "{src}");
     assert!(
         src.contains(
-            "let index = unsafe { scanMemoryForAl(seg_off(es(), di()) as *const u8, \
-             al(), count, delta, &mut last_byte) };"
+            "let index = unsafe { scanMemoryForAl(seg_off(r.es(), r.di()) as *const u8, \
+             r.al(), count, delta, &mut last_byte) };"
         ),
         "{src}"
     );
@@ -278,19 +265,19 @@ fn repne__scasb_calls_scan_memory_for_al() {
         "{src}"
     );
     assert!(src.contains("if advance > 0 {"), "{src}");
-    assert!(src.contains("set_CF((l32 < r32) as u8);"), "{src}");
-    assert!(src.contains("set_SF(((res >> 7) & 1) as u8);"), "{src}");
+    assert!(src.contains("r.set_CF((l32 < r32) as u8);"), "{src}");
+    assert!(src.contains("r.set_SF(((res >> 7) & 1) as u8);"), "{src}");
     assert!(
-        src.contains("set_OF((((l32 ^ r32) & (l32 ^ (res as u32)) & 0x80) != 0) as u8);"),
+        src.contains("r.set_OF((((l32 ^ r32) & (l32 ^ (res as u32)) & 0x80) != 0) as u8);"),
         "{src}"
     );
-    assert!(src.contains("set_ZF((res == 0) as u8);"), "{src}");
+    assert!(src.contains("r.set_ZF((res == 0) as u8);"), "{src}");
     assert!(
-        src.contains("set_cx(count.wrapping_sub(advance));"),
+        src.contains("r.set_cx(count.wrapping_sub(advance));"),
         "{src}"
     );
     assert!(
-        src.contains("set_di(((di() as i32 + advance as i32 * delta) & 0xFFFF) as u16);"),
+        src.contains("r.set_di(((r.di() as i32 + advance as i32 * delta) & 0xFFFF) as u16);"),
         "{src}"
     );
 }
@@ -309,10 +296,13 @@ fn ret__near() {
     });
     let src = render_rs(&func, &[], "");
     // near ret pops the return IP and re-enters the dispatch loop — no retf
-    assert!(src.contains("let popped_ip = memw(ss(), sp());"), "{src}");
+    assert!(
+        src.contains("let popped_ip = r.memw(r.ss(), r.sp());"),
+        "{src}"
+    );
     assert!(
         src.contains(
-            "pc = (((cs() as u32) << 4).wrapping_add(popped_ip as u32).wrapping_sub(0x10100)) as i32;"
+            "return (((r.cs() as u32) << 4).wrapping_add(popped_ip as u32).wrapping_sub(0x10100)) as i32;"
         ),
         "{src}"
     );
@@ -329,8 +319,8 @@ fn ret__far_invokes_helper() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert!(src.contains("retf_();"), "{src}");
-    assert!(src.contains("retf_();\n                return;"), "{src}");
+    assert!(src.contains("r.retf_();"), "{src}");
+    assert!(src.contains("r.retf_();\n    return -1;"), "{src}");
 }
 
 #[test]
@@ -342,10 +332,11 @@ fn ret__far_only() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert!(src.contains("retf_();"), "{src}");
-    // the retf terminates its arm
-    let body = arm(&src, 0x0000);
-    assert!(body.trim_end().ends_with("return;"), "{body}");
+    assert!(src.contains("r.retf_();"), "{src}");
+    // the retf terminates its block: the next statement is the done sentinel
+    let body = blk(&src, 0x0000);
+    assert!(body.contains("r.retf_();\n    return -1;"), "{body}");
+    assert!(body.trim_end().ends_with("return -1;"), "{body}");
 }
 
 #[test]
@@ -359,13 +350,16 @@ fn ret__immediate_adjusts_sp() {
     });
     let src = render_rs(&func, &[], "");
     // pop the return IP, then discard the 4 argument bytes
-    assert!(src.contains("let popped_ip = memw(ss(), sp());"), "{src}");
     assert!(
-        src.contains("set_sp((sp().wrapping_add(2)) & 0xFFFF);"),
+        src.contains("let popped_ip = r.memw(r.ss(), r.sp());"),
         "{src}"
     );
     assert!(
-        src.contains("set_sp((sp().wrapping_add(0x4)) & 0xFFFF);"),
+        src.contains("r.set_sp((r.sp().wrapping_add(2)) & 0xFFFF);"),
+        "{src}"
+    );
+    assert!(
+        src.contains("r.set_sp((r.sp().wrapping_add(0x4)) & 0xFFFF);"),
         "{src}"
     );
 }
@@ -379,8 +373,8 @@ fn ret__far_immediate_uses_retf_pop() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert!(src.contains("retf_pop_(0x4);"), "{src}");
-    assert!(!src.contains("set_sp("), "{src}");
+    assert!(src.contains("r.retf_pop_(0x4);"), "{src}");
+    assert!(!src.contains("r.set_sp("), "{src}");
 }
 
 #[test]
@@ -393,8 +387,8 @@ fn ret__far_decimal_immediate_preserves_decimal_value() {
     });
     let src = render_rs(&func, &[], "");
     // "12" is decimal 12 (0xC) — a hex misparse would give retf_pop_(0x12)
-    assert!(src.contains("retf_pop_(0xC);"), "{src}");
-    assert!(!src.contains("retf_pop_(0x12);"), "{src}");
+    assert!(src.contains("r.retf_pop_(0xC);"), "{src}");
+    assert!(!src.contains("r.retf_pop_(0x12);"), "{src}");
 }
 
 #[test]
@@ -411,9 +405,9 @@ fn ret__far_in_if_else() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert!(src.contains("if ZF() == 0 {"), "{src}");
-    assert!(src.contains("pc = 0x0008;"), "{src}");
-    assert!(src.contains("retf_();"), "{src}");
+    assert!(src.contains("if r.ZF() == 0 {"), "{src}");
+    assert!(src.contains("return 0x0008;"), "{src}");
+    assert!(src.contains("r.retf_();"), "{src}");
 }
 
 // ===========================================================================
@@ -435,10 +429,13 @@ fn ror__translates_to_rotate_right() {
         src.contains("let v = ((d0 >> count) | (d0 << (8 - count))) & 0xFF;"),
         "{src}"
     );
-    assert!(src.contains("set_CF((((al()) >> 7) & 1) as u8);"), "{src}");
+    assert!(
+        src.contains("r.set_CF((((r.al()) >> 7) & 1) as u8);"),
+        "{src}"
+    );
     assert!(
         src.contains(
-            "set_OF(if count == 1 { ((((al()) >> 7) & 1) ^ (((al()) >> 6) & 1)) as u8 } else { 0 });"
+            "r.set_OF(if count == 1 { ((((r.al()) >> 7) & 1) ^ (((r.al()) >> 6) & 1)) as u8 } else { 0 });"
         ),
         "{src}"
     );
@@ -467,12 +464,16 @@ fn sar__uses_arithmetic_shift() {
         "{src}"
     );
     assert_eq!(src.matches("let orig_count = count;").count(), 2, "{src}");
-    assert!(src.contains("let mut tmp: i8 = (al()) as i8;"), "{src}");
-    assert!(src.contains("let mut tmp: i16 = (ax()) as i16;"), "{src}");
-    assert_eq!(src.matches("set_CF((tmp & 1) as u8);").count(), 2, "{src}");
-    assert!(src.contains("set_al((tmp as u8));"), "{src}");
-    assert!(src.contains("set_ax((tmp as u16));"), "{src}");
-    assert_eq!(src.matches("set_OF(0);").count(), 2, "{src}");
+    assert!(src.contains("let mut tmp: i8 = (r.al()) as i8;"), "{src}");
+    assert!(src.contains("let mut tmp: i16 = (r.ax()) as i16;"), "{src}");
+    assert_eq!(
+        src.matches("r.set_CF((tmp & 1) as u8);").count(),
+        2,
+        "{src}"
+    );
+    assert!(src.contains("r.set_al((tmp as u8));"), "{src}");
+    assert!(src.contains("r.set_ax((tmp as u16));"), "{src}");
+    assert_eq!(src.matches("r.set_OF(0);").count(), 2, "{src}");
 }
 
 // ===========================================================================
@@ -494,9 +495,11 @@ fn sbb_rol_loop__rol_translates_to_rotate_left() {
         src.contains("let v = ((d0 << count) | (d0 >> (8 - count))) & 0xFF;"),
         "{src}"
     );
-    assert!(src.contains("set_CF(((al()) & 1) as u8);"), "{src}");
+    assert!(src.contains("r.set_CF(((r.al()) & 1) as u8);"), "{src}");
     assert!(
-        src.contains("set_OF(if count == 1 { (((al()) >> 7) & 1) as u8 ^ CF() } else { 0 });"),
+        src.contains(
+            "r.set_OF(if count == 1 { (((r.al()) >> 7) & 1) as u8 ^ r.CF() } else { 0 });"
+        ),
         "{src}"
     );
     assert!(!src.contains("set_ZF"), "{src}");
@@ -513,19 +516,19 @@ fn sbb_rol_loop__sbb_subtracts_with_carry() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert!(src.contains("let old: u32 = (al()) as u32;"), "{src}");
+    assert!(src.contains("let old: u32 = (r.al()) as u32;"), "{src}");
     assert!(
-        src.contains("let src: u32 = (0x1 as u32).wrapping_add(CF() as u32);"),
+        src.contains("let src: u32 = (0x1 as u32).wrapping_add(r.CF() as u32);"),
         "{src}"
     );
-    assert!(src.contains("set_CF((old < src) as u8);"), "{src}");
+    assert!(src.contains("r.set_CF((old < src) as u8);"), "{src}");
     assert!(
         src.contains("let tmp: u32 = old.wrapping_sub(src);"),
         "{src}"
     );
-    assert!(src.contains("set_al((tmp & 0xFF) as u8);"), "{src}");
+    assert!(src.contains("r.set_al((tmp & 0xFF) as u8);"), "{src}");
     assert!(
-        src.contains("set_OF((((old ^ src) & (old ^ tmp) & 0x80) != 0) as u8);"),
+        src.contains("r.set_OF((((old ^ src) & (old ^ tmp) & 0x80) != 0) as u8);"),
         "{src}"
     );
 }
@@ -540,10 +543,13 @@ fn sbb_rol_loop__loopne_decrements_cx_and_branches() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert!(src.contains("set_cx(cx().wrapping_sub(1));"), "{src}");
-    assert!(src.contains("if cx() != 0 && ZF() == 0 {"), "{src}");
-    assert!(src.contains("pc = 0x0010;"), "{src}");
-    assert!(src.contains("continue;"), "{src}");
+    assert!(src.contains("r.set_cx(r.cx().wrapping_sub(1));"), "{src}");
+    assert!(src.contains("if r.cx() != 0 && r.ZF() == 0 {"), "{src}");
+    // the taken branch yields the target pc from inside the guard
+    assert!(
+        src.contains("if r.cx() != 0 && r.ZF() == 0 {\n        return 0x0010;\n    }"),
+        "{src}"
+    );
 }
 
 // ===========================================================================
@@ -560,22 +566,25 @@ fn scasb__compares_al_with_memory_and_increments_di() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    let cf_index = src.find("set_CF((left_val < right_val) as u8);").unwrap();
+    let cf_index = src.find("r.set_CF((left_val < right_val) as u8);").unwrap();
     let tmp_index = src
         .find("let tmp = left_val.wrapping_sub(right_val);")
         .unwrap();
     assert!(cf_index < tmp_index, "{src}");
-    assert!(src.contains("let left_val: u32 = (al()) as u32;"), "{src}");
     assert!(
-        src.contains("let right_val: u32 = memb(es(), di()) as u32;"),
+        src.contains("let left_val: u32 = (r.al()) as u32;"),
         "{src}"
     );
     assert!(
-        src.contains("let delta: i32 = if DF() != 0 { -1 } else { 1 };"),
+        src.contains("let right_val: u32 = r.memb(r.es(), r.di()) as u32;"),
         "{src}"
     );
     assert!(
-        src.contains("set_di(((di() as i32 + delta) & 0xFFFF) as u16);"),
+        src.contains("let delta: i32 = if r.DF() != 0 { -1 } else { 1 };"),
+        "{src}"
+    );
+    assert!(
+        src.contains("r.set_di(((r.di() as i32 + delta) & 0xFFFF) as u16);"),
         "{src}"
     );
 }
@@ -606,7 +615,11 @@ fn shr__sets_cf_of() {
         2,
         "{src}"
     );
-    assert_eq!(src.matches("set_CF((tmp & 1) as u8);").count(), 2, "{src}");
+    assert_eq!(
+        src.matches("r.set_CF((tmp & 1) as u8);").count(),
+        2,
+        "{src}"
+    );
     assert!(
         src.contains("let orig_sign = ((tmp >> 7) & 1) as u8;"),
         "{src}"
@@ -616,7 +629,7 @@ fn shr__sets_cf_of() {
         "{src}"
     );
     assert_eq!(
-        src.matches("set_OF(if orig_count == 1 { orig_sign } else { 0 });")
+        src.matches("r.set_OF(if orig_count == 1 { orig_sign } else { 0 });")
             .count(),
         2,
         "{src}"
@@ -634,9 +647,9 @@ fn shr__memory_writes_via_helper() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert!(src.contains("memb_write(ds(), 0x1234, tmp);"), "{src}");
+    assert!(src.contains("r.memb_write(r.ds(), 0x1234, tmp);"), "{src}");
     assert!(
-        src.contains("set_ZF(((memb(ds(), 0x1234)) == 0) as u8);"),
+        src.contains("r.set_ZF(((r.memb(r.ds(), 0x1234)) == 0) as u8);"),
         "{src}"
     );
 }
@@ -663,31 +676,37 @@ fn sign_flag_src(mnemonic: &str, op_str: &str, bytes: &str) -> String {
 #[test]
 fn sign_flag__add_sets_sf() {
     let src = sign_flag_src("add", "al, 1", "0401");
-    assert!(src.contains("set_SF((((al()) >> 7) & 1) as u8);"), "{src}");
+    assert!(
+        src.contains("r.set_SF((((r.al()) >> 7) & 1) as u8);"),
+        "{src}"
+    );
 }
 
 #[test]
 fn sign_flag__sub_sets_sf() {
     let src = sign_flag_src("sub", "ax, bx", "29D8");
-    assert!(src.contains("set_SF((((ax()) >> 15) & 1) as u8);"), "{src}");
+    assert!(
+        src.contains("r.set_SF((((r.ax()) >> 15) & 1) as u8);"),
+        "{src}"
+    );
 }
 
 #[test]
 fn sign_flag__or_sets_sf() {
     let src = sign_flag_src("or", "al, al", "08C0");
-    assert!(src.contains("set_SF(((tmp >> 7) & 1) as u8);"), "{src}");
+    assert!(src.contains("r.set_SF(((tmp >> 7) & 1) as u8);"), "{src}");
 }
 
 #[test]
 fn sign_flag__and_sets_sf() {
     let src = sign_flag_src("and", "ax, bx", "21D8");
-    assert!(src.contains("set_SF(((tmp >> 15) & 1) as u8);"), "{src}");
+    assert!(src.contains("r.set_SF(((tmp >> 15) & 1) as u8);"), "{src}");
 }
 
 #[test]
 fn sign_flag__xor_sets_sf() {
     let src = sign_flag_src("xor", "al, ah", "30E0");
-    assert!(src.contains("set_SF(((tmp >> 7) & 1) as u8);"), "{src}");
+    assert!(src.contains("r.set_SF(((tmp >> 7) & 1) as u8);"), "{src}");
 }
 
 // ===========================================================================
@@ -705,12 +724,14 @@ fn single_header_instruction__loop() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    // the store executes inside the loop body (the 0x0000 arm) and the
+    // the store executes inside the loop body (the 0x0000 block) and the
     // header-only jump forms the pc back edge
-    let body = arm(&src, 0x0000);
-    assert!(body.contains("memb_write(ds(), 0xFF1A, 0x0);"), "{body}");
-    assert!(body.contains("pc = 0x0000;"), "{body}");
-    assert!(body.contains("continue;"), "{body}");
+    let body = blk(&src, 0x0000);
+    assert!(
+        body.contains("r.memb_write(r.ds(), 0xFF1A, 0x0);"),
+        "{body}"
+    );
+    assert!(body.contains("return 0x0000;"), "{body}");
 }
 
 // ===========================================================================
@@ -726,7 +747,7 @@ fn ss_interrupt_shadow__mov_ss_sets_interrupt_shadow() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert!(src.contains("set_ss(ax());"), "{src}");
+    assert!(src.contains("r.set_ss(r.ax());"), "{src}");
     assert_eq!(src.matches("set_interrupt_shadow(1);").count(), 1, "{src}");
 }
 
@@ -740,9 +761,9 @@ fn ss_interrupt_shadow__pop_ss_sets_interrupt_shadow() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert!(src.contains("set_ss(memw(ss(), sp()));"), "{src}");
+    assert!(src.contains("r.set_ss(r.memw(r.ss(), r.sp()));"), "{src}");
     assert!(
-        src.contains("set_sp((sp().wrapping_add(2)) & 0xFFFF);"),
+        src.contains("r.set_sp((r.sp().wrapping_add(2)) & 0xFFFF);"),
         "{src}"
     );
     assert_eq!(src.matches("set_interrupt_shadow(1);").count(), 1, "{src}");
@@ -765,7 +786,7 @@ fn stack_indexed_bp__keeps_bp_expression() {
     // bp-based defaults to SS; the bp+si expression survives (no var_4 rewrite)
     assert!(
         src.contains(
-            "set_ax(memw(ss(), (((bp() as u32).wrapping_add((si() as u32)).wrapping_sub(0x4u32)) & 0xFFFF) as u16));"
+            "r.set_ax(r.memw(r.ss(), (((r.bp() as u32).wrapping_add((r.si() as u32)).wrapping_sub(0x4u32)) & 0xFFFF) as u16));"
         ),
         "{src}"
     );
@@ -793,26 +814,26 @@ fn stick_loop__stick_style_loop() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert!(src.contains("if ZF() == 0 {"), "{src}");
+    assert!(src.contains("if r.ZF() == 0 {"), "{src}");
     assert!(
-        src.contains("let delta: i32 = if DF() != 0 { -1 } else { 1 };"),
+        src.contains("let delta: i32 = if r.DF() != 0 { -1 } else { 1 };"),
         "{src}"
     );
     // exactly one lodsb step and one inc-si step
     assert_eq!(
-        src.matches("set_si(((si() as i32 + delta) & 0xFFFF) as u16);")
+        src.matches("r.set_si(((r.si() as i32 + delta) & 0xFFFF) as u16);")
             .count(),
         1,
         "{src}"
     );
     assert_eq!(
-        src.matches("set_si((old.wrapping_add(1) & 0xFFFF) as u16);")
+        src.matches("r.set_si((old.wrapping_add(1) & 0xFFFF) as u16);")
             .count(),
         1,
         "{src}"
     );
     // the loop closes through the pc back edge to the header
-    assert!(src.contains("pc = 0x0000;"), "{src}");
+    assert!(src.contains("return 0x0000;"), "{src}");
 }
 
 // ===========================================================================
@@ -828,7 +849,7 @@ fn sub_cf__sets_cf_before_subtraction() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    let cf_index = src.find("set_CF((old < src) as u8);").unwrap();
+    let cf_index = src.find("r.set_CF((old < src) as u8);").unwrap();
     let tmp_index = src.find("let tmp: u32 = old.wrapping_sub(src);").unwrap();
     assert!(cf_index < tmp_index, "{src}");
 }
@@ -856,16 +877,16 @@ fn switch__pattern_emits_switch_statement() {
     });
     let src = render_rs(&func, &[], "");
     // the selector prep is preserved in program order
-    assert!(src.contains("set_bl(memb(cs(), 0x8E7));"), "{src}");
-    assert!(src.contains("set_bh(0x0);"), "{src}");
+    assert!(src.contains("r.set_bl(r.memb(r.cs(), 0x8E7));"), "{src}");
+    assert!(src.contains("r.set_bh(0x0);"), "{src}");
     assert!(
         src.contains("let tmp: u32 = old.wrapping_add(src);"),
         "{src}"
     ); // add bx,bx
        // the indirect jmp routes through the runtime jump table at cs:[bx+0x100]
-    assert!(src.contains("jump_table_("), "{src}");
+    assert!(src.contains("r.jump_table_("), "{src}");
     assert!(
-        src.contains("memw(cs(), (((bx() as u32).wrapping_add(0x100u32)) & 0xFFFF) as u16)"),
+        src.contains("r.memw(r.cs(), (((r.bx() as u32).wrapping_add(0x100u32)) & 0xFFFF) as u16)"),
         "{src}"
     );
 }
@@ -896,12 +917,12 @@ fn switch__structures_case_bodies() {
     });
     let src = render_rs(&func, &[], "");
     // the table dispatch is a runtime jump_table_ call ...
-    assert!(src.contains("jump_table_("), "{src}");
-    // ... and the case bodies stay dispatchable as their own arms
-    let case0 = arm(&src, 0x0010);
-    assert!(case0.contains("set_ax(0x1);"), "{case0}");
-    let case1 = arm(&src, 0x0016);
-    assert!(case1.contains("set_ax(0x2);"), "{case1}");
+    assert!(src.contains("r.jump_table_("), "{src}");
+    // ... and the case bodies stay dispatchable as their own blocks
+    let case0 = blk(&src, 0x0010);
+    assert!(case0.contains("r.set_ax(0x1);"), "{case0}");
+    let case1 = blk(&src, 0x0016);
+    assert!(case1.contains("r.set_ax(0x2);"), "{case1}");
 }
 
 #[test]
@@ -917,12 +938,12 @@ fn switch__pattern_detects_xor_zeroing_bh() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert!(src.contains("set_bl(al());"), "{src}");
-    // xor bh,bh zeroes the selector high byte via the flag-setting helper
-    assert!(src.contains("unsafe { xor8(bh_ptr(), bh()); }"), "{src}");
-    assert!(src.contains("jump_table_("), "{src}");
+    assert!(src.contains("r.set_bl(r.al());"), "{src}");
+    // xor bh,bh zeroes the selector high byte
+    assert!(src.contains("r.set_bh(0);"), "{src}");
+    assert!(src.contains("r.jump_table_("), "{src}");
     assert!(
-        src.contains("memw(es(), (((bx() as u32).wrapping_add(0x100u32)) & 0xFFFF) as u16)"),
+        src.contains("r.memw(r.es(), (((r.bx() as u32).wrapping_add(0x100u32)) & 0xFFFF) as u16)"),
         "{src}"
     );
 }
@@ -944,9 +965,10 @@ fn switch__pattern_uses_current_function_addresses_for_cases() {
     let src = render_rs(&func, &[], "");
     // no translate-time case decode: the transfer goes through jump_table_,
     // and the in-function ret targets keep their own pop-return epilogues
-    assert!(src.contains("jump_table_("), "{src}");
+    assert!(src.contains("r.jump_table_("), "{src}");
     assert_eq!(
-        src.matches("let popped_ip = memw(ss(), sp());").count(),
+        src.matches("let popped_ip = r.memw(r.ss(), r.sp());")
+            .count(),
         2,
         "{src}"
     );
@@ -959,8 +981,9 @@ fn switch__pattern_uses_current_function_addresses_for_cases() {
 fn terminates__on_noreturn_funcs() {
     // The original asserted CCodeRenderer()._terminates("<fn>();") over the
     // private _NORETURN_FUNCS list. The observable Rust-backend equivalent:
-    // after a noreturn runtime call (dos_exit here), the dispatch arm ends
-    // with `return;` and the unreachable in-block tail (the ret) is dropped.
+    // after a noreturn runtime call (dos_exit here), the block yields the
+    // done sentinel (-1) and the unreachable in-block tail (the ret) is
+    // dropped.
     let func = json!({
         "start": 0x0000,
         "instructions": [
@@ -969,9 +992,9 @@ fn terminates__on_noreturn_funcs() {
         ],
     });
     let src = render_rs(&func, &[], "");
+    assert!(src.contains("r.dos_exit();\n    return -1;"), "{src}");
     assert!(
-        src.contains("dos_exit();\n                return;"),
+        !src.contains("let popped_ip = r.memw(r.ss(), r.sp());"),
         "{src}"
     );
-    assert!(!src.contains("let popped_ip = memw(ss(), sp());"), "{src}");
 }

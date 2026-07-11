@@ -13,9 +13,10 @@ pub fn known(addrs: &[i64]) -> BTreeSet<i64> {
 }
 
 /// Render one function through the chunk emitter and return the whole chunk
-/// text (dispatch + `_impl` wrapper). Substring assertions run against this.
-/// `known_addrs` marks sibling call targets as intra-chunk (direct calls
-/// render as `pc = 0x…; continue;`). Panics on `Unsupported` — use
+/// text (dispatch + per-block fns + `_impl` wrapper). Substring assertions run
+/// against this. `known_addrs` marks sibling call targets as intra-chunk
+/// (direct calls render as `return 0x…;` — the next pc — inside the caller's
+/// per-block fn). Panics on `Unsupported` — use
 /// `try_render_rs` for tests asserting a construct is (intentionally) not
 /// emittable.
 pub fn render_rs(func: &Value, known_addrs: &[i64], prefix: &str) -> String {
@@ -41,6 +42,21 @@ pub fn render_rs_ir(ir: &Value, known_addrs: &[i64], prefix: &str) -> Result<Str
 /// match arms and every function body share the one returned text.
 pub fn render_rs_dispatch(funcs: &[Value], known_addrs: &[i64]) -> String {
     render_rs_ir(&json!({ "functions": funcs }), known_addrs, "").expect("emit_chunk (dispatch)")
+}
+
+/// Slice out one per-block fn body (`fn {prefix}blk_{ADDR:04X}(…) -> c_int`)
+/// from a chunk text — the body of the dispatch arm for that pc. The body runs
+/// to the fn's closing brace at column 0 (each block fn ends with the
+/// unreachable `return -1;` backstop, which is included).
+pub fn blk(src: &str, addr: i64) -> String {
+    let key = format!("blk_{addr:04X}(r: &mut Regs, expected_retip: u16) -> c_int {{");
+    src.split(&key)
+        .nth(1)
+        .unwrap_or_else(|| panic!("block fn for 0x{addr:04X} must exist in:\n{src}"))
+        .split("\n}")
+        .next()
+        .unwrap()
+        .to_string()
 }
 
 /// disassemble.disassemble_ir(...) parsed into a serde_json Value. Mirrors a

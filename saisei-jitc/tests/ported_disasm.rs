@@ -7,8 +7,9 @@
 //!       function_call, cross_func__backward_jmp_no_label, forward__jmp_no_label,
 //!       invalid_opcode__is_noop) re-asserted through the Rust backend
 //!       (render_rs_ir): "no dispatch(/label_XXXX emitted" becomes "the target
-//!       is an in-chunk arm `0xNNNN => {` reached via `pc = 0xNNNN;`, with no
-//!       call_table_"; C register writes (`ax = 0x1234;`) become Rust accessor
+//!       is an in-chunk arm `0xNNNN => blk_NNNN(expected_retip),` reached via
+//!       `return 0xNNNN;` from the jumping block fn, with no call_table_";
+//!       C register writes (`ax = 0x1234;`) become Rust accessor
 //!       writes (`set_ax(0x1234);`).
 //!     - 2 CFG tests (iret__cfg_no_fallthrough_after_iret,
 //!       ljmp__cfg_no_fallthrough) re-expressed via translate::build_basic_blocks
@@ -133,11 +134,14 @@ fn backward__jmp_ignored() {
     let labels = extern_labels(&ir);
     assert!(!labels.contains(&0x0000));
     // The backward jmp inside the function is an intra-chunk transfer: its
-    // target is an in-chunk dispatch arm reached via a direct `pc = …;`, never
-    // routed through the call table.
+    // target is an in-chunk dispatch arm reached via a direct `return 0x…;`
+    // (next pc) from the block fn, never routed through the call table.
     let src = render_rs_ir(&ir, &[], "").expect("emit (backward jmp)");
-    assert!(src.contains("0x0000 => {"), "{src}");
-    assert!(src.contains("pc = 0x0000;"), "{src}");
+    assert!(
+        src.contains("0x0000 => blk_0000(r, expected_retip),"),
+        "{src}"
+    );
+    assert!(blk(&src, 0x0000).contains("return 0x0000;"), "{src}");
     assert!(!src.contains("call_table_"), "{src}");
 }
 
@@ -157,11 +161,19 @@ fn call_hex_prefix__generates_function_call() {
     let funcs = functions(&ir);
     assert!(funcs.iter().any(|f| as_i(f, "start") == 0x0CAD));
     // The call immediate (0x0CAD) is resolved to the known sibling and routed
-    // through the in-loop dispatch: push the return IP, set pc to the target,
-    // continue — no call_table_ (and no TODO-ASM-style bailout).
+    // through the dispatch loop: push the return IP, yield the target as the
+    // next pc — no call_table_ (and no TODO-ASM-style bailout).
     let src = render_rs_ir(&ir, &[], "game_").expect("emit (call hex)");
-    assert!(src.contains("pc = 0x0CAD;"), "{src}");
-    assert!(src.contains("0x0CAD => {"), "{src}");
+    let caller = blk(&src, 0x0000);
+    assert!(
+        caller.contains("r.set_sp((r.sp().wrapping_sub(2)) & 0xFFFF);"),
+        "{src}"
+    );
+    assert!(caller.contains("return 0x0CAD;"), "{src}");
+    assert!(
+        src.contains("0x0CAD => game_blk_0CAD(r, expected_retip),"),
+        "{src}"
+    );
     assert!(!src.contains("call_table_"), "{src}");
 }
 
@@ -175,11 +187,15 @@ fn cross_func__backward_jmp_no_label() {
     let labels = extern_labels(&ir);
     assert!(!labels.contains(&0x0000));
     // The cross-function backward jmp is still an intra-chunk transfer: the
-    // target 0x0000 is an in-chunk arm reached via `pc = 0x0000;`, not a label
-    // and not a dispatch through the call table.
+    // target 0x0000 is an in-chunk arm reached via `return 0x0000;` (next pc)
+    // from the jumping block fn, not a label and not a dispatch through the
+    // call table.
     let src = render_rs_ir(&ir, &[], "").expect("emit (cross-func jmp)");
-    assert!(src.contains("pc = 0x0000;"), "{src}");
-    assert!(src.contains("0x0000 => {"), "{src}");
+    assert!(blk(&src, 0x0002).contains("return 0x0000;"), "{src}");
+    assert!(
+        src.contains("0x0000 => blk_0000(r, expected_retip),"),
+        "{src}"
+    );
     assert!(!src.contains("call_table_"), "{src}");
 }
 
@@ -280,11 +296,14 @@ fn forward__jmp_no_label() {
     let labels = extern_labels(&ir);
     assert!(!labels.contains(&0x0004));
     // A forward jmp inside the function is an intra-chunk transfer: rendered as
-    // a direct `pc = …;` to an in-chunk arm, with no dispatch through the call
-    // table and no label.
+    // a direct `return 0x…;` (next pc) to an in-chunk arm, with no dispatch
+    // through the call table and no label.
     let src = render_rs_ir(&ir, &[], "").expect("emit (forward jmp)");
-    assert!(src.contains("pc = 0x0004;"), "{src}");
-    assert!(src.contains("0x0004 => {"), "{src}");
+    assert!(blk(&src, 0x0000).contains("return 0x0004;"), "{src}");
+    assert!(
+        src.contains("0x0004 => blk_0004(r, expected_retip),"),
+        "{src}"
+    );
     assert!(!src.contains("call_table_"), "{src}");
 }
 
@@ -312,7 +331,7 @@ fn invalid_opcode__is_noop() {
     let data = [0xB8u8, 0x34, 0x12, 0x0F];
     let ir = d(&data, &[]);
     let src = render_rs_ir(&ir, &[], "").expect("emit (invalid opcode)");
-    assert!(src.contains("set_ax(0x1234);"), "{src}");
+    assert!(src.contains("r.set_ax(0x1234);"), "{src}");
     // The db byte produces no code at all: its value never appears.
     assert!(!src.contains("0x0f") && !src.contains("0x0F"), "{src}");
 }

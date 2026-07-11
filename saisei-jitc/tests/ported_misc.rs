@@ -56,8 +56,11 @@ fn filter_internal_labels__internal_label_is_an_in_function_arm() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert!(src.contains("0x0200 => {"), "{src}");
-    assert!(src.contains("pc = 0x0200;"), "{src}");
+    assert!(
+        src.contains("0x0200 => blk_0200(r, expected_retip),"),
+        "{src}"
+    );
+    assert!(blk(&src, 0x0100).contains("return 0x0200;"), "{src}");
 }
 
 // ==========================================================================
@@ -104,8 +107,14 @@ fn rcb_mov__reads_and_writes_via_rcb_helpers() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert!(src.contains("rcb_write16(DATA_BASE_SEG, ax());"), "{src}");
-    assert!(src.contains("set_ax(rcb_read16(DATA_BASE_SEG));"), "{src}");
+    assert!(
+        src.contains("r.rcb_write16(DATA_BASE_SEG, r.ax());"),
+        "{src}"
+    );
+    assert!(
+        src.contains("r.set_ax(r.rcb_read16(DATA_BASE_SEG));"),
+        "{src}"
+    );
 }
 
 #[test]

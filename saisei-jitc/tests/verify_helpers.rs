@@ -23,18 +23,28 @@ fn pc_switch_renderer_emits_cases() {
     });
     let src = render_rs_dispatch(&[f], &[]);
     let match_section = src.split("match pc").nth(1).unwrap();
-    assert!(match_section.contains("0x0100 => {"), "{match_section}");
-    assert!(match_section.contains("pc = 0x0109;"), "{match_section}");
-    assert!(match_section.contains("pc = 0x0105;"), "{match_section}");
-    // The cmp+jne block ends in exactly one `continue;` (after the if/else).
-    let block_0100 = match_section
-        .split("0x0100 => {")
-        .nth(1)
-        .unwrap()
-        .split("=> {")
-        .next()
-        .unwrap();
-    assert_eq!(block_0100.matches("continue;").count(), 1, "{block_0100}");
+    assert!(
+        match_section.contains("0x0100 => blk_0100(r, expected_retip),"),
+        "{match_section}"
+    );
+    assert!(
+        match_section.contains("0x0105 => blk_0105(r, expected_retip),"),
+        "{match_section}"
+    );
+    // The cmp+jne block ends in an if/else where both branches return the
+    // next pc (dispatch-level `continue;` no longer exists anywhere).
+    let block_0100 = blk(&src, 0x0100);
+    assert_eq!(
+        block_0100.matches("return 0x0109;").count(),
+        1,
+        "{block_0100}"
+    );
+    assert_eq!(
+        block_0100.matches("return 0x0105;").count(),
+        1,
+        "{block_0100}"
+    );
+    assert!(!src.contains("continue;"), "{src}");
 }
 
 #[test]
@@ -44,10 +54,10 @@ fn forward_jmp_no_label() {
     let labels = extern_labels(&ir);
     assert!(!labels.contains(&0x0004));
     // A forward jmp inside the function is an intra-chunk transfer: rendered as
-    // a direct `pc = …;` with no dispatch through the call table.
+    // a direct `return 0x…;` (the next pc) with no dispatch through the call table.
     let funcs = functions(&ir);
     let src = render_rs_ir(&ir, &[], "").expect("emit (forward jmp)");
     assert!(!funcs.is_empty());
-    assert!(src.contains("pc = 0x0004;"), "{src}");
+    assert!(src.contains("return 0x0004;"), "{src}");
     assert!(!src.contains("call_table_"), "{src}");
 }

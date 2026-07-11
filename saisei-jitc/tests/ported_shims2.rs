@@ -25,8 +25,14 @@ fn test_inb_mda_status_alias_supported() {
     let lib = ShimLib::load();
     unsafe {
         let inb: unsafe extern "C" fn(u16) -> u8 = lib.func("inb");
-        let value = inb(0x3BA);
-        assert!(value == 0x01 || value == 0x08, "value={value:#x}");
+        // 0x3BA aliases the same 6845 raster-status model as 0x3DA: bit0
+        // (display disable) and bit3 (vsync) in any combination except
+        // vsync-without-blank (display is always disabled during vsync).
+        let value = inb(0x3BA) & 0x09;
+        assert!(
+            value == 0x00 || value == 0x01 || value == 0x09,
+            "value={value:#x}"
+        );
     }
 }
 

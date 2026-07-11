@@ -60,6 +60,12 @@ extern "C" {
     static mut pit_cycle_accum: u64;
     static mut pit_cycle_fraction_accum: u64;
     static mut bios_timer_tick_backlog: u32;
+    static mut jit_instr_budget: i64;
+    static mut jit_budget_last_refill: i64;
+    static mut jit_total_retired: u64;
+    static mut jit_ns_per_instr: u64;
+    static mut virtual_now_accum_ns: u64;
+    fn vclock_advance_ns(ns: u64);
     fn vclock_service();
     fn vclock_halt();
     fn vclock_resume();
@@ -696,6 +702,100 @@ unsafe extern "C" fn crash_signal_handler(signum: c_int) {
     libc::raise(signum);
 }
 
+/// Repeatable, NON-fatal freeze sampler (SIGUSR1). Unlike the crash handler,
+/// this returns and lets the guest keep running, so `kill -USR1 <pid>` can be
+/// tapped several times against a wedged game to trace a spin loop. It reports
+/// the live cs:ip, the last I/O port touched + the access counter (a spin on a
+/// status port pins the port while the counter races between taps), and the
+/// depth/flag state that distinguishes a spin from a blocked wait.
+unsafe extern "C" fn freeze_diag_handler(_signum: c_int) {
+    static mut last_counter: u64 = 0;
+    static mut last_ip_linear: u32 = 0;
+    let ip_lin = ((cs() as u32) << 4) + ip() as u32;
+    let delta = io_access_counter.wrapping_sub(last_counter);
+    let ip_moved = ip_lin != last_ip_linear;
+    last_counter = io_access_counter;
+    last_ip_linear = ip_lin;
+    let mut buf = [0u8; 512];
+    let n = libc::snprintf(
+        buf.as_mut_ptr() as *mut c_char,
+        buf.len(),
+        cstr!("[FREEZE-DIAG] cs:ip=%04X:%04X lin=0x%05X  last_io=%s 0x%04X  io_count=%llu (+%llu since last tap)  ip_moved=%d  isr=%u disp=%u crit=%u lcall=%u IF=%d  ss:sp=%04X:%04X ds=%04X es=%04X ax=%04X bx=%04X\n"),
+        cs() as c_uint,
+        ip() as c_uint,
+        ip_lin as c_uint,
+        if last_io_was_read != 0 { cstr!("IN ") } else { cstr!("OUT") },
+        last_io_port as c_uint,
+        io_access_counter as c_ulonglong,
+        delta as c_ulonglong,
+        ip_moved as c_int,
+        isr_depth as c_uint,
+        dispatch_depth as c_uint,
+        critical_depth as c_uint,
+        lcall_depth as c_uint,
+        IF() as c_int,
+        ss() as c_uint,
+        sp() as c_uint,
+        ds() as c_uint,
+        es() as c_uint,
+        ax() as c_uint,
+        bx() as c_uint,
+    );
+    if n > 0 {
+        let err_fd = libc::fileno(stderr);
+        let len = if (n as usize) < buf.len() {
+            n as usize
+        } else {
+            buf.len()
+        };
+        libc::write(err_fd, buf.as_ptr() as *const c_void, len);
+        libc::fsync(err_fd);
+    }
+    // Second line: the timer/clock/interrupt state that decides whether an
+    // interrupt-driven wait can ever complete. A loop polling an ISR-set flag
+    // hangs if virtual time is frozen (vnow +0), irq0 never latches, or the
+    // vector it INT-calls points at nothing.
+    static mut last_vnow: u64 = 0;
+    let vnow = virtual_now_accum_ns;
+    let vnow_delta = vnow.wrapping_sub(last_vnow);
+    last_vnow = vnow;
+    let bios_tick =
+        memw_raw_read(0x40, 0x006C) as u32 | ((memw_raw_read(0x40, 0x006E) as u32) << 8);
+    let v61_off = memw_raw_read(0, 0x61 * 4);
+    let v61_seg = memw_raw_read(0, 0x61 * 4 + 2);
+    let v08_off = memw_raw_read(0, 0x08 * 4);
+    let v08_seg = memw_raw_read(0, 0x08 * 4 + 2);
+    let ff1a = *seg_off(ds(), 0xFF1A);
+    let ff1d = *seg_off(ds(), 0xFF1D);
+    let ff1e = *seg_off(ds(), 0xFF1E);
+    let mut b2 = [0u8; 512];
+    let n2 = libc::snprintf(
+        b2.as_mut_ptr() as *mut c_char,
+        b2.len(),
+        cstr!("[FREEZE-DIAG]   vclock=%d vnow=%llu (+%llu)  irq0_pending=%u last_int=0x%02X  pit0.reload=%u bios_tick=%u  INT61->%04X:%04X INT08->%04X:%04X  RCB[FF1A]=%02X [FF1D]=%02X [FF1E]=%02X\n"),
+        vclock_state as c_int,
+        vnow as c_ulonglong,
+        vnow_delta as c_ulonglong,
+        irq0_pending as c_uint,
+        last_int_no as c_uint,
+        pit.reload as c_uint,
+        bios_tick as c_uint,
+        v61_seg as c_uint, v61_off as c_uint,
+        v08_seg as c_uint, v08_off as c_uint,
+        ff1a as c_uint, ff1d as c_uint, ff1e as c_uint,
+    );
+    if n2 > 0 {
+        let err_fd = libc::fileno(stderr);
+        let len = if (n2 as usize) < b2.len() {
+            n2 as usize
+        } else {
+            b2.len()
+        };
+        libc::write(err_fd, b2.as_ptr() as *const c_void, len);
+        libc::fsync(err_fd);
+    }
+}
+
 /// Exposed so sdl.rs can re-install after SDL_Init overrides our handlers.
 #[no_mangle]
 pub unsafe extern "C" fn shim_reinstall_crash_handlers() {
@@ -723,6 +823,14 @@ unsafe fn install_crash_handlers() {
     libc::sigaction(libc::SIGINT, &sa, ptr::null_mut());
     libc::sigaction(libc::SIGTERM, &sa, ptr::null_mut());
     libc::sigaction(libc::SIGPIPE, &sa, ptr::null_mut());
+
+    // SIGUSR1: the repeatable, NON-fatal freeze sampler — its own handler, no
+    // SA_RESETHAND (stays installed across taps), on the alt stack.
+    let mut du: libc::sigaction = core::mem::zeroed();
+    du.sa_sigaction = freeze_diag_handler as usize;
+    libc::sigemptyset(&mut du.sa_mask);
+    du.sa_flags = libc::SA_ONSTACK | libc::SA_RESTART;
+    libc::sigaction(libc::SIGUSR1, &du, ptr::null_mut());
 }
 
 // ============================================================================
@@ -932,24 +1040,65 @@ static mut lifecycle_ring: [[u8; LIFECYCLE_LINE_MAX]; LIFECYCLE_RING_LINES] =
 static mut lifecycle_ring_len: [u16; LIFECYCLE_RING_LINES] = [0; LIFECYCLE_RING_LINES];
 static mut lifecycle_ring_pos: c_int = 0;
 static mut lifecycle_ring_filled: c_int = 0;
-static mut lifecycle_fp_buf: [u8; 1 << 15] = [0; 1 << 15];
-static mut lifecycle_start_ts: libc::timespec = libc::timespec {
-    tv_sec: 0,
-    tv_nsec: 0,
-};
-static mut lifecycle_start_ts_set: c_int = 0;
+// Per-entry payload tag: LC_TEXT = preformatted line (the general
+// lifecycle_log path), LC_DISPATCH / LC_NRET = a binary LifecycleDispatchRec
+// stored in the line buffer, formatted only when the ring is dumped. The
+// dispatch-trace entries (CALL/LCALL/JMP/LJMP/NRET, several 100k/s on
+// driver-call-heavy games) were the dominant per-transfer cost as text — two
+// vsnprintfs and an alias lookup per far transfer. Dump output is identical.
+const LC_TEXT: u8 = 0;
+const LC_DISPATCH: u8 = 1;
+const LC_NRET: u8 = 2;
+static mut lifecycle_ring_kind: [u8; LIFECYCLE_RING_LINES] = [0; LIFECYCLE_RING_LINES];
 
-unsafe fn lifecycle_elapsed_us() -> u64 {
-    let mut now: libc::timespec = core::mem::zeroed();
-    libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now);
-    if lifecycle_start_ts_set == 0 {
-        lifecycle_start_ts = now;
-        lifecycle_start_ts_set = 1;
-        return 0;
+/// A deferred dispatch-trace event. Everything dump-time formatting needs is
+/// captured at record time: the mapping resolution (mappings change as
+/// overlays load — resolving later would lie) and the registers (the alias
+/// arg-spec renderer reads them). Alias names resolve at dump time from the
+/// same registry the eager path consults.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LifecycleDispatchRec {
+    t_us: u64,
+    /// Static cstr ("CALL"/"LCALL"/"JMP"/"LJMP"); unused for LC_NRET.
+    kind: *const c_char,
+    addr: u32,
+    popped: u16, // LC_NRET only
+    has_path: u8,
+    _pad: u8,
+    off_in: u64,
+    bn: [u8; 20],
+    regs: RegSnap,
+}
+
+unsafe fn lifecycle_ring_save_rec(rec: &LifecycleDispatchRec, kind: u8) {
+    let dst = lifecycle_ring[lifecycle_ring_pos as usize].as_mut_ptr() as *mut LifecycleDispatchRec;
+    core::ptr::write_unaligned(dst, *rec);
+    lifecycle_ring_len[lifecycle_ring_pos as usize] =
+        core::mem::size_of::<LifecycleDispatchRec>() as u16;
+    lifecycle_ring_kind[lifecycle_ring_pos as usize] = kind;
+    lifecycle_ring_pos = (lifecycle_ring_pos + 1) % LIFECYCLE_RING_LINES as c_int;
+    if lifecycle_ring_filled < LIFECYCLE_RING_LINES as c_int {
+        lifecycle_ring_filled += 1;
     }
-    let s = (now.tv_sec - lifecycle_start_ts.tv_sec) as u64;
-    let ns = now.tv_nsec as i64 - lifecycle_start_ts.tv_nsec as i64;
-    s * 1000000u64 + (ns / 1000) as u64
+}
+
+/// True when dispatch-trace events must be formatted at record time: the shim
+/// trace is live on stdout (--verbose / trace file) or lifecycle events are
+/// streaming to a file (--lifecycle-file). Otherwise they are recorded as
+/// binary ring entries and formatted only if a dump ever happens.
+unsafe fn lifecycle_eager() -> bool {
+    lifecycle_fp_open_if_requested();
+    shim_stdout_enabled != 0 || !lifecycle_fp.is_null()
+}
+static mut lifecycle_fp_buf: [u8; 1 << 15] = [0; 1 << 15];
+unsafe fn lifecycle_elapsed_us() -> u64 {
+    // VIRTUAL (instruction-driven) elapsed µs since machine init. Forensic
+    // stamps in lifecycle.log / stack_writes.log follow game time: they are
+    // deterministic across replays and cost a few loads instead of the
+    // per-event host clock_gettime the old host-clock formula paid (which was
+    // the single hottest line on the stack-op path — every push/pop stamped).
+    shim_virtual_now_ns().saturating_sub(host_time_origin_ns) / 1000
 }
 
 unsafe fn lifecycle_fp_open_if_requested() {
@@ -992,6 +1141,7 @@ unsafe fn lifecycle_ring_save(buf: *const c_char, mut len: usize) {
     libc::memcpy(dst as *mut c_void, buf as *const c_void, len);
     *dst.add(len) = 0;
     lifecycle_ring_len[lifecycle_ring_pos as usize] = len as u16;
+    lifecycle_ring_kind[lifecycle_ring_pos as usize] = LC_TEXT;
     lifecycle_ring_pos = (lifecycle_ring_pos + 1) % LIFECYCLE_RING_LINES as c_int;
     if lifecycle_ring_filled < LIFECYCLE_RING_LINES as c_int {
         lifecycle_ring_filled += 1;
@@ -1054,16 +1204,27 @@ unsafe fn lifecycle_dump_to_dir(dir: *const c_char) {
     let n = lifecycle_ring_filled;
     let start =
         (lifecycle_ring_pos - n + LIFECYCLE_RING_LINES as c_int) % LIFECYCLE_RING_LINES as c_int;
+    let mut fmt = [0u8; LIFECYCLE_LINE_MAX];
     for i in 0..n {
         let idx = ((start + i) % LIFECYCLE_RING_LINES as c_int) as usize;
-        let len = lifecycle_ring_len[idx] as usize;
+        let kind = lifecycle_ring_kind[idx];
+        let (mut line, mut len): (*const u8, usize) = (
+            lifecycle_ring[idx].as_ptr(),
+            lifecycle_ring_len[idx] as usize,
+        );
+        if kind != LC_TEXT {
+            // Deferred dispatch-trace record: format now, exactly as the
+            // eager path would have at record time.
+            let rec = core::ptr::read_unaligned(
+                lifecycle_ring[idx].as_ptr() as *const LifecycleDispatchRec
+            );
+            let w = lifecycle_format_rec(&rec, kind, fmt.as_mut_ptr() as *mut c_char, fmt.len());
+            line = fmt.as_ptr();
+            len = w;
+        }
         let mut off: usize = 0;
         while off < len {
-            let w = libc::write(
-                fd,
-                lifecycle_ring[idx].as_ptr().add(off) as *const c_void,
-                len - off,
-            );
+            let w = libc::write(fd, line.add(off) as *const c_void, len - off);
             if w < 0 {
                 if *libc::__errno_location() == libc::EINTR {
                     continue;
@@ -1074,6 +1235,94 @@ unsafe fn lifecycle_dump_to_dir(dir: *const c_char) {
         }
     }
     libc::close(fd);
+}
+
+/// Render a deferred LC_DISPATCH / LC_NRET record to the exact text the eager
+/// lifecycle_log path would have produced at record time. Returns the byte
+/// length (truncated to cap-1, like lifecycle_log's vsnprintf).
+unsafe fn lifecycle_format_rec(
+    rec: &LifecycleDispatchRec,
+    kind: u8,
+    out: *mut c_char,
+    cap: usize,
+) -> usize {
+    let bn = rec.bn.as_ptr() as *const c_char;
+    let mut w: c_int;
+    if kind == LC_NRET {
+        w = libc::snprintf(
+            out,
+            cap,
+            cstr!("t=%llu NRET 0x%05X popped=%04X -> %s+0x%zX\n"),
+            rec.t_us as c_ulonglong,
+            rec.addr as c_uint,
+            rec.popped as c_uint,
+            bn,
+            rec.off_in as usize,
+        );
+    } else {
+        let mut alias: *const c_char = ptr::null();
+        let mut disp = [0u8; 256];
+        if rec.has_path != 0 {
+            let mut idbuf = [0u8; 160];
+            libc::snprintf(
+                idbuf.as_mut_ptr() as *mut c_char,
+                idbuf.len(),
+                cstr!("%s+0x%zX"),
+                bn,
+                rec.off_in as usize,
+            );
+            alias = aliasreg_alias(idbuf.as_ptr() as *const c_char, 0);
+        }
+        if !alias.is_null() {
+            render_alias_with_args(
+                alias,
+                disp.as_mut_ptr() as *mut c_char,
+                disp.len(),
+                &rec.regs,
+            );
+            w = libc::snprintf(
+                out,
+                cap,
+                cstr!("t=%llu %s 0x%05X -> %s (%s+0x%zX)  bx=%04X si=%04X ax=%04X ds=%04X cs=%04X ip=%04X\n"),
+                rec.t_us as c_ulonglong,
+                rec.kind,
+                rec.addr as c_uint,
+                disp.as_ptr() as *const c_char,
+                bn,
+                rec.off_in as usize,
+                rec.regs.bx as c_uint,
+                rec.regs.si as c_uint,
+                rec.regs.ax as c_uint,
+                rec.regs.ds as c_uint,
+                rec.regs.cs as c_uint,
+                rec.regs.ip as c_uint,
+            );
+        } else {
+            w = libc::snprintf(
+                out,
+                cap,
+                cstr!("t=%llu %s 0x%05X -> %s+0x%zX  bx=%04X si=%04X ax=%04X ds=%04X cs=%04X ip=%04X\n"),
+                rec.t_us as c_ulonglong,
+                rec.kind,
+                rec.addr as c_uint,
+                bn,
+                rec.off_in as usize,
+                rec.regs.bx as c_uint,
+                rec.regs.si as c_uint,
+                rec.regs.ax as c_uint,
+                rec.regs.ds as c_uint,
+                rec.regs.cs as c_uint,
+                rec.regs.ip as c_uint,
+            );
+        }
+    }
+    if w < 0 {
+        return 0;
+    }
+    if w as usize >= cap {
+        return cap - 1;
+    }
+    w as usize
 }
 
 // ============================================================================
@@ -1328,6 +1577,13 @@ unsafe fn io_port_error(func: *const c_char, port: u16) {
     );
     shim_flush_all_streams();
     libc::exit(1);
+}
+
+/// Exit-time execution stats: retired guest instructions vs host wall time.
+/// Under `--speedup N` (pacing mostly idle) host-MIPS approximates raw
+/// execution capability; at speedup 1 it just re-states real-time pacing.
+extern "C" fn report_retired_at_exit() {
+    unsafe { shim_perf_report(cstr!("exit")) }
 }
 
 #[cfg(feature = "force_exit_after_10s")]
@@ -1619,9 +1875,14 @@ pub static mut dd_inc_overlay_first: u64 = 0;
 pub static mut dd_dec_overlay_first: u64 = 0;
 
 const SHIM_ACTIVE_BINARY_MAX: usize = 64;
-static mut active_binary_stack: [*const c_char; SHIM_ACTIVE_BINARY_MAX] =
+// Exported (with the tail_dispatch_* statics) so the chunk prelude can inline
+// enter/leave_binary and tail_dispatch_save/restore — the per-function wrapper
+// bookkeeping — without an FFI hop; layout is part of the chunk ABI.
+#[no_mangle]
+pub static mut active_binary_stack: [*const c_char; SHIM_ACTIVE_BINARY_MAX] =
     [ptr::null(); SHIM_ACTIVE_BINARY_MAX];
-static mut active_binary_top: c_int = 0;
+#[no_mangle]
+pub static mut active_binary_top: c_int = 0;
 
 // ============================================================================
 // Active-binary stack + dispatch-fn lookup  [C lines 1020-1047]
@@ -2202,6 +2463,7 @@ unsafe fn invoke_isr(
     func: *const c_char,
     line: c_int,
 ) {
+    jit_instr_budget -= 30; // int + iret ≈ 59+38 cycles on a 386
     let saved_ss = ss();
     let saved_sp = sp();
     let mut saved_stack_word0: u16 = 0;
@@ -2452,20 +2714,165 @@ pub unsafe extern "C" fn shim_copy_linear_block(seg: u16, off: u16, len: usize, 
     copy_linear_from_segoff(seg, off, len, dst);
 }
 
+/// Instructions handed to the chunks per budget refill (~102µs of game time at
+/// the default 10 MIPS). Small enough for sub-ms IRQ latency and PIT fidelity,
+/// large enough that the slow path is amortized to noise.
+const JIT_BUDGET_QUANTUM: i64 = 1024;
+const NS_PER_BIOS_TICK: u64 = 54_925_000;
+
+// Real-time pacing anchors: virtual (instruction-driven) time is slaved to the
+// host clock scaled by emulation_speedup, by sleeping in the slow path when
+// virtual runs ahead. When the HOST stalls (a JIT compile, scheduler hiccup)
+// we re-anchor instead of letting the game fast-forward to catch up.
+static mut pacing_host_anchor_ns: u64 = 0;
+static mut pacing_virtual_anchor_ns: u64 = 0;
+static mut last_stdin_poll_host_ns: u64 = 0;
+// perf counters (dumped by FIFO opcode 0x1E and the exit report)
+static mut perf_sp_visits: u64 = 0;
+static mut perf_sync_calls: u64 = 0;
+static mut perf_pacing_sleeps: u64 = 0;
+static mut perf_pacing_slept_ns: u64 = 0;
+static mut perf_idle_waits: u64 = 0;
+const PACING_SLACK_NS: u64 = 200_000; // ignore sub-slack drift
+const PACING_MAX_SLEEP_NS: u64 = 2_000_000; // bounded slices: stay responsive
+const PACING_FORGIVE_NS: u64 = 250_000_000; // host stall → re-anchor, don't fast-forward
+
+unsafe fn pacing_service(virtual_now: u64, host_now: u64) {
+    if vclock_state != VCLOCK_RUNNING {
+        return; // halted/stepping: the control FIFO owns time, never sleep-sync
+    }
+    if pacing_host_anchor_ns == 0 {
+        pacing_host_anchor_ns = host_now;
+        pacing_virtual_anchor_ns = virtual_now;
+        return;
+    }
+    let v_elapsed = virtual_now.saturating_sub(pacing_virtual_anchor_ns);
+    let target_host =
+        pacing_host_anchor_ns.wrapping_add((v_elapsed as f64 / emulation_speedup) as u64);
+    if host_now.wrapping_add(PACING_SLACK_NS) < target_host {
+        let mut d = target_host - host_now;
+        if d > PACING_MAX_SLEEP_NS {
+            d = PACING_MAX_SLEEP_NS;
+        }
+        perf_pacing_sleeps += 1;
+        perf_pacing_slept_ns += d;
+        let ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: d as i64,
+        };
+        libc::nanosleep(&ts, ptr::null_mut());
+    } else if host_now > target_host.wrapping_add(PACING_FORGIVE_NS) {
+        pacing_host_anchor_ns = host_now;
+        pacing_virtual_anchor_ns = virtual_now;
+    }
+}
+
+/// Blocking-wait service for runtime-internal input waits (INT 16h AH=0, DOS
+/// console reads) and the emitted `hlt`: the guest retires no instructions
+/// while stalled, so the instruction-driven clock would freeze — but machine
+/// time must keep flowing (PIT music, TAP release deadlines, BIOS ticks) at
+/// real-time pace. Advance the virtual clock to track the host (scaled),
+/// run the safepoint machinery, and yield a slice of host CPU.
 #[no_mangle]
-pub unsafe extern "C" fn safe_point_impl(file: *const c_char, func: *const c_char, line: c_int) {
+pub unsafe extern "C" fn shim_idle_wait() {
+    perf_idle_waits += 1;
+    if vclock_state == VCLOCK_RUNNING {
+        if pacing_host_anchor_ns != 0 {
+            let host_now = shim_host_monotonic_ns();
+            let h_elapsed = host_now.saturating_sub(pacing_host_anchor_ns);
+            let target_v = pacing_virtual_anchor_ns
+                .wrapping_add((h_elapsed as f64 * emulation_speedup) as u64);
+            if target_v > virtual_now_accum_ns {
+                virtual_now_accum_ns = target_v;
+            }
+        }
+    } else if vclock_state == VCLOCK_STEPPING {
+        // A step progresses in bounded slices while the guest idles, so a
+        // FIFO-driven step completes even when the program blocks on input.
+        virtual_now_accum_ns = virtual_now_accum_ns.wrapping_add(1_000_000);
+    }
+    safe_point_impl(SHIMS_FILE, cstr!("shim_idle_wait"), 0);
+    if vclock_state != VCLOCK_HALTED {
+        let ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 1_000_000,
+        };
+        libc::nanosleep(&ts, ptr::null_mut());
+    }
+}
+
+/// Fold the instructions the chunks retired since the last visit into the
+/// virtual clock, refill the budget, and advance the PIT chain to "now".
+/// Called from every safepoint slow-path visit AND from the PIT port
+/// handlers: the guest must never observe a frozen counter — a calibration
+/// loop reading the PIT twice within one budget quantum would compute a zero
+/// delta and #DE on its division. Returns virtual now.
+/// One-line execution snapshot to stderr (FIFO opcode 0x1E, exit report).
+#[no_mangle]
+pub unsafe extern "C" fn shim_perf_report(tag: *const c_char) {
+    let host_elapsed_ns = shim_host_monotonic_ns().saturating_sub(host_time_origin_ns);
+    let virt_elapsed_ns = shim_virtual_now_ns().saturating_sub(host_time_origin_ns);
+    libc::fprintf(
+        stderr,
+        cstr!("[PERF %s] retired=%llu host=%.2fs virtual=%.2fs sp_visits=%llu syncs=%llu sleeps=%llu slept=%.2fs idle_waits=%llu isr_depth=%d cs:ip=%04X:%04X\n"),
+        tag,
+        jit_total_retired as c_ulonglong,
+        host_elapsed_ns as f64 / 1e9,
+        virt_elapsed_ns as f64 / 1e9,
+        perf_sp_visits as c_ulonglong,
+        perf_sync_calls as c_ulonglong,
+        perf_pacing_sleeps as c_ulonglong,
+        perf_pacing_slept_ns as f64 / 1e9,
+        perf_idle_waits as c_ulonglong,
+        isr_depth as c_int,
+        cs() as c_uint,
+        ip() as c_uint,
+    );
+    libc::fflush(stderr);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn shim_time_sync() -> u64 {
+    perf_sync_calls += 1;
+    // Fold WITHOUT refilling: move the fold point to wherever the countdown
+    // stands so the next fold sees only newer instructions, but leave the
+    // countdown itself alone — a guest loop that polls the PIT every few
+    // instructions must still hit the safepoint slow path (IRQ delivery,
+    // pacing) when its budget runs out. Only safe_point_impl refills.
+    let consumed = jit_budget_last_refill - jit_instr_budget;
+    if consumed > 0 {
+        jit_total_retired = jit_total_retired.wrapping_add(consumed as u64);
+        vclock_advance_ns(consumed as u64 * jit_ns_per_instr);
+    }
+    jit_budget_last_refill = jit_instr_budget;
+
     vclock_service();
     let now_ns = shim_virtual_now_ns();
-    let elapsed_ns = now_ns.wrapping_sub(last_host_time_ns);
+    // Virtual elapsed since the PIT chain last advanced. Capped so a stale
+    // anchor (snapshot restore, clock mode change) can't dump an hour of
+    // backlogged ticks at once.
+    let mut elapsed_ns = now_ns.saturating_sub(last_host_time_ns);
+    if elapsed_ns > 1_000_000_000 {
+        elapsed_ns = 1_000_000_000;
+    }
     last_host_time_ns = now_ns;
 
-    if headless_mode == 0 {
-        virtual_display_poll_input();
-    }
-    if isr_depth == 0 {
-        let scaled_elapsed_ns: u64 = (elapsed_ns as f64 * emulation_speedup) as u64;
+    // The 8254 is FREE-RUNNING: it counts continuously regardless of whether
+    // the CPU is servicing an interrupt. Accumulating the PIT / BIOS tick only
+    // at isr_depth==0 was unfaithful and — with the per-basic-block safepoint
+    // model — a hard hang: a guest that spends most of its time inside an ISR
+    // never advances the clock. Alley Cat's BIOS delay loop (`sub ah,ah;
+    // int 1Ah` polling the tick) calls a software interrupt every iteration;
+    // the per-block budget kept depleting *inside* that handler, so every
+    // accumulating safepoint saw isr_depth>0, the tick froze, and the delay
+    // never completed. So accumulate whenever time has elapsed. Only IRQ0
+    // *delivery* stays gated on isr_depth==0 (in safe_point_impl) — a pending
+    // tick set here is delivered once the ISR returns.
+    if elapsed_ns > 0 {
+        // The PIT counts VIRTUAL (instruction-driven) time directly;
+        // emulation_speedup no longer scales here — it scales the pacing.
         pit_cycle_fraction_accum =
-            pit_cycle_fraction_accum.wrapping_add(scaled_elapsed_ns.wrapping_mul(1193182u64));
+            pit_cycle_fraction_accum.wrapping_add(elapsed_ns.wrapping_mul(1193182u64));
         pit_cycle_accum = pit_cycle_accum.wrapping_add(pit_cycle_fraction_accum / 1000000000u64);
         pit_cycle_fraction_accum %= 1000000000u64;
         while pit_cycle_accum >= pit.reload as u64 {
@@ -2478,27 +2885,73 @@ pub unsafe extern "C" fn safe_point_impl(file: *const c_char, func: *const c_cha
             }
             if irq0_pending == 0 {
                 irq0_pending = 1;
-                if headless_mode == 0 {
-                    if now_ns - last_present_time_ns >= 16000000u64 {
-                        last_present_time_ns = now_ns;
-                        stage_and_present_current_buffer();
-                    }
-                } else if now_ns - last_present_time_ns >= 16000000u64 {
+                // Frame present / save-manager poll are the only side effects
+                // that must NOT run re-entrantly inside an ISR; gate just them
+                // on isr_depth==0. The clock itself keeps advancing above.
+                if isr_depth == 0 && now_ns - last_present_time_ns >= 16000000u64 {
                     last_present_time_ns = now_ns;
-                    save_manager_poll_pending();
+                    if headless_mode == 0 {
+                        stage_and_present_current_buffer();
+                    } else {
+                        save_manager_poll_pending();
+                    }
                 }
             }
-        }
-        if headless_mode != 0
-            && SCREENSHOT_INTERVAL_SECS > 0
-            && now_ns - last_screenshot_time_ns >= SCREENSHOT_INTERVAL_SECS as u64 * 1000000000u64
-        {
-            last_screenshot_time_ns = now_ns;
-            shim_save_video_memory();
         }
         if irq0_pending == 0 && bios_timer_tick_backlog > 0 {
             irq0_pending = 1;
         }
+    }
+    now_ns
+}
+
+/// Budget-gated safepoint for the dispatcher hot paths: the per-block polls
+/// and the transfer-cost debits already bound IRQ latency, so a dispatcher
+/// hop only takes the slow path when the budget is actually spent. (The
+/// debits guarantee a resolver ping-pong still drains the budget and polls.)
+#[inline(always)]
+unsafe fn maybe_safe_point(file: *const c_char, func: *const c_char, line: c_int) {
+    if jit_instr_budget <= 0 {
+        safe_point_impl(file, func, line);
+    }
+}
+
+// Host-clock probe cache for the safepoint slow path: a fresh clock_gettime
+// (and a pacing check) only when virtual time moved ≥50µs since the last
+// probe. Rep-block debits drain the budget in large bites, so bursts of
+// slow-path visits land within the same virtual instant; re-reading the host
+// clock for each adds nothing (pacing slack is 200µs — 50µs of extra drift is
+// invisible) but costs a vdso call per visit.
+static mut last_host_probe_virtual_ns: u64 = 0;
+static mut cached_host_now_ns: u64 = 0;
+const HOST_PROBE_MIN_VIRTUAL_NS: u64 = 50_000;
+
+#[no_mangle]
+pub unsafe extern "C" fn safe_point_impl(file: *const c_char, func: *const c_char, line: c_int) {
+    perf_sp_visits += 1;
+    let now_ns = shim_time_sync();
+    jit_instr_budget = JIT_BUDGET_QUANTUM;
+    jit_budget_last_refill = JIT_BUDGET_QUANTUM;
+    let host_now_ns =
+        if now_ns.wrapping_sub(last_host_probe_virtual_ns) >= HOST_PROBE_MIN_VIRTUAL_NS {
+            last_host_probe_virtual_ns = now_ns;
+            cached_host_now_ns = shim_host_monotonic_ns();
+            pacing_service(now_ns, cached_host_now_ns);
+            cached_host_now_ns
+        } else {
+            cached_host_now_ns
+        };
+
+    if headless_mode == 0 {
+        virtual_display_poll_input();
+    }
+    if isr_depth == 0
+        && headless_mode != 0
+        && SCREENSHOT_INTERVAL_SECS > 0
+        && now_ns - last_screenshot_time_ns >= SCREENSHOT_INTERVAL_SECS as u64 * 1000000000u64
+    {
+        last_screenshot_time_ns = now_ns;
+        shim_save_video_memory();
     }
 
     if interrupt_shadow != 0 {
@@ -2506,13 +2959,15 @@ pub unsafe extern "C" fn safe_point_impl(file: *const c_char, func: *const c_cha
         return;
     }
 
-    static mut sp_poll_counter: u32 = 0;
-    sp_poll_counter = sp_poll_counter.wrapping_add(1);
-    let force_stdin_poll = (sp_poll_counter & 0x3FF) == 0;
+    // Poll the control FIFO at least every 5ms of host time (the slow path
+    // runs per budget quantum now, not per instruction, so a call-count gate
+    // would be far too coarse).
+    let force_stdin_poll = host_now_ns.saturating_sub(last_stdin_poll_host_ns) >= 5_000_000;
     if isr_depth == 0
         && keyboard_input_enabled != 0
         && (irq0_pending != 0 || vclock_state != VCLOCK_RUNNING || force_stdin_poll)
     {
+        last_stdin_poll_host_ns = host_now_ns;
         let mut c: u8 = 0;
         loop {
             let r = session_logged_read(&mut c as *mut u8 as *mut c_void, 1);
@@ -2617,6 +3072,10 @@ pub unsafe extern "C" fn safe_point_impl(file: *const c_char, func: *const c_cha
                 shim_dump_ram_snapshot();
                 continue;
             }
+            if c == 0x1E {
+                shim_perf_report(cstr!("fifo"));
+                continue;
+            }
             if c == 0x10 || c == 0x11 {
                 let kind = c;
                 let mut sc: u8 = 0;
@@ -2668,7 +3127,10 @@ pub unsafe extern "C" fn safe_point_impl(file: *const c_char, func: *const c_cha
                     } else {
                         shim_keyboard_enqueue_scancode_press(sc);
                     }
-                    let ns_per_tick: u64 = (54925000.0f64 / emulation_speedup) as u64;
+                    // Deadline in VIRTUAL ns: a BIOS tick is 54.925ms of game
+                    // time; emulation_speedup is a pacing concern, not a
+                    // game-time one.
+                    let ns_per_tick: u64 = NS_PER_BIOS_TICK;
                     let now_v = shim_virtual_now_ns();
                     pending_release_deadline_ns[slot] =
                         now_v.wrapping_add((ticks as u64).wrapping_mul(ns_per_tick));
@@ -2932,6 +3394,7 @@ unsafe fn evict_or_shrink_for_load(new_base: u32, new_len: usize) {
         }
         file_mappings[file_mapping_count] = splits[i];
         file_mapping_count += 1;
+        mem_page_flags_recompute();
     }
 }
 
@@ -2993,6 +3456,7 @@ unsafe fn register_file_mapping(
             );
         }
         file_mapping_count += 1;
+        mem_page_flags_recompute();
     } else {
         libc::printf(cstr!(
             "Error: register_file_mapping: too many file mappings\n"
@@ -3353,6 +3817,7 @@ unsafe fn swap_file_mappings_in_regions(a_start: u32, b_start: u32, len: u32) {
                 file_mappings[i].len = (cut - base) as usize;
                 file_mappings[file_mapping_count] = right;
                 file_mapping_count += 1;
+                mem_page_flags_recompute();
             }
         }
     }
@@ -3448,7 +3913,8 @@ unsafe fn lifecycle_log_dispatch(kind: *const c_char, addr: u32) {
     let fm = find_file_mapping(addr);
     let mut bn: *const c_char = cstr!("<unmapped>");
     let mut off_in: usize = 0;
-    if !fm.is_null() && !(*fm).path.is_null() {
+    let has_path = !fm.is_null() && !(*fm).path.is_null();
+    if has_path {
         let bn0 = libc::strrchr((*fm).path, b'/' as c_int);
         bn = if !bn0.is_null() {
             bn0.add(1)
@@ -3461,10 +3927,53 @@ unsafe fn lifecycle_log_dispatch(kind: *const c_char, addr: u32) {
     if isr_depth > 0 && !unmapped {
         return;
     }
+    let call_like = *kind == b'C' as c_char || *kind == b'L' as c_char;
+    // Callgraph accounting stays eager (a hash-probe + count on settled
+    // edges). Alias self-seeding used to ride a per-transfer registry lookup;
+    // a new callgraph edge fires at exactly the same first-call moments, so
+    // seed only then — steady state does no registry work at all.
+    let new_edge = if call_like {
+        cg_record(((cs() as u32) << 4) + ip() as u32, addr)
+    } else {
+        false
+    };
+    if new_edge && has_path {
+        let mut idbuf = [0u8; 160];
+        libc::snprintf(
+            idbuf.as_mut_ptr() as *mut c_char,
+            idbuf.len(),
+            cstr!("%s+0x%zX"),
+            bn,
+            off_in,
+        );
+        aliasreg_alias(idbuf.as_ptr() as *const c_char, 1);
+    }
+    if !lifecycle_eager() {
+        // Silent run: capture a binary record; the text (identical to the
+        // eager output) is produced only if the ring is ever dumped.
+        let mut rec = LifecycleDispatchRec {
+            t_us: lifecycle_elapsed_us(),
+            kind,
+            addr,
+            popped: 0,
+            has_path: has_path as u8,
+            _pad: 0,
+            off_in: off_in as u64,
+            bn: [0; 20],
+            regs: regsnap_now(),
+        };
+        libc::snprintf(
+            rec.bn.as_mut_ptr() as *mut c_char,
+            rec.bn.len(),
+            cstr!("%s"),
+            bn,
+        );
+        lifecycle_ring_save_rec(&rec, LC_DISPATCH);
+        return;
+    }
     let mut alias: *const c_char = ptr::null();
     let mut disp = [0u8; 256];
-    let call_like = *kind == b'C' as c_char || *kind == b'L' as c_char;
-    if !fm.is_null() && !(*fm).path.is_null() {
+    if has_path {
         let mut idbuf = [0u8; 160];
         libc::snprintf(
             idbuf.as_mut_ptr() as *mut c_char,
@@ -3476,10 +3985,10 @@ unsafe fn lifecycle_log_dispatch(kind: *const c_char, addr: u32) {
         alias = aliasreg_alias(idbuf.as_ptr() as *const c_char, call_like as c_int);
     }
     if !alias.is_null() {
-        render_alias_with_args(alias, disp.as_mut_ptr() as *mut c_char, disp.len());
+        let snap = regsnap_now();
+        render_alias_with_args(alias, disp.as_mut_ptr() as *mut c_char, disp.len(), &snap);
     }
     if call_like {
-        cg_record(((cs() as u32) << 4) + ip() as u32, addr);
         if !alias.is_null() {
             shim_log_stdout(
                 cstr!("Flow: %s 0x%05X -> %s (%s+0x%zX)  from=%04X:%04X\n"),
@@ -4330,60 +4839,99 @@ unsafe fn aliasreg_enum_label(ename: *const c_char, value: u32) -> *const c_char
     ptr::null()
 }
 
-unsafe fn aliasreg_reg_value(r: *const c_char) -> u32 {
+/// Register values captured at a lifecycle-event's record time, so deferred
+/// ring entries can be formatted at dump time with the registers the event
+/// actually saw (the live cpu has long since moved on).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RegSnap {
+    ax: u16,
+    bx: u16,
+    cx: u16,
+    dx: u16,
+    si: u16,
+    di: u16,
+    bp: u16,
+    sp: u16,
+    ip: u16,
+    cs: u16,
+    ds: u16,
+    es: u16,
+    ss: u16,
+}
+
+unsafe fn regsnap_now() -> RegSnap {
+    RegSnap {
+        ax: ax(),
+        bx: bx(),
+        cx: cx(),
+        dx: dx(),
+        si: si(),
+        di: di(),
+        bp: bp(),
+        sp: sp(),
+        ip: ip(),
+        cs: cs(),
+        ds: ds(),
+        es: es(),
+        ss: ss(),
+    }
+}
+
+unsafe fn aliasreg_reg_value(r: *const c_char, s: &RegSnap) -> u32 {
     if libc::strcmp(r, cstr!("ax")) == 0 {
-        return ax() as u32;
+        return s.ax as u32;
     }
     if libc::strcmp(r, cstr!("bx")) == 0 {
-        return bx() as u32;
+        return s.bx as u32;
     }
     if libc::strcmp(r, cstr!("cx")) == 0 {
-        return cx() as u32;
+        return s.cx as u32;
     }
     if libc::strcmp(r, cstr!("dx")) == 0 {
-        return dx() as u32;
+        return s.dx as u32;
     }
     if libc::strcmp(r, cstr!("si")) == 0 {
-        return si() as u32;
+        return s.si as u32;
     }
     if libc::strcmp(r, cstr!("di")) == 0 {
-        return di() as u32;
+        return s.di as u32;
     }
     if libc::strcmp(r, cstr!("bp")) == 0 {
-        return bp() as u32;
+        return s.bp as u32;
     }
     if libc::strcmp(r, cstr!("ds")) == 0 {
-        return ds() as u32;
+        return s.ds as u32;
     }
     if libc::strcmp(r, cstr!("es")) == 0 {
-        return es() as u32;
+        return s.es as u32;
     }
     if libc::strcmp(r, cstr!("cs")) == 0 {
-        return cs() as u32;
+        return s.cs as u32;
     }
     if libc::strcmp(r, cstr!("al")) == 0 {
-        return (ax() & 0xFF) as u32;
+        return (s.ax & 0xFF) as u32;
     }
     if libc::strcmp(r, cstr!("ah")) == 0 {
-        return ((ax() >> 8) & 0xFF) as u32;
+        return ((s.ax >> 8) & 0xFF) as u32;
     }
     if libc::strcmp(r, cstr!("bl")) == 0 {
-        return (bx() & 0xFF) as u32;
+        return (s.bx & 0xFF) as u32;
     }
     if libc::strcmp(r, cstr!("bh")) == 0 {
-        return ((bx() >> 8) & 0xFF) as u32;
+        return ((s.bx >> 8) & 0xFF) as u32;
     }
     if libc::strcmp(r, cstr!("cl")) == 0 {
-        return (cx() & 0xFF) as u32;
+        return (s.cx & 0xFF) as u32;
     }
     if libc::strcmp(r, cstr!("ch")) == 0 {
-        return ((cx() >> 8) & 0xFF) as u32;
+        return ((s.cx >> 8) & 0xFF) as u32;
     }
     if libc::strcmp(r, cstr!("dl")) == 0 {
-        return (dx() & 0xFF) as u32;
+        return (s.dx & 0xFF) as u32;
     }
     if libc::strcmp(r, cstr!("dh")) == 0 {
-        return ((dx() >> 8) & 0xFF) as u32;
+        return ((s.dx >> 8) & 0xFF) as u32;
     }
     0
 }
@@ -4392,6 +4940,7 @@ unsafe fn render_alias_with_args(
     alias: *const c_char,
     out: *mut c_char,
     cap: usize,
+    regs: &RegSnap,
 ) -> *const c_char {
     let lp = libc::strchr(alias, b'(' as c_int);
     if lp.is_null() {
@@ -4464,7 +5013,7 @@ unsafe fn render_alias_with_args(
                 en[k] = 0;
             }
         }
-        let v = aliasreg_reg_value(reg.as_ptr() as *const c_char);
+        let v = aliasreg_reg_value(reg.as_ptr() as *const c_char, regs);
         let lab = if en[0] != 0 {
             aliasreg_enum_label(en.as_ptr() as *const c_char, v)
         } else {
@@ -4663,9 +5212,11 @@ unsafe fn cg_save() {
     );
 }
 
-unsafe fn cg_record(caller: u32, callee: u32) {
+/// Record a callgraph edge; returns true when the edge is NEW (first time
+/// this caller→callee pair is seen) — the moment alias self-seeding fires.
+unsafe fn cg_record(caller: u32, callee: u32) -> bool {
     if isr_depth != 0 {
-        return;
+        return false;
     }
     let h = caller
         .wrapping_mul(2654435761u32)
@@ -4675,7 +5226,7 @@ unsafe fn cg_record(caller: u32, callee: u32) {
         if e.used != 0 {
             if e.caller == caller && e.callee == callee {
                 e.count += 1;
-                return;
+                return false;
             }
             continue;
         }
@@ -4715,8 +5266,9 @@ unsafe fn cg_record(caller: u32, callee: u32) {
             cg_new_since_save = 0;
             cg_save();
         }
-        return;
+        return true;
     }
+    false
 }
 
 // ============================================================================
@@ -5488,7 +6040,7 @@ const SWO_POP: u8 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct StackWriteEvent {
+pub struct StackWriteEvent {
     t_us: u32,
     writer_cs: u16,
     writer_ip: u16,
@@ -5523,9 +6075,14 @@ impl StackWriteEvent {
 const STACK_WRITE_RING_BITS: u32 = 11;
 const STACK_WRITE_RING_SIZE: u32 = 1u32 << STACK_WRITE_RING_BITS;
 const STACK_WRITE_RING_MASK: u32 = STACK_WRITE_RING_SIZE - 1;
-static mut stack_write_ring: [StackWriteEvent; STACK_WRITE_RING_SIZE as usize] =
+// Exported so the chunk prelude's SS-segment fast path can append push/pop
+// events inline (saisei_rt.rs mirrors StackWriteEvent's #[repr(C)] layout and
+// the [-16, +256]-of-SP filter; the two must be edited together).
+#[no_mangle]
+pub static mut stack_write_ring: [StackWriteEvent; STACK_WRITE_RING_SIZE as usize] =
     [StackWriteEvent::ZERO; STACK_WRITE_RING_SIZE as usize];
-static mut stack_write_ring_pos: u32 = 0;
+#[no_mangle]
+pub static mut stack_write_ring_pos: u32 = 0;
 
 unsafe fn stack_op_record(
     kind: u8,
@@ -5795,6 +6352,7 @@ pub unsafe extern "C" fn shim_bookend_start() {
     bookend_writes_logged = 0;
     bookend_writes_skipped = 0;
     bookend_active = 1;
+    mem_page_flags_recompute(); // capture mode: route every write through the impl
     shim_log_stdout(cstr!("Bookend: START\n"));
 }
 
@@ -5805,6 +6363,7 @@ pub unsafe extern "C" fn shim_bookend_stop() {
         return;
     }
     bookend_active = 0;
+    mem_page_flags_recompute();
     bookend_dump_snapshot(cstr!("/tmp/zbookend_snap2.bin"));
     if !bookend_log_fp.is_null() {
         libc::fprintf(
@@ -5870,6 +6429,97 @@ unsafe fn bookend_log_write(
     bookend_writes_logged += 1;
 }
 
+// ---- write fast-path page flags ---------------------------------------------
+//
+// One byte per 4KB page of guest memory. A zero flag means a chunk's inline
+// `memb_write`/`memw_write` (saisei_rt.rs) may store directly; a nonzero flag
+// routes the write through `mem*_write_impl` so every special behavior —
+// JIT'd-code invalidation, write watches / annotation vars, protected slots,
+// the null-page warning, .drv cross-binary overwrite detection, bookend
+// capture — runs exactly as before. Flags only ever err toward the slow path:
+// a stale flag costs a few ns, a missing one would drop a behavior, so every
+// event that could grow the special set (chunk registration, file-mapping
+// registration, bookend start) triggers a recompute.
+#[no_mangle]
+pub static mut mem_page_flags: [u8; MEMORY_SIZE >> 12] = [0; MEMORY_SIZE >> 12];
+
+static mut watch_vars_init: c_int = 0;
+static mut watch_vars_resolved_at: usize = usize::MAX;
+
+unsafe fn watch_ranges_prepare() {
+    if watch_vars_init == 0 {
+        watch_vars_init = 1;
+        aliasreg_vars_load();
+    }
+    if aliasreg_has_origin_vars != 0 && file_mapping_count != watch_vars_resolved_at {
+        watch_vars_resolved_at = file_mapping_count;
+        aliasreg_vars_resolve();
+    }
+}
+
+unsafe fn mem_page_flag_range(lo: u32, hi_exclusive: u32) {
+    if hi_exclusive <= lo {
+        return;
+    }
+    let first = (lo >> 12) as usize;
+    let last = ((hi_exclusive - 1) >> 12) as usize;
+    for p in first..=last.min((MEMORY_SIZE >> 12) - 1) {
+        mem_page_flags[p] = 1;
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn mem_page_flags_recompute() {
+    if bookend_active != 0 {
+        // capture-everything mode: every write goes through the impl
+        for p in mem_page_flags.iter_mut() {
+            *p = 1;
+        }
+        return;
+    }
+    for p in mem_page_flags.iter_mut() {
+        *p = 0;
+    }
+    // null-pointer page (the 0000:0000..000F warning lives in the impl)
+    mem_page_flags[0] = 1;
+    // live JIT chunk code ranges (self-modifying-code invalidation)
+    for i in 0..jit_chunk_count {
+        let c = &jit_chunks[i];
+        if c.stale == 0 {
+            mem_page_flag_range(c.seg_base + c.lo, c.seg_base + c.hi);
+        }
+    }
+    // .drv file mappings (cross-binary overwrite abort in warn_on_mutation)
+    for i in 0..file_mapping_count {
+        let path = file_mappings[i].path;
+        if !path.is_null() {
+            let plen = libc::strlen(path);
+            if plen >= 4 && libc::strcmp(path.add(plen - 4), cstr!(".drv")) == 0 {
+                mem_page_flag_range(
+                    file_mappings[i].base,
+                    file_mappings[i].base + file_mappings[i].len as u32,
+                );
+            }
+        }
+    }
+    // write watches + annotation vars
+    watch_ranges_prepare();
+    for i in 0..write_watches_count {
+        if write_watches[i].lo <= write_watches[i].hi {
+            mem_page_flag_range(write_watches[i].lo, write_watches[i].hi + 1);
+        }
+    }
+    if aliasreg_var_lo <= aliasreg_var_hi {
+        mem_page_flag_range(aliasreg_var_lo, aliasreg_var_hi.saturating_add(1));
+    }
+    // protected slots
+    for i in 0..game_config.protected_slot_count {
+        let lo = (*game_config.protected_slots.add(i)).lo;
+        let hi = (*game_config.protected_slots.add(i)).hi;
+        mem_page_flag_range(lo, hi.saturating_add(1));
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn write_watch_log(
     addr: u32,
@@ -5879,16 +6529,7 @@ pub unsafe extern "C" fn write_watch_log(
     func: *const c_char,
     line: c_int,
 ) {
-    static mut vars_init: c_int = 0;
-    static mut vars_resolved_at: usize = usize::MAX;
-    if vars_init == 0 {
-        vars_init = 1;
-        aliasreg_vars_load();
-    }
-    if aliasreg_has_origin_vars != 0 && file_mapping_count != vars_resolved_at {
-        vars_resolved_at = file_mapping_count;
-        aliasreg_vars_resolve();
-    }
+    watch_ranges_prepare();
     if addr >= aliasreg_var_lo && addr <= aliasreg_var_hi {
         aliasreg_var_write(addr, size as u8, value);
     }
@@ -5977,12 +6618,23 @@ pub unsafe extern "C" fn memw_write_impl(
         rcb_write16_impl(field, value, file, func, line);
         return;
     }
-    bookend_log_write(seg, off, addr, 2, value as u32, file, func, line);
-    write_watch_log(addr, 2, value as u32, file, func, line);
-    warn_on_mutation(addr, 2, file, func, line);
     stack_op_record(SWO_PUSH, seg, off, value, file, line);
+    // The special write behaviors (bookend capture, watches/annotation vars,
+    // .drv cross-binary tripwire, protected slots, JIT'd-code invalidation)
+    // all live on flagged pages — mem_page_flags_recompute marks every range
+    // they can match. An unflagged page write (the overwhelmingly common
+    // case: runtime-internal stack pushes from lcall/call_table) is a plain
+    // store, same as the chunk-inline fast path already treats byte writes.
+    let addr_hi = mask_addr(addr.wrapping_add(1));
+    if mem_page_flags[(addr >> 12) as usize] != 0 || mem_page_flags[(addr_hi >> 12) as usize] != 0 {
+        bookend_log_write(seg, off, addr, 2, value as u32, file, func, line);
+        write_watch_log(addr, 2, value as u32, file, func, line);
+        warn_on_mutation(addr, 2, file, func, line);
+        memw_raw_write(seg, off, value);
+        shim_jit_invalidate_code_range(addr, 2);
+        return;
+    }
     memw_raw_write(seg, off, value);
-    shim_jit_invalidate_code_range(addr, 2);
 }
 
 #[no_mangle]
@@ -6018,11 +6670,17 @@ pub unsafe extern "C" fn memb_write_impl(
         rcb_write8_impl(field, value, file, func, line);
         return;
     }
-    bookend_log_write(seg, off, addr, 1, value as u32, file, func, line);
-    write_watch_log(addr, 1, value as u32, file, func, line);
-    warn_on_mutation(addr, 1, file, func, line);
+    // Flag-gated like memw_write_impl: unflagged pages carry no special write
+    // behavior (see the comment there).
+    if mem_page_flags[(addr >> 12) as usize] != 0 {
+        bookend_log_write(seg, off, addr, 1, value as u32, file, func, line);
+        write_watch_log(addr, 1, value as u32, file, func, line);
+        warn_on_mutation(addr, 1, file, func, line);
+        *seg_off(seg, off) = value;
+        shim_jit_invalidate_code_range(addr, 1);
+        return;
+    }
     *seg_off(seg, off) = value;
-    shim_jit_invalidate_code_range(addr, 1);
 }
 
 unsafe fn rep_range_touches_rcb(seg: u16, lo: u32, len: u32) -> c_int {
@@ -6082,6 +6740,7 @@ unsafe fn maybe_register_relocation_shadow(src_lo: u32, dst_lo: u32, count: u32)
     }
     let idx = file_mapping_count;
     file_mapping_count += 1;
+    mem_page_flags_recompute();
     file_mappings[idx] = FileMapping::ZERO;
     let src_path = (*src_fm).path;
     let fm = &mut file_mappings[idx];
@@ -6118,6 +6777,9 @@ pub unsafe extern "C" fn rep_movsb_block_impl(
         return;
     }
     let count: u32 = cx() as u32;
+    // The block copy stands in for `count` iterations of rep movsb: debit the
+    // instruction budget so bulk copies consume game time like real ones.
+    jit_instr_budget -= count as i64;
     let delta: c_int = if DF() != 0 { -1 } else { 1 };
 
     if rep_would_wrap(si(), count, delta) != 0 || rep_would_wrap(di(), count, delta) != 0 {
@@ -6195,6 +6857,7 @@ pub unsafe extern "C" fn rep_stosb_block_impl(
         return;
     }
     let count: u32 = cx() as u32;
+    jit_instr_budget -= count as i64; // count iterations of rep stosb
     let delta: c_int = if DF() != 0 { -1 } else { 1 };
 
     if rep_would_wrap(di(), count, delta) != 0 {
@@ -6249,6 +6912,7 @@ pub unsafe extern "C" fn rep_movsw_block_impl(
         return;
     }
     let count_words: u32 = cx() as u32;
+    jit_instr_budget -= count_words as i64; // count iterations of rep movsw
     let count_bytes: u32 = count_words * 2;
     let delta: c_int = if DF() != 0 { -2 } else { 2 };
 
@@ -6721,6 +7385,14 @@ unsafe extern "C" fn init_memory() {
     memw_raw_write(0, 0x1C * 4 + 2, BIOS_TIMER_TICK_ISR_SEG);
     memw_raw_write(0, 0x33 * 4, MOUSE_ISR_OFF);
     memw_raw_write(0, 0x33 * 4 + 2, MOUSE_ISR_SEG);
+    // Seed the instruction-driven virtual clock from the host monotonic clock
+    // so virtual and host share an epoch, and hand the chunks their first
+    // instruction budget.
+    virtual_now_accum_ns = shim_host_monotonic_ns();
+    jit_instr_budget = JIT_BUDGET_QUANTUM;
+    jit_budget_last_refill = JIT_BUDGET_QUANTUM;
+    mem_page_flags_recompute();
+    libc::atexit(report_retired_at_exit);
     last_host_time_ns = shim_virtual_now_ns();
     host_time_origin_ns = last_host_time_ns;
     pit_cycle_accum = 0;
@@ -6851,6 +7523,71 @@ unsafe fn pit_state_for_channel(channel: u8) -> *mut PITState {
     }
 }
 
+// 8254 channel-2 OUTPUT state (port 0x61 bit 5) needs the operating mode
+// (control-word bits 1-3) and the virtual time of the last counter load /
+// gate rise — neither lives in the FROZEN PITState (snapshots serialize that
+// layout byte-for-byte), so they are separate statics. After a snapshot
+// restore they reset (a one-sound transient), which is benign.
+static mut pit_ch2_mode: u8 = 3;
+static mut pit_ch2_load_ns: u64 = 0;
+
+/// Virtual-time elapsed PIT ticks since `since_ns` (1 tick = 838.1ns).
+unsafe fn pit_ticks_since(since_ns: u64) -> u64 {
+    let elapsed = shim_virtual_now_ns().saturating_sub(since_ns);
+    ((elapsed as u128 * 1193182u128) / 1_000_000_000u128) as u64
+}
+
+/// The 8254 channel-2 output pin, as port 0x61 bit 5 reports it. Faithful for
+/// the modes games use: mode 0 (one-shot: out low from load until the count
+/// expires — the "wait for timer" poll idiom), mode 2 (rate generator: out
+/// high except one tick at terminal count; forced high while the gate is
+/// low), mode 3 (square wave: high first half of each period; forced high
+/// while the gate is low). The gate is port 0x61 bit 0.
+unsafe fn pit_ch2_output() -> u8 {
+    let gate = port61 & 1;
+    let reload: u64 = if pit_channel2.reload != 0 {
+        pit_channel2.reload as u64
+    } else {
+        0x10000
+    };
+    match pit_ch2_mode {
+        0 => {
+            // Gate low suspends counting: not expired yet (the poll idiom
+            // loads the count with the gate already high).
+            if gate == 0 {
+                return 0;
+            }
+            (pit_ticks_since(pit_ch2_load_ns) >= reload) as u8
+        }
+        2 => {
+            if gate == 0 {
+                return 1;
+            }
+            (pit_ticks_since(pit_ch2_load_ns) % reload != reload - 1) as u8
+        }
+        _ => {
+            if gate == 0 {
+                return 1;
+            }
+            (pit_ticks_since(pit_ch2_load_ns) % reload < (reload + 1) / 2) as u8
+        }
+    }
+}
+
+/// The AT's DRAM refresh-detect bit (port 0x61 bit 4): toggles on each PIT
+/// channel-1 terminal count. The BIOS programs channel 1 to 18 ticks
+/// (15.085µs); our machine starts post-POST, so an unprogrammed channel 1
+/// models that BIOS value. Period code busy-waits by COUNTING these toggles
+/// — a static bit spins such a delay loop forever.
+unsafe fn refresh_detect_bit() -> u8 {
+    let reload: u64 = match pit_channel1.reload {
+        0 | 0x10000 => 18,
+        r => r as u64,
+    };
+    let period_ns = reload * 1_000_000_000 / 1193182;
+    ((shim_virtual_now_ns() / period_ns) & 1) as u8
+}
+
 unsafe fn pit_commit_reload(state: *mut PITState, channel: u8) {
     let reload_value: u32 = if (*state).temp_reload != 0 {
         (*state).temp_reload as u32
@@ -6863,6 +7600,11 @@ unsafe fn pit_commit_reload(state: *mut PITState, channel: u8) {
         pit_reload_value = (reload_value & 0xFFFF) as u32;
         pit_read_expect_high = 0;
         pit_latch_valid = 0;
+    }
+    if channel == 2 {
+        // A data write (re)starts channel 2's count — the anchor the output
+        // model (port 0x61 bit 5) measures from.
+        pit_ch2_load_ns = shim_virtual_now_ns();
     }
 }
 
@@ -6900,8 +7642,18 @@ unsafe fn pit_write_data(channel: u8, value: u8) {
 // IO-port dispatch (inb/outb/inw/outw) + block scan helpers  [C lines 5142-5624]
 // ============================================================================
 
+// Last I/O port the guest touched + a monotonic access counter, sampled by the
+// SIGUSR1 freeze diagnostic (a spin on a status port is named directly by
+// watching last_io_port stay pinned while io_access_counter races).
+static mut last_io_port: u16 = 0xFFFF;
+static mut last_io_was_read: u8 = 0;
+static mut io_access_counter: u64 = 0;
+
 #[no_mangle]
 pub unsafe extern "C" fn inb(port: u16) -> u8 {
+    last_io_port = port;
+    last_io_was_read = 1;
+    io_access_counter = io_access_counter.wrapping_add(1);
     let dev = io_bus_lookup(port);
     if !dev.is_null() {
         return ((*dev).read8.unwrap())(port);
@@ -6931,9 +7683,31 @@ pub unsafe extern "C" fn inb(port: u16) -> u8 {
         return kbd.last_scancode;
     }
     if port == 0x61 {
-        return port61;
+        // Port B read: the low nibble echoes the written control bits
+        // (speaker gate/data enable); bit 4 = DRAM refresh detect, bit 5 =
+        // 8254 channel-2 output — LIVE hardware state derived from the
+        // virtual clock. These bits read as static constants before, which is
+        // a real hang class on this corpus's period: PC-speaker sound routines
+        // and refresh-counting delay loops (INT 15h AH=86h style, and driver
+        // BUSY-waits on the channel-2 one-shot) poll them and never advance if
+        // they don't toggle. Faithful modelling, not a targeted band-aid.
+        // Fold time first, same rule as the PIT data ports: a poll loop must
+        // see time flowing between safepoints.
+        shim_time_sync();
+        let mut v = port61 & 0x0F;
+        if refresh_detect_bit() != 0 {
+            v |= 0x10;
+        }
+        if pit_ch2_output() != 0 {
+            v |= 0x20;
+        }
+        return v;
     }
     if port == 0x40 {
+        // Fold un-accounted budget into the clock first: the counter must
+        // move between two reads inside one quantum (calibration loops #DE
+        // on a zero delta otherwise).
+        shim_time_sync();
         let mut ret: u8;
         if pit.access_mode == 0x3 {
             if pit_read_expect_high == 0 {
@@ -6973,6 +7747,7 @@ pub unsafe extern "C" fn inb(port: u16) -> u8 {
         return ret;
     }
     if port == 0x42 {
+        shim_time_sync(); // live counter — see port 0x40
         let reload2: u16 = if pit_channel2.reload != 0 {
             pit_channel2.reload as u16
         } else {
@@ -7039,18 +7814,38 @@ pub unsafe extern "C" fn inb(port: u16) -> u8 {
         return vga.palette_mask;
     }
     if port == 0x3BA || port == 0x3DA {
-        let now_ms: u64 = shim_scaled_monotonic_ns() / 1000000u64;
-        static mut last_toggle_ms: u64 = 0;
-        static mut in_vsync: u8 = 0;
-        if now_ms - last_toggle_ms >= 16 {
-            in_vsync ^= 1;
-            last_toggle_ms = now_ms;
-        }
+        // CGA/MDA status register, modeled from the 6845's real raster timing
+        // on the shared 14.318MHz crystal (same time base as the PIT):
+        //   bit 0 = display disabled (horizontal OR vertical blanking) — games
+        //           write CGA VRAM snow-free one word per ~64µs hblank window;
+        //   bit 3 = vertical sync pulse (MC6845: fixed 16 scan lines starting
+        //           at the programmed vsync row — line 224 of 262 on CGA).
+        // Both bits are set during vsync (display is disabled there too).
+        // The old model was a 16ms half-period square wave with bit0 and bit3
+        // mutually exclusive: a snow-avoiding redraw loop (wait-for-hblank per
+        // word) took ~32ms per WORD instead of ≤64µs — Alley Cat's title cat
+        // froze for ~30s per animation frame.
+        //
+        // Fold retired units into the virtual clock first, exactly like the
+        // PIT port handlers: a polling loop must see time flowing between
+        // safepoints, or the ~19µs hblank window aliases against the budget
+        // quantum.
+        let t = shim_time_sync();
+        const LINE_NS: u64 = 63_695; // 15.70kHz horizontal rate
+        const FRAME_LINES: u64 = 262; // 59.92Hz frame
+        const VISIBLE_LINES: u64 = 200;
+        const VSYNC_START_LINE: u64 = 224;
+        const VSYNC_LINES: u64 = 16; // MC6845 vsync width is fixed
+        const H_ACTIVE_NS: u64 = 44_700; // 80 of 114 char clocks visible
+        let frame_pos = t % (LINE_NS * FRAME_LINES);
+        let line = frame_pos / LINE_NS;
+        let line_pos = frame_pos % LINE_NS;
         let mut status: u8 = 0;
-        if in_vsync != 0 {
-            status |= 0x08;
-        } else {
+        if line >= VISIBLE_LINES || line_pos >= H_ACTIVE_NS {
             status |= 0x01;
+        }
+        if line >= VSYNC_START_LINE && line < VSYNC_START_LINE + VSYNC_LINES {
+            status |= 0x08;
         }
         return status;
     }
@@ -7079,6 +7874,9 @@ pub unsafe extern "C" fn inw(port: u16) -> u16 {
 
 #[no_mangle]
 pub unsafe extern "C" fn outb(port: u16, value: u8) {
+    last_io_port = port;
+    last_io_was_read = 0;
+    io_access_counter = io_access_counter.wrapping_add(1);
     let dev = io_bus_lookup(port);
     if !dev.is_null() {
         ((*dev).write8.unwrap())(port, value);
@@ -7115,6 +7913,7 @@ pub unsafe extern "C" fn outb(port: u16, value: u8) {
                 // Read-back command (channel == 3) not yet implemented.
             } else if access == 0x00 {
                 if channel == 0 {
+                    shim_time_sync(); // latch a live counter — see inb 0x40
                     pit_latched_value = pit_current_count();
                     pit_latch_valid = 1;
                     pit_read_expect_high = 0;
@@ -7125,13 +7924,28 @@ pub unsafe extern "C" fn outb(port: u16, value: u8) {
                 if channel == 0 {
                     pit_latch_valid = 0;
                 }
+                if channel == 2 {
+                    // Control-word bits 1-3 select the operating mode (the
+                    // 8254 aliases 6/7 back to 2/3); mode 0 drops the output
+                    // low immediately — anchor now, the data write re-anchors.
+                    let mut mode = (value >> 1) & 0x07;
+                    if mode >= 6 {
+                        mode -= 4;
+                    }
+                    pit_ch2_mode = mode;
+                    pit_ch2_load_ns = shim_virtual_now_ns();
+                }
             }
         }
         0x40 => pit_write_data(0, value),
         0x41 => pit_write_data(1, value),
         0x42 => pit_write_data(2, value),
         0x61 => {
-            let _old = port61;
+            // A gate rising edge (bit 0) reloads channel 2's counter in the
+            // periodic modes — re-anchor the output model.
+            if value & 1 != 0 && port61 & 1 == 0 {
+                pit_ch2_load_ns = shim_virtual_now_ns();
+            }
             port61 = value;
         }
         0x3B4 | 0x3B5 => {}
@@ -8286,6 +9100,7 @@ pub unsafe extern "C" fn shim_file_mappings_add_for_restore(
     file_mappings[file_mapping_count].data = ptr::null_mut();
     file_mappings[file_mapping_count].canonical_cs = canonical_cs;
     file_mapping_count += 1;
+    mem_page_flags_recompute();
     0
 }
 
@@ -8613,9 +9428,19 @@ pub unsafe extern "C" fn iret_impl(file: *const c_char, func: *const c_char, lin
     set_IF(((flags >> 9) & 1) as u8);
     set_DF(((flags >> 10) & 1) as u8);
     set_OF(((flags >> 11) & 1) as u8);
-    if old_if == 0 && IF() != 0 {
-        interrupt_shadow = 1;
-    }
+    let _ = old_if;
+    // IRET does NOT create an interrupt shadow. Only STI, MOV SS and POP SS
+    // inhibit interrupt recognition for the following instruction on x86; after
+    // an IRET that re-enables IF, a pending maskable interrupt is recognized
+    // immediately. Setting the shadow here was unfaithful, and with the
+    // per-basic-block safepoint model it became a hard hang: a loop that calls
+    // a software interrupt every iteration (Zeliard's shop music-poll: INT 61h,
+    // whose handler returns with IF 0->1) re-armed this shadow between the rare
+    // budget-gated safepoints, so every safepoint early-returned before
+    // delivering the pending timer IRQ0 — the hooked INT8 music tick never ran,
+    // the RCB flag it sets never changed, and the poll loop spun forever. (The
+    // old per-instruction safepoint masked this: a safepoint ran the very next
+    // instruction, consumed the shadow, and the one after delivered the IRQ.)
     set_cs(seg);
     set_ip(new_ip);
 }
@@ -8780,6 +9605,9 @@ struct JitChunk {
     fn_: DispatchFn,
     handle: *mut c_void,
     stale: c_int,
+    /// Next chunk index with the same seg_base (newest-first bucket list of
+    /// `jit_seg_heads`), -1 = end. Maintained by `jit_seg_index_relink`.
+    next_same_seg: i32,
 }
 impl JitChunk {
     const ZERO: JitChunk = JitChunk {
@@ -8793,6 +9621,7 @@ impl JitChunk {
         fn_: None,
         handle: ptr::null_mut(),
         stale: 0,
+        next_same_seg: -1,
     };
 }
 const MAX_JIT_CHUNKS: usize = 1024;
@@ -8800,6 +9629,52 @@ static mut jit_chunks: [JitChunk; MAX_JIT_CHUNKS] = [JitChunk::ZERO; MAX_JIT_CHU
 static mut jit_chunk_count: usize = 0;
 static mut jit_code_lo: u32 = 0xFFFFFFFF;
 static mut jit_code_hi: u32 = 0;
+
+/// Per-segbase chunk index: head of a newest-first list of chunk indices for
+/// each 16-byte-aligned seg base (encoded idx+1, 0 = empty; zero-init → BSS).
+/// The dispatch hot path resolves the live cs's chunk in O(chunks-at-this-cs)
+/// instead of scanning the whole registry newest-first.
+static mut jit_seg_heads: [u16; MEMORY_SIZE >> 4] = [0; MEMORY_SIZE >> 4];
+
+/// (Re-)insert chunk `idx` at the head of its seg_base bucket. A reused stale
+/// slot is already in the list (same seg_base) — unlink it first so the bucket
+/// stays newest-first and cycle-free.
+unsafe fn jit_seg_index_relink(idx: usize) {
+    let slot = (jit_chunks[idx].seg_base >> 4) as usize;
+    let mut cur = jit_seg_heads[slot] as i32 - 1;
+    if cur == idx as i32 {
+        jit_seg_heads[slot] = (jit_chunks[idx].next_same_seg + 1) as u16;
+    } else {
+        while cur >= 0 {
+            let nxt = jit_chunks[cur as usize].next_same_seg;
+            if nxt == idx as i32 {
+                jit_chunks[cur as usize].next_same_seg = jit_chunks[idx].next_same_seg;
+                break;
+            }
+            cur = nxt;
+        }
+    }
+    jit_chunks[idx].next_same_seg = jit_seg_heads[slot] as i32 - 1;
+    jit_seg_heads[slot] = (idx + 1) as u16;
+}
+
+/// Newest-first lookup restricted to one seg base: the chunk that decodes
+/// `seg_base:off` (off must be a decoded case key), or null. This is the
+/// dispatch fast path — a far transfer lands at the live cs almost always.
+unsafe fn jit_lookup_at_base(seg_base: u32, off: u32) -> *mut JitChunk {
+    if off >= 0x10000 {
+        return ptr::null_mut();
+    }
+    let mut cur = jit_seg_heads[(seg_base >> 4) as usize] as i32 - 1;
+    while cur >= 0 {
+        let c = &mut jit_chunks[cur as usize] as *mut JitChunk;
+        if (*c).stale == 0 && off >= (*c).lo && off < (*c).hi && jit_chunk_has_key(c, off) != 0 {
+            return c;
+        }
+        cur = (*c).next_same_seg;
+    }
+    ptr::null_mut()
+}
 
 unsafe fn jit_chunk_has_key(c: *const JitChunk, off: u32) -> c_int {
     if (*c).keys.is_null() || (*c).nkeys == 0 {
@@ -8938,18 +9813,7 @@ unsafe fn jit_lookup(linear: u32) -> *mut JitChunk {
 
 #[no_mangle]
 pub unsafe extern "C" fn shim_pc_is_jit_case_key(seg: u16, off: u16) -> c_int {
-    let seg_base = (seg as u32) << 4;
-    for i in 0..jit_chunk_count {
-        let c = &jit_chunks[i] as *const JitChunk;
-        if (*c).stale != 0 || (*c).seg_base != seg_base {
-            continue;
-        }
-        if off as u32 >= (*c).lo && (off as u32) < (*c).hi && jit_chunk_has_key(c, off as u32) != 0
-        {
-            return 1;
-        }
-    }
-    0
+    (!jit_lookup_at_base((seg as u32) << 4, off as u32).is_null()) as c_int
 }
 
 unsafe fn jit_invalidate_range_impl(lin: u32, len: u32) {
@@ -9024,8 +9888,8 @@ unsafe fn jit_dispatch(
 
 unsafe fn jit_compile_or_get(seg: u16, off: u16) -> *mut JitChunk {
     let seg_base = (seg as u32) << 4;
-    let existing = jit_lookup(seg_base + off as u32);
-    if !existing.is_null() && (*existing).seg_base == seg_base {
+    let existing = jit_lookup_at_base(seg_base, off as u32);
+    if !existing.is_null() {
         return existing;
     }
     let repo = libc::getenv(cstr!("SAISEI_REPO_ROOT"));
@@ -9180,13 +10044,30 @@ unsafe fn jit_compile_or_get(seg: u16, off: u16) -> *mut JitChunk {
                         (*c).stale = 0;
                         (*c).keys = ptr::null_mut();
                         (*c).nkeys = 0;
+                        jit_seg_index_relink(c.offset_from(jit_chunks.as_ptr()) as usize);
                         if seg_base + lo < jit_code_lo {
                             jit_code_lo = seg_base + lo;
                         }
                         if seg_base + hi > jit_code_hi {
                             jit_code_hi = seg_base + hi;
                         }
-                        jit_load_keys(c, so.as_ptr() as *const c_char);
+                        mem_page_flags_recompute();
+                        // Sidecars (.keys/.code) are named by the CHUNK, not
+                        // by the object file: batched speculative compiles
+                        // share one .so between many chunks, so derive the
+                        // sidecar base from the symbol name.
+                        let mut sidecar = [0u8; 1100];
+                        let symlen = libc::strlen(sym.as_ptr() as *const c_char);
+                        let namelen = symlen.saturating_sub(9); // strip "_dispatch"
+                        libc::snprintf(
+                            sidecar.as_mut_ptr() as *mut c_char,
+                            sidecar.len(),
+                            cstr!("%s/%.*s.so"),
+                            dir.as_ptr() as *const c_char,
+                            namelen as c_int,
+                            sym.as_ptr() as *const c_char,
+                        );
+                        jit_load_keys(c, sidecar.as_ptr() as *const c_char);
                         shim_log_stdout(
                             cstr!("JIT: chunk %04X:[%04X,%04X) (lin %05X) %s keys=%zu\n"),
                             seg as c_uint,
@@ -9263,6 +10144,60 @@ unsafe fn jit_compile_or_get(seg: u16, off: u16) -> *mut JitChunk {
         libc::exit(1);
     }
     vclock_resume();
+
+    // Speculative background pre-compile of this segment's other entries: one
+    // detached, niced `saisei-jitc speculate` per segbase per run. The dump is
+    // re-written to a speculate-private file first (later compiles of this
+    // segbase overwrite seg_<base>.bin), and everything the child produces is
+    // plain cache content that later foreground jit-compiles resolve — the
+    // game only ever blocks on the entry it actually reached.
+    static mut speculated_segbases: [u32; 256] = [0; 256];
+    static mut speculated_count: usize = 0;
+    let mut already = false;
+    for i in 0..speculated_count {
+        if speculated_segbases[i] == seg_base {
+            already = true;
+            break;
+        }
+    }
+    if !already && speculated_count < 256 {
+        speculated_segbases[speculated_count] = seg_base;
+        speculated_count += 1;
+        let mut spec_in = [0u8; 1100];
+        libc::snprintf(
+            spec_in.as_mut_ptr() as *mut c_char,
+            spec_in.len(),
+            cstr!("%s/spec_in_%05X.bin"),
+            dir.as_ptr() as *const c_char,
+            seg_base as c_uint,
+        );
+        let sfp = libc::fopen(spec_in.as_ptr() as *const c_char, cstr!("wb"));
+        if !sfp.is_null() {
+            libc::fwrite(
+                virtual_memory.add(seg_base as usize) as *const c_void,
+                1,
+                0x10000,
+                sfp,
+            );
+            libc::fclose(sfp);
+            let jitc = libc::getenv(cstr!("SAISEI_JITC"));
+            libc::snprintf(
+                cmd.as_mut_ptr() as *mut c_char,
+                cmd.len(),
+                cstr!("nice -n 10 '%s' speculate --mem '%s' --image-base 0x%X --outdir '%s' --exclude 0x%X --delete-input >> '%s/speculate.log' 2>&1 &"),
+                jitc,
+                spec_in.as_ptr() as *const c_char,
+                seg_base as c_uint,
+                dir.as_ptr() as *const c_char,
+                off as c_uint,
+                dir.as_ptr() as *const c_char,
+            );
+            let sp = libc::popen(cmd.as_ptr() as *const c_char, cstr!("r"));
+            if !sp.is_null() {
+                libc::pclose(sp);
+            }
+        }
+    }
     result
 }
 
@@ -9282,6 +10217,20 @@ unsafe fn resolve_and_run_chunk(addr: u32) -> c_int {
         0,
     ) != 0
     {
+        return 1;
+    }
+    // Fast path: the chunk decoding this address at the live cs (the common
+    // case for every far transfer) — one bucket walk, no registry scan.
+    let live_base = (cs() as u32) << 4;
+    let fast = jit_lookup_at_base(live_base, addr.wrapping_sub(live_base));
+    if !fast.is_null() {
+        ((*fast).fn_.unwrap())(
+            (addr - live_base) as c_int,
+            0,
+            cstr!("<run_machine>"),
+            cstr!("resolve_and_run_chunk"),
+            7077,
+        );
         return 1;
     }
     let jc = jit_lookup(addr);
@@ -9311,7 +10260,7 @@ unsafe fn resolve_and_run_chunk(addr: u32) -> c_int {
     }
     let bfn = try_call_target(addr);
     if bfn.is_some() && is_builtin_call_target(addr) != 0 {
-        safe_point_impl(SHIMS_FILE, cstr!("resolve_and_run_chunk"), 7101);
+        maybe_safe_point(SHIMS_FILE, cstr!("resolve_and_run_chunk"), 7101);
         (bfn.unwrap())(
             0,
             cstr!("<run_machine>"),
@@ -9368,7 +10317,7 @@ unsafe fn resolve_and_run_chunk(addr: u32) -> c_int {
         }
     }
     if bfn.is_some() {
-        safe_point_impl(SHIMS_FILE, cstr!("resolve_and_run_chunk"), 7142);
+        maybe_safe_point(SHIMS_FILE, cstr!("resolve_and_run_chunk"), 7142);
         (bfn.unwrap())(
             0,
             cstr!("<run_machine>"),
@@ -9384,7 +10333,10 @@ unsafe fn resolve_and_run_chunk(addr: u32) -> c_int {
 pub unsafe extern "C" fn run_machine() {
     while machine_halted == 0 {
         let addr = ((cs() as u32) << 4) + ip() as u32;
-        safe_point_impl(SHIMS_FILE, cstr!("run_machine"), 7156);
+        // Budget-gated like the dispatcher hops: far-return unwinds land here
+        // once per transfer, and the transfer debits guarantee the budget
+        // still drains to a real poll at bounded intervals.
+        maybe_safe_point(SHIMS_FILE, cstr!("run_machine"), 7156);
         if machine_halted != 0 {
             break;
         }
@@ -9537,6 +10489,15 @@ static mut patch_reg_lin: [u32; MAX_PATCHES] = [0; MAX_PATCHES];
 static mut patch_reg_count: usize = 0;
 static mut patch_reg_inited: c_int = 0;
 static mut patch_reg_lin_ready: c_int = 0;
+/// file_mapping_count at the last linear-resolution attempt: unresolved
+/// patches are only re-resolved when the mappings actually changed, not on
+/// every transfer through the dispatcher.
+static mut patch_reg_lin_stamp: usize = usize::MAX;
+/// Resolved-patch early-out state for the dispatch hot path: min/max linear
+/// bounds plus a 64-bit bloom over (lin >> 4). Rebuilt with patch_reg_lin.
+static mut patch_lin_min: u32 = 0xFFFFFFFF;
+static mut patch_lin_max: u32 = 0;
+static mut patch_lin_bloom: u64 = 0;
 static mut patch_active_addr: u32 = NO_ACTIVE_PATCH;
 static mut patch_current_addr: u32 = 0;
 static mut patch_current_retip: u16 = 0;
@@ -9586,6 +10547,7 @@ pub unsafe extern "C" fn patch_register(arr: *const GamePatch, n: usize) {
         i += 1;
     }
     patch_reg_lin_ready = 0;
+    patch_reg_lin_stamp = usize::MAX;
     shim_log_stdout(
         cstr!("patch: registered %zu patch(es), %zu total\n"),
         n,
@@ -9633,6 +10595,12 @@ unsafe fn ensure_patch_lin() {
     if patch_reg_lin_ready != 0 {
         return;
     }
+    // Unresolved entries can only become resolvable when a new file mapping
+    // appears; skip the per-transfer re-resolution walk until then.
+    if patch_reg_lin_stamp == file_mapping_count {
+        return;
+    }
+    patch_reg_lin_stamp = file_mapping_count;
     let mut all = 1;
     for i in 0..patch_reg_count {
         if patch_reg_lin[i] != 0 {
@@ -9646,6 +10614,22 @@ unsafe fn ensure_patch_lin() {
         }
     }
     patch_reg_lin_ready = all;
+    patch_lin_min = 0xFFFFFFFF;
+    patch_lin_max = 0;
+    patch_lin_bloom = 0;
+    for i in 0..patch_reg_count {
+        let lin = patch_reg_lin[i];
+        if lin == 0 {
+            continue;
+        }
+        if lin < patch_lin_min {
+            patch_lin_min = lin;
+        }
+        if lin > patch_lin_max {
+            patch_lin_max = lin;
+        }
+        patch_lin_bloom |= 1u64 << ((lin >> 4) & 63);
+    }
 }
 
 unsafe fn try_patch_at(
@@ -9663,6 +10647,16 @@ unsafe fn try_patch_at(
         return 0;
     }
     ensure_patch_lin();
+    // Hot-path early-out: almost no transfer targets a patched function.
+    // (addr == 0 keeps the full scan: an unresolved entry's lin is 0 and the
+    // legacy loop would compare equal — preserve that behavior exactly.)
+    if addr != 0
+        && (addr < patch_lin_min
+            || addr > patch_lin_max
+            || patch_lin_bloom & (1u64 << ((addr >> 4) & 63)) == 0)
+    {
+        return 0;
+    }
     for i in 0..patch_reg_count {
         let p = &patch_reg[i];
         if p.enabled == 0 || p.fn_.is_none() || patch_reg_lin[i] != addr {
@@ -9800,15 +10794,27 @@ unsafe fn dispatch_via_binary(
     func: *const c_char,
     line: c_int,
 ) -> c_int {
+    // A cross-chunk far transfer stands in for a real far-call + retf pair
+    // (~52+32 cycles on a 386 ≈ 25 model instructions): charge the instruction
+    // budget accordingly, or virtual time under-runs real time for code that
+    // far-calls a driver per sprite/char (Zeliard's attract loop measured
+    // 0.36× real time with transfers charged as a single instruction).
+    jit_instr_budget -= 25;
     tail_dispatch_pending = false;
     if try_patch_at(addr, expected_retip, file, func, line) != 0 {
         return 1;
     }
+    // Fast path: the chunk decoding this address at the live cs (the common
+    // case for every far transfer) — one bucket walk, no registry scan.
+    let live_base = (cs() as u32) << 4;
+    let fast = jit_lookup_at_base(live_base, addr.wrapping_sub(live_base));
+    if !fast.is_null() {
+        return jit_dispatch(fast, addr, expected_retip, file, func, line);
+    }
     let jc = jit_lookup(addr);
     if !jc.is_null() {
         let mut jc = jc;
-        let live_base = (cs() as u32) << 4;
-        let alias_off = addr - live_base;
+        let alias_off = addr.wrapping_sub(live_base);
         if alias_off < 0x10000 && (*jc).seg_base != live_base {
             let nc = jit_compile_or_get(cs(), alias_off as u16);
             if !nc.is_null() && (*nc).seg_base == live_base {
@@ -9849,9 +10855,9 @@ unsafe fn dispatch_via_binary(
     loop {
         set_dispatch_cs(fm, addr);
         let file_off = (addr - (*fm).base) + (*fm).file_offset as u32;
-        safe_point_impl(SHIMS_FILE, cstr!("dispatch_via_binary"), 7562);
+        maybe_safe_point(SHIMS_FILE, cstr!("dispatch_via_binary"), 7562);
         ((*bd).fn_.unwrap())(file_off as c_int, expected_retip, file, func, line);
-        safe_point_impl(SHIMS_FILE, cstr!("dispatch_via_binary"), 7564);
+        maybe_safe_point(SHIMS_FILE, cstr!("dispatch_via_binary"), 7564);
         if !tail_dispatch_pending {
             break;
         }
@@ -9939,9 +10945,9 @@ unsafe fn try_dispatch_overlay_first(
     set_dispatch_cs(fm, addr);
     dispatch_depth += 1;
     dd_inc_overlay_first += 1;
-    safe_point_impl(SHIMS_FILE, cstr!("try_dispatch_overlay_first"), 7668);
+    maybe_safe_point(SHIMS_FILE, cstr!("try_dispatch_overlay_first"), 7668);
     (fn_.unwrap())(expected_retip, file, func, line);
-    safe_point_impl(SHIMS_FILE, cstr!("try_dispatch_overlay_first"), 7670);
+    maybe_safe_point(SHIMS_FILE, cstr!("try_dispatch_overlay_first"), 7670);
     dispatch_depth -= 1;
     dd_dec_overlay_first += 1;
     set_cs(saved_cs);
@@ -9975,6 +10981,7 @@ pub unsafe extern "C" fn near_ret_tail_impl(
     func: *const c_char,
     line: c_int,
 ) {
+    jit_instr_budget -= 3; // near ret ≈ 10 cycles on a 386
     let addr = ((cs() as u32) << 4) + popped_ip as u32;
     shim_log_stdout(
         cstr!("Trace: near_ret_tail to %04X:%04X (0x%08X) (%s:%s:%d)\n"),
@@ -10002,13 +11009,34 @@ pub unsafe extern "C" fn near_ret_tail_impl(
         } else {
             0
         };
-        lifecycle_log(
-            cstr!("NRET 0x%05X popped=%04X -> %s+0x%zX\n"),
-            addr as c_uint,
-            popped_ip as c_uint,
-            bn,
-            off_in,
-        );
+        if lifecycle_eager() {
+            lifecycle_log(
+                cstr!("NRET 0x%05X popped=%04X -> %s+0x%zX\n"),
+                addr as c_uint,
+                popped_ip as c_uint,
+                bn,
+                off_in,
+            );
+        } else {
+            let mut rec = LifecycleDispatchRec {
+                t_us: lifecycle_elapsed_us(),
+                kind: ptr::null(),
+                addr,
+                popped: popped_ip,
+                has_path: 0,
+                _pad: 0,
+                off_in: off_in as u64,
+                bn: [0; 20],
+                regs: regsnap_now(),
+            };
+            libc::snprintf(
+                rec.bn.as_mut_ptr() as *mut c_char,
+                rec.bn.len(),
+                cstr!("%s"),
+                bn,
+            );
+            lifecycle_ring_save_rec(&rec, LC_NRET);
+        }
     }
     set_ip(popped_ip);
 }

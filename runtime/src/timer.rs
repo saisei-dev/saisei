@@ -76,20 +76,77 @@ pub static mut vclock_frozen_virtual_ns: u64 = 0;
 #[no_mangle]
 pub static mut vclock_step_deadline_virtual_ns: u64 = 0;
 
+// ---- instruction-driven virtual clock ---------------------------------------
+//
+// Virtual time advances with RETIRED GUEST WORK, not the host clock:
+// `virtual_now_accum_ns += consumed × jit_ns_per_instr` at every safepoint
+// slow-path visit. The unit of `consumed` is a budget unit: each basic block
+// debits its summed per-class instruction weights (≈ 386 cycle count / 3.3;
+// insn_weight in codegen.rs — mul/div/string/memory ops cost multiples of a
+// register mov), and rep iterations/transfer shims debit their real costs.
+// This models a fixed-speed CPU with per-class cycle costs: a calibration
+// loop always measures the same work-per-PIT-tick ratio regardless of host
+// stalls (JIT compiles, scheduler hiccups), and the PIT / BIOS tick chain
+// derives from the same flow of time the program itself experiences. Pacing
+// back to real time happens in the safepoint slow path (sleep while virtual
+// is ahead of host × emulation_speedup) — never here.
+//
+// The emulated CPU speed: 40ns/unit ≈ a 486-class machine (2.5× the original
+// 33MHz-386DX model of 100ns/unit), period-correct for the late end of this
+// corpus and 4×-faster load/decompress phases. CONSTRAINT: the modeled speed
+// must not exceed the raw sustained host throughput of dense translated code,
+// or virtual time — and every PIT-paced game timer with it — falls behind
+// real time in gameplay-heavy loops (pacing only ever sleeps when virtual
+// runs AHEAD; it cannot speed up a lagging guest). Measured 2026-07-10 after
+// the dispatcher/SS-ring/lifecycle/reg-cache rework: worst-case raw (Zeliard
+// attract, the historical 0.80× phase) sustains ~37M units/s, so 25M units/s
+// keeps a ~32% margin; 25ns/unit (40M units/s) would exceed it. Re-measure
+// that phase before lowering this further.
+#[no_mangle]
+pub static mut jit_ns_per_instr: u64 = 40;
+/// Instructions the running chunks may retire before the next safepoint
+/// slow-path visit. Decremented by JIT_BUDGET() in every emitted basic block;
+/// refilled (and the consumed count folded into virtual time) by
+/// `safe_point_impl`.
+#[no_mangle]
+pub static mut jit_instr_budget: i64 = 0;
+/// What `jit_instr_budget` was set to at the last refill (so consumed =
+/// refill − budget).
+#[no_mangle]
+pub static mut jit_budget_last_refill: i64 = 0;
+/// Total retired-instruction count (diagnostics / MIPS measurement).
+#[no_mangle]
+pub static mut jit_total_retired: u64 = 0;
+/// The instruction-driven virtual clock. Seeded from the host monotonic clock
+/// at startup so virtual and host share an epoch; advanced only by
+/// `vclock_advance_ns` below.
+#[no_mangle]
+pub static mut virtual_now_accum_ns: u64 = 0;
+
 const BIOS_TICKS_PER_DAY: u32 = 0x1800B0;
+pub const NS_PER_BIOS_TICK: u64 = 54_925_000;
+
+/// Advance the instruction-driven clock (RUNNING/STEPPING only; while HALTED
+/// the flow of virtual time is frozen even though instructions may retire).
+#[no_mangle]
+pub extern "C" fn vclock_advance_ns(ns: u64) {
+    unsafe {
+        if vclock_state != VCLOCK_HALTED {
+            virtual_now_accum_ns += ns;
+        }
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn shim_virtual_now_ns() -> u64 {
     unsafe {
-        if vclock_state == VCLOCK_HALTED {
-            return vclock_frozen_virtual_ns;
+        match vclock_state {
+            VCLOCK_HALTED => vclock_frozen_virtual_ns,
+            VCLOCK_STEPPING if virtual_now_accum_ns > vclock_step_deadline_virtual_ns => {
+                vclock_step_deadline_virtual_ns
+            }
+            _ => virtual_now_accum_ns,
         }
-        let wall = shim_host_monotonic_ns();
-        let mut virt = wall - vclock_paused_offset_ns;
-        if vclock_state == VCLOCK_STEPPING && virt > vclock_step_deadline_virtual_ns {
-            virt = vclock_step_deadline_virtual_ns;
-        }
-        virt
     }
 }
 
@@ -99,10 +156,9 @@ pub extern "C" fn vclock_service() {
         if vclock_state != VCLOCK_STEPPING {
             return;
         }
-        let wall = shim_host_monotonic_ns();
-        let virt = wall - vclock_paused_offset_ns;
-        if virt >= vclock_step_deadline_virtual_ns {
+        if virtual_now_accum_ns >= vclock_step_deadline_virtual_ns {
             vclock_frozen_virtual_ns = vclock_step_deadline_virtual_ns;
+            virtual_now_accum_ns = vclock_step_deadline_virtual_ns;
             vclock_state = VCLOCK_HALTED;
             shim_log_stdout(
                 c"[VCLOCK] step complete, halted virtual_ns=%llu\n".as_ptr(),
@@ -134,18 +190,17 @@ pub extern "C" fn vclock_resume() {
         if vclock_state == VCLOCK_RUNNING {
             return;
         }
-        let wall = shim_host_monotonic_ns();
         let anchor = if vclock_state == VCLOCK_HALTED {
             vclock_frozen_virtual_ns
         } else {
             vclock_step_deadline_virtual_ns
         };
-        vclock_paused_offset_ns = wall - anchor;
+        virtual_now_accum_ns = anchor;
         vclock_state = VCLOCK_RUNNING;
         shim_log_stdout(
             c"[VCLOCK] resumed virtual_ns=%llu wall_ns=%llu\n".as_ptr(),
             anchor,
-            wall,
+            shim_host_monotonic_ns(),
         );
     }
 }
@@ -154,15 +209,16 @@ pub extern "C" fn vclock_resume() {
 pub extern "C" fn vclock_step(ticks: u32) {
     unsafe {
         let ticks = if ticks == 0 { 1 } else { ticks };
-        let ns_per_tick = (54925000.0 / emulation_speedup) as u64;
-        let ns = ticks as u64 * ns_per_tick;
-        let wall = shim_host_monotonic_ns();
+        // Deadline is in VIRTUAL ns: a BIOS tick is always 54.925ms of game
+        // time (emulation_speedup only changes how fast virtual time passes
+        // relative to the host, which the pacing sleep handles).
+        let ns = ticks as u64 * NS_PER_BIOS_TICK;
         let base_virtual = if vclock_state == VCLOCK_HALTED {
             let b = vclock_frozen_virtual_ns;
-            vclock_paused_offset_ns = wall - b;
+            virtual_now_accum_ns = b;
             b
         } else {
-            wall - vclock_paused_offset_ns
+            virtual_now_accum_ns
         };
         vclock_step_deadline_virtual_ns = base_virtual + ns;
         vclock_state = VCLOCK_STEPPING;

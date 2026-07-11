@@ -63,6 +63,7 @@ extern "C" {
         line: c_int,
     );
     fn safe_point_impl(file: *const c_char, func: *const c_char, line: c_int);
+    fn shim_idle_wait();
     fn shim_log_stdout(fmt: *const c_char, ...);
     fn shim_exit_with_message(fmt: *const c_char, ...) -> !;
 }
@@ -609,7 +610,9 @@ pub extern "C" fn bios_keyboard_impl(file: *const c_char, func: *const c_char, l
             let mut ascii: u8 = 0;
             let mut scancode: u8 = 0;
             while kbd_bios_pop(&mut ascii, &mut scancode) == 0 {
-                safepoint();
+                // Blocking wait: no guest instructions retire, so let machine
+                // time flow at host pace (music, TAP deadlines) while we wait.
+                unsafe { shim_idle_wait() };
             }
             set_ax(ascii as u16 | ((scancode as u16) << 8));
             set_ZF(0);
