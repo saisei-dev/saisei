@@ -160,6 +160,25 @@ impl Fonts {
         self.draw_top(cv, text, x + (width - tw) / 2.0, y, w, px, color);
     }
 
+    /// Shorten `text` from the *front*, keeping its end.
+    ///
+    /// For a field you are typing or pasting into: what matters is the end, where
+    /// the caret is. A long URL elided the usual way would show you its scheme and
+    /// hide everything you just pasted.
+    pub fn elide_front(&mut self, text: &str, w: Weight, px: f32, max: f32) -> String {
+        if self.width(text, w, px) <= max {
+            return text.to_string();
+        }
+        let chars: Vec<char> = text.chars().collect();
+        for start in 1..chars.len() {
+            let cand: String = "…".to_string() + &chars[start..].iter().collect::<String>();
+            if self.width(&cand, w, px) <= max {
+                return cand;
+            }
+        }
+        String::new()
+    }
+
     /// Shorten `text` with an ellipsis until it fits `max` px. A game title or a
     /// long file name must never bleed out of its card.
     pub fn elide(&mut self, text: &str, w: Weight, px: f32, max: f32) -> String {

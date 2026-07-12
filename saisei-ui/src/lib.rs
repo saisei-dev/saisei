@@ -27,6 +27,8 @@ pub enum Key {
     Backspace,
     /// The overlay hotkey (F12), which also closes the overlay.
     Overlay,
+    /// Ctrl+V. The UI cannot read a clipboard; it asks the host to.
+    Paste,
 }
 
 /// What the host must go and do. The UI itself performs nothing: it has no idea
@@ -52,6 +54,9 @@ pub enum Action {
     AddUrl(String),
     /// The player picked which executable in the bundle is the game.
     PickExe(usize),
+    /// Put the clipboard's text in the link field. Only the host can read a
+    /// clipboard, so the UI can only ask.
+    Paste,
 }
 
 pub struct SaveView {
@@ -101,6 +106,7 @@ enum Hit {
     Action(usize),
     Save(usize),
     Exe(usize),
+    Paste,
 }
 
 pub struct Ui {
@@ -375,12 +381,23 @@ impl Ui {
             Key::Backspace => {
                 self.add.url.pop();
             }
+            Key::Paste => return Action::Paste,
             Key::Enter if !self.add.url.trim().is_empty() && !self.add.busy => {
                 return Action::AddUrl(self.add.url.trim().to_string())
             }
             _ => {}
         }
         Action::None
+    }
+
+    /// The host fetched the clipboard for us.
+    pub fn pasted(&mut self, text: &str) {
+        if self.screen != Screen::AddGame || !self.add.exes.is_empty() {
+            return;
+        }
+        // A copied URL routinely carries a trailing newline; typing one is
+        // impossible, so nothing is lost by dropping the whitespace.
+        self.add.url.push_str(text.trim());
     }
 
     /// A typed character (the URL field).
@@ -411,6 +428,7 @@ impl Ui {
                     Hit::Game(_) | Hit::Add => self.key(Key::Enter),
                     Hit::Action(_) | Hit::Save(_) => self.activate(),
                     Hit::Exe(i) => Action::PickExe(i),
+                    Hit::Paste => Action::Paste,
                 }
             }
             None => Action::None,
@@ -432,6 +450,7 @@ impl Ui {
                 self.save = i;
             }
             Hit::Exe(i) => self.add.exe_idx = i,
+            Hit::Paste => {}
         }
     }
 
@@ -736,6 +755,49 @@ mod tests {
             u.key(Key::Enter),
             Action::AddUrl("http://x/g.zip".to_string())
         );
+    }
+
+    #[test]
+    fn a_link_can_be_pasted_as_well_as_typed() {
+        // Typing worked and pasting didn't, which is backwards: a URL is the one
+        // thing here you are far more likely to have on the clipboard than in your
+        // head. The UI cannot read a clipboard — it knows nothing about SDL — so it
+        // asks, and the host answers with `pasted`.
+        let mut u = ui(&[]);
+        u.key(Key::Enter); // the Add screen
+        assert_eq!(u.screen, Screen::AddGame);
+
+        // Both the chord and the button raise the same request.
+        assert_eq!(u.key(Key::Paste), Action::Paste);
+        let mut cv = Canvas::new(1280, 800);
+        u.paint(&mut cv, false);
+        let (r, _) = *u
+            .hot
+            .iter()
+            .find(|(_, h)| *h == Hit::Paste)
+            .expect("a Paste button was painted");
+        assert_eq!(u.click(r.x + r.w / 2.0, r.y + r.h / 2.0), Action::Paste);
+
+        // A copied URL routinely carries a trailing newline; typing one is
+        // impossible, so it must not survive into the field.
+        u.pasted("  http://x/g.zip\n");
+        assert_eq!(u.add.url, "http://x/g.zip");
+        assert_eq!(
+            u.key(Key::Enter),
+            Action::AddUrl("http://x/g.zip".to_string())
+        );
+    }
+
+    #[test]
+    fn a_pasted_link_shows_its_end_not_its_scheme() {
+        // The field elides from the front: what you want to see after a paste is
+        // where the caret is, not `https://` and a cut-off host.
+        let mut f = Fonts::new();
+        let long = "https://archive.example.org/dos/games/1990/some-very-long-name.zip";
+        let out = f.elide_front(long, Weight::Regular, 15.0, 200.0);
+        assert!(out.starts_with('…'), "elided from the wrong end: {out}");
+        assert!(out.ends_with("name.zip"), "lost the end: {out}");
+        assert!(f.width(&out, Weight::Regular, 15.0) <= 200.0);
     }
 
     #[test]

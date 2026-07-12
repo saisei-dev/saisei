@@ -85,6 +85,22 @@ impl Painter {
     }
 }
 
+/// The clipboard, as text.
+///
+/// A pasted link never reaches us as typed characters — SDL delivers Ctrl+V as a
+/// key chord and nothing else — so the interface asks for it and we go and fetch
+/// it. The UI crate cannot: it knows nothing about SDL, which is the point of it.
+fn clipboard() -> Option<String> {
+    let mut buf = [0 as std::ffi::c_char; 4096];
+    if !rt::saisei_ui_clipboard(buf.as_mut_ptr(), buf.len() as i32) {
+        return None;
+    }
+    let s = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    Some(s).filter(|s| !s.trim().is_empty())
+}
+
 // ---- events -----------------------------------------------------------------
 
 /// Drain the queue into the UI. Returns the action to carry out, and whether
@@ -110,6 +126,7 @@ fn pump(ui: &mut Ui) -> (Action, bool) {
                 rt::UI_KEY_ESCAPE => ui.key(Key::Escape),
                 rt::UI_KEY_BACKSPACE => ui.key(Key::Backspace),
                 rt::UI_KEY_OVERLAY => ui.key(Key::Overlay),
+                rt::UI_KEY_PASTE => ui.key(Key::Paste),
                 _ => Action::None,
             },
             rt::UI_EV_TEXT => {
@@ -221,6 +238,11 @@ pub fn run(root: &Path) -> ! {
                 crate::add::from_url(root, &mut ui, &url);
                 ui.games = games_view(root);
             }
+            Action::Paste => {
+                if let Some(text) = clipboard() {
+                    ui.pasted(&text);
+                }
+            }
             Action::PickExe(i) => {
                 crate::add::pick_exe(root, &mut ui, i);
                 ui.games = games_view(root);
@@ -317,7 +339,11 @@ unsafe extern "C" fn overlay_entry(can_save: bool) {
                 crate::relaunch::exec_player(&args);
             }
             Action::Quit => std::process::exit(0),
-            Action::AddPath(_) | Action::AddUrl(_) | Action::PickExe(_) | Action::None => {}
+            Action::AddPath(_)
+            | Action::AddUrl(_)
+            | Action::PickExe(_)
+            | Action::Paste
+            | Action::None => {}
         }
         if touched || dirty || p.resize_to_window() {
             p.paint(&mut ui, true);

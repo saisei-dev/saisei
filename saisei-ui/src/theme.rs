@@ -27,9 +27,14 @@ pub const TEXT_DIM: Color = Color::rgb(0x9A, 0x86, 0x94);
 /// Text on something that cannot be chosen.
 pub const TEXT_OFF: Color = Color::rgb(0x5A, 0x4C, 0x56);
 
-/// The scrim the in-game overlay lays over the frozen frame. Dark enough to put
-/// the menu clearly in front, sheer enough that you can still see where you were.
-pub const SCRIM: Color = Color(0x0B, 0x07, 0x0B, 0xD2);
+/// The scrim the in-game overlay lays over the frozen frame.
+///
+/// Light. The game you paused is the thing you are coming back to, and the point
+/// of showing it at all is that you can see where you were — a scrim heavy enough
+/// to make it a texture behind the menu may as well not be there. The menu reads
+/// in front because its panel is opaque and its edge is drawn, not because the
+/// game has been drowned.
+pub const SCRIM: Color = Color(0x0B, 0x07, 0x0B, 0x73);
 
 /// Corner radius for cards and buttons.
 pub const RADIUS: f32 = 10.0;

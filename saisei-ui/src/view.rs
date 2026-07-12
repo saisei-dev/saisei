@@ -47,7 +47,11 @@ pub fn paint(ui: &mut Ui, cv: &mut Canvas, over_game: bool) {
                 let w = (1080.0 * s).min(full.w);
                 let h = (620.0 * s).min(full.h);
                 let panel = Rect::new((cv.w as f32 - w) / 2.0, (cv.h as f32 - h) / 2.0, w, h);
-                cv.rounded(panel, t::RADIUS * 1.6, t::SURFACE.alpha(250));
+                // The scrim is deliberately light, so the panel has to carry the
+                // separation itself: a soft shadow and an opaque face, not a wash
+                // over the whole window.
+                shadow(cv, panel, t::RADIUS * 1.6, 18.0 * s);
+                cv.rounded(panel, t::RADIUS * 1.6, t::SURFACE);
                 cv.stroke(panel, t::RADIUS * 1.6, 1.0, t::BORDER);
                 paint_game(ui, cv, panel.inset(32.0 * s), s);
             } else {
@@ -56,6 +60,24 @@ pub fn paint(ui: &mut Ui, cv: &mut Canvas, over_game: bool) {
         }
         Screen::Settings => paint_settings(ui, cv, full, s, over_game),
         Screen::AddGame => paint_add(ui, cv, full, s),
+    }
+}
+
+/// A soft drop shadow under `r`: concentric rounded rects, fading outward.
+///
+/// Cheap, and enough — at these sizes nobody can tell it from a real blur, and it
+/// is what lifts the menu off the game now that the game behind it is bright
+/// enough to see.
+fn shadow(cv: &mut Canvas, r: Rect, radius: f32, spread: f32) {
+    let steps = 8;
+    for i in (1..=steps).rev() {
+        let g = spread * i as f32 / steps as f32;
+        let a = (26.0 * (1.0 - i as f32 / steps as f32).powf(0.7)) as u8;
+        cv.rounded(
+            Rect::new(r.x - g, r.y - g + g * 0.35, r.w + 2.0 * g, r.h + 2.0 * g),
+            radius + g,
+            Color(0, 0, 0, a.max(6)),
+        );
     }
 }
 
@@ -480,7 +502,8 @@ fn paint_settings(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32, over_game: bool
         let w = (620.0 * s).min(r.w);
         let h = (300.0 * s).min(r.h);
         let p = Rect::new((cv.w as f32 - w) / 2.0, (cv.h as f32 - h) / 2.0, w, h);
-        cv.rounded(p, t::RADIUS * 1.6, t::SURFACE.alpha(250));
+        shadow(cv, p, t::RADIUS * 1.6, 18.0 * s);
+        cv.rounded(p, t::RADIUS * 1.6, t::SURFACE);
         cv.stroke(p, t::RADIUS * 1.6, 1.0, t::BORDER);
         p.inset(30.0 * s)
     } else {
@@ -583,7 +606,26 @@ fn paint_add(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
         14.0 * s,
         t::TEXT_DIM,
     );
-    let field = Rect::new(r.x, fy + 26.0 * s, well.w, 44.0 * s);
+    // Paste, as a button. Ctrl+V does it too, but a link is the one thing here you
+    // are most likely to have on the clipboard rather than in your head, and a
+    // chord you have to know about is not an interface.
+    let paste_w = ui.fonts.width("Paste", Weight::Bold, 14.5 * s) + 30.0 * s;
+    let field = Rect::new(r.x, fy + 26.0 * s, well.w - paste_w - 8.0 * s, 44.0 * s);
+    let paste = Rect::new(field.x + field.w + 8.0 * s, field.y, paste_w, field.h);
+    cv.rounded(paste, 8.0, t::SURFACE_HI);
+    cv.stroke(paste, 8.0, 1.0, t::BORDER);
+    ui.fonts.draw_centered(
+        cv,
+        "Paste",
+        paste.x,
+        paste.w,
+        paste.y + 12.0 * s,
+        Weight::Bold,
+        14.5 * s,
+        t::TEXT,
+    );
+    ui.push_hot(paste, Hit::Paste);
+
     cv.rounded(field, 8.0, t::SURFACE_HI);
     cv.stroke(field, 8.0, 1.0, t::ACCENT.alpha(160));
     let shown = if ui.add.url.is_empty() {
@@ -594,7 +636,7 @@ fn paint_add(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
     let dim = ui.add.url.is_empty();
     let shown = ui
         .fonts
-        .elide(&shown, Weight::Regular, 15.0 * s, field.w - 28.0 * s);
+        .elide_front(&shown, Weight::Regular, 15.0 * s, field.w - 28.0 * s);
     let end = ui.fonts.draw_top(
         cv,
         &shown,
@@ -624,7 +666,7 @@ fn paint_add(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
         );
     }
 
-    hint(ui, cv, r, s, "Enter fetch    Esc back");
+    hint(ui, cv, r, s, "Ctrl+V paste    Enter fetch    Esc back");
 }
 
 // ---- shared -----------------------------------------------------------------

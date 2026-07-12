@@ -160,6 +160,8 @@ extern "C" {
     fn SDL_StartTextInput();
     fn SDL_EventState(type_: u32, state: c_int) -> u8;
     fn SDL_free(mem: *mut c_void);
+    fn SDL_HasClipboardText() -> bool;
+    fn SDL_GetClipboardText() -> *mut c_char;
     // rest of the C runtime + save layer
     fn shim_save_video_memory();
     fn shim_bookend_start();
@@ -223,6 +225,7 @@ const SDLK_RETURN: i32 = b'\r' as i32;
 const SDLK_ESCAPE: i32 = 27;
 const SDLK_BACKSPACE: i32 = 8;
 const SDLK_TAB: i32 = 9;
+const SDLK_V: i32 = b'v' as i32;
 const SDLK_1: i32 = b'1' as i32;
 const SDLK_2: i32 = b'2' as i32;
 const SDLK_3: i32 = b'3' as i32;
@@ -1193,6 +1196,9 @@ pub const UI_KEY_ESCAPE: c_int = 6;
 pub const UI_KEY_BACKSPACE: c_int = 7;
 /// F12 — opens the overlay, and closes it again.
 pub const UI_KEY_OVERLAY: c_int = 8;
+/// Ctrl+V (Cmd+V on a Mac). A pasted link never arrives as typed text, so it has
+/// to be asked for.
+pub const UI_KEY_PASTE: c_int = 9;
 
 #[repr(C)]
 pub struct UiEvent {
@@ -1286,6 +1292,16 @@ pub extern "C" fn saisei_ui_poll(out: *mut UiEvent) -> bool {
         let scale = ui_dpi_scale();
         match e.type_ {
             SDL_QUIT => ev.kind = UI_EV_QUIT,
+            SDL_KEYDOWN
+                if (e.key.keysym.r#mod & (KMOD_CTRL | KMOD_GUI)) != 0
+                    && e.key.keysym.sym == SDLK_V =>
+            {
+                // A paste is not text input — SDL never delivers it as typed
+                // characters — so it arrives only as this chord, and the host has
+                // to go and fetch the clipboard itself.
+                ev.kind = UI_EV_KEY;
+                ev.code = UI_KEY_PASTE;
+            }
             SDL_KEYDOWN => {
                 let code = match e.key.keysym.sym {
                     SDLK_UP => UI_KEY_UP,
@@ -1432,6 +1448,28 @@ pub extern "C" fn saisei_ui_present(rgba: *const u8, w: c_int, h: c_int, over_ga
             SDL_RenderCopy(RENDERER, UI_TEXTURE, core::ptr::null(), core::ptr::null());
         }
         SDL_RenderPresent(RENDERER);
+    }
+}
+
+/// Copy the clipboard's text into `out` (NUL-terminated), or return false if
+/// there is none. A pasted link reaches us no other way — SDL delivers Ctrl+V as
+/// a key chord, never as typed characters.
+#[no_mangle]
+pub extern "C" fn saisei_ui_clipboard(out: *mut c_char, cap: c_int) -> bool {
+    unsafe {
+        if out.is_null() || cap <= 0 || !SDL_HasClipboardText() {
+            return false;
+        }
+        let text = SDL_GetClipboardText();
+        if text.is_null() {
+            return false;
+        }
+        let n = libc::strlen(text).min(cap as usize - 1);
+        core::ptr::copy_nonoverlapping(text, out, n);
+        *out.add(n) = 0;
+        // SDL allocated it; SDL frees it.
+        SDL_free(text as *mut c_void);
+        n > 0
     }
 }
 
