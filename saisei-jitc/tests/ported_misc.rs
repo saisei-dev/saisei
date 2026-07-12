@@ -151,14 +151,45 @@ fn parity8_helper__matches_x86_even_parity() {
     )
     .expect("copy prelude");
 
+    // Precompile the prelude rlib, then link the chunk-shell against it —
+    // mirroring codegen::emit_chunk + compile_chunk exactly (`--extern
+    // saisei_rt`, no more `include!`). Doubles as the "prelude compiles as a
+    // standalone rlib and a chunk links it" regression.
+    let rlib = dir.join("libsaisei_rt.rlib");
+    let rlib_ok = Command::new("rustc")
+        .current_dir(&dir)
+        .args([
+            "--edition",
+            "2021",
+            "--crate-type",
+            "rlib",
+            "--crate-name",
+            "saisei_rt",
+            "-C",
+            "opt-level=0",
+            "-C",
+            "overflow-checks=off",
+            "-C",
+            "debug-assertions=off",
+            "-C",
+            "panic=abort",
+            "-o",
+        ])
+        .arg(&rlib)
+        .arg(dir.join("saisei_rt.rs"))
+        .status()
+        .expect("spawn rustc (rlib)");
+    assert!(rlib_ok.success(), "rustc failed to build saisei_rt rlib");
+
     // The chunk-shell header mirrors codegen::emit_chunk's exactly.
     let src = r#"#![no_std]
 #![allow(dead_code, unused_imports, non_snake_case, non_upper_case_globals, non_camel_case_types)]
 #![allow(unused_parens, unused_mut, unused_assignments, unused_unsafe, unused_variables)]
 #![allow(unreachable_code, unreachable_patterns)]
+extern crate saisei_rt;
+use saisei_rt::*;
 use core::ffi::{c_char, c_int, c_void};
-include!("saisei_rt.rs");
-pub const SAISEI_SITE: &core::ffi::CStr = c"parity8_check";
+#[no_mangle] pub extern "C" fn saisei_site_name() -> *const c_char { c"parity8_check".as_ptr() }
 
 /// 0 if parity8 matches even-popcount parity for every byte; else input+1.
 #[no_mangle]
@@ -187,15 +218,17 @@ pub extern "C" fn parity8_check() -> c_int {
             "--crate-type",
             "cdylib",
             "-C",
-            "opt-level=1",
+            "opt-level=0",
             "-C",
             "overflow-checks=off",
             "-C",
             "debug-assertions=off",
             "-C",
             "panic=abort",
-            "-o",
+            "--extern",
         ])
+        .arg(format!("saisei_rt={}", rlib.display()))
+        .arg("-o")
         .arg(&so)
         .arg(&rs)
         .status()

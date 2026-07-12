@@ -24,6 +24,8 @@ sha2 = "0.10"
 # Insertion-ordered maps/sets: a insertion-ordered DiGraph for the structured
 # renderer (the source / patterns/) needs deterministic adjacency iteration order.
 indexmap = "2"
+# flock() for single-flight speculation (one full-core pass at a time).
+libc = "0.2"
 
 [dev-dependencies]
 # dlopen the freshly-built runtime shim .so for the ported C-shim tests

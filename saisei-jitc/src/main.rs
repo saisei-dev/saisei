@@ -206,6 +206,68 @@ fn write_u32s(path: &std::path::Path, header: u32, body: &[u32]) {
 /// chunk (the Rust equivalent of the C chunks `#include "shims.h"`).
 const SAISEI_RT: &str = include_str!("../rt/saisei_rt.rs");
 
+/// Precompile the prelude once as the `saisei_rt` rlib and return its path.
+/// Chunks link it via `--extern` instead of `include!`ing 941 lines each; the
+/// prelude was ~86% of a small chunk's rustc time. Keyed by toolchain hash and
+/// written temp+rename so concurrent compilers (the single foreground compile
+/// and every speculate thread) race safely — identical content, atomic publish.
+fn ensure_rt_rlib(outdir: &std::path::Path, rt_src: &std::path::Path) -> Result<PathBuf, String> {
+    let rlib = outdir.join(format!("libsaisei_rt_{}.rlib", toolchain_hash()));
+    if rlib.exists() {
+        return Ok(rlib);
+    }
+    let pid = std::process::id();
+    let tmp = outdir.join(format!("libsaisei_rt_{}.rlib.tmp{pid}", toolchain_hash()));
+    let out = std::process::Command::new("rustc")
+        .args([
+            "--edition",
+            "2021",
+            "--crate-type",
+            "rlib",
+            "--crate-name",
+            "saisei_rt",
+            // Match the chunk cdylib's codegen contract exactly: opt-level and
+            // the checks flags govern the non-inline prelude items linked into
+            // the chunk, and panic=abort must agree with the cdylib's strategy.
+            "-C",
+            "opt-level=0",
+            "-C",
+            "overflow-checks=off",
+            "-C",
+            "debug-assertions=off",
+            "-C",
+            "panic=abort",
+            "-o",
+        ])
+        .arg(&tmp)
+        .arg(rt_src)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            // Atomic publish; a concurrent builder that already renamed wins and
+            // ours becomes a harmless leftover cleaned by the rename replacing it.
+            std::fs::rename(&tmp, &rlib).ok();
+            Ok(rlib)
+        }
+        Ok(o) => {
+            std::fs::remove_file(&tmp).ok();
+            // A late-arriving racer may have published it between our exists()
+            // check and now.
+            if rlib.exists() {
+                return Ok(rlib);
+            }
+            Err(format!(
+                "rustc failed building saisei_rt rlib:\n{}",
+                String::from_utf8_lossy(&o.stderr)
+            ))
+        }
+        Err(e) => {
+            std::fs::remove_file(&tmp).ok();
+            Err(format!("rustc spawn failed for saisei_rt rlib: {e}"))
+        }
+    }
+}
+
 /// Compile one chunk: write the (already emitted) Rust text, compile it with
 /// rustc to `so`. Returns the case-key set on success, or the failure reason —
 /// which the JIT caller treats as a hard error (there is no fallback backend).
@@ -215,7 +277,8 @@ fn compile_chunk(
     outdir: &std::path::Path,
     so: &std::path::Path,
 ) -> Result<Vec<u32>, String> {
-    // Drop the prelude next to the chunk so `include!("saisei_rt.rs")` resolves.
+    // Drop the prelude source and precompile it once as the `saisei_rt` rlib
+    // (chunks link it via `--extern` instead of re-`include!`ing it).
     let rt_p = outdir.join("saisei_rt.rs");
     let need_rt = std::fs::read_to_string(&rt_p)
         .map(|s| s != SAISEI_RT)
@@ -223,6 +286,7 @@ fn compile_chunk(
     if need_rt {
         std::fs::write(&rt_p, SAISEI_RT).ok();
     }
+    let rlib = ensure_rt_rlib(outdir, &rt_p)?;
     // Both the input .rs and the output .so are compiled through PID-private
     // temp paths and renamed into place at the end. The foreground jit-compile
     // and a background speculate can race on the same chunk NAME (identical
@@ -242,6 +306,17 @@ fn compile_chunk(
 
     // rustc: cdylib with C-like wrapping arithmetic (overflow-checks off) so the
     // translated math matches the x86 model and never panics across the FFI edge.
+    //
+    // opt-level=0, deliberately. The emulated CPU is a fixed ~486-class model and
+    // the worst measured phase still leaves 63–75% of the host idle (see
+    // docs/perf_backlog.md) — the JIT'd chunks have enormous execution headroom,
+    // so optimizing their machine code buys nothing the player can feel. What the
+    // player *does* feel is compile latency: reaching a new phase (e.g. DM's
+    // menu→dungeon transition) compiles ~150+ chunks synchronously, and a chunk's
+    // rustc time is dominated by LLVM codegen. opt-level=1→0 measured ~4.5× faster
+    // on the tent-pole chunks (a 24.7k-line dungeon-renderer chunk: 3.9s→0.86s)
+    // and ~1.5× on the median, turning a ~30s cold first-entry freeze into a few
+    // seconds. Faithfulness is unchanged — opt-level never alters Rust semantics.
     let run_rustc = || {
         std::process::Command::new("rustc")
             .args([
@@ -256,7 +331,7 @@ fn compile_chunk(
                 "--crate-name",
                 name,
                 "-C",
-                "opt-level=1",
+                "opt-level=0",
                 "-C",
                 "overflow-checks=off",
                 "-C",
@@ -266,6 +341,8 @@ fn compile_chunk(
                 "-o",
             ])
             .arg(&so_tmp)
+            .arg("--extern")
+            .arg(format!("saisei_rt={}", rlib.display()))
             .arg(&rs_tmp)
             .output()
     };
@@ -461,6 +538,108 @@ fn write_chunk_sidecars(
     std::fs::write(p("sha"), format!("{sha_key}\n")).ok();
 }
 
+// ---- function-level dedup -------------------------------------------------
+//
+// A chunk is decoded from one entry and pulls in every function statically
+// reachable from it. DM enters each 64KB segment at ~9 different indirect
+// targets, and their reachable sets overlap heavily on shared subroutines —
+// measured 2.2x block-level redundancy (the same blocks re-emitted and
+// recompiled in chunk after chunk). Each compiled chunk records the function
+// starts it emitted in a `.funcs` sidecar; a later compile at the same segbase
+// drops functions another chunk already owns and keeps only its own entry
+// function plus not-yet-owned ones. Transfers to a dropped function fall to the
+// existing inter-chunk dispatch — `call_table_` for a call, the dispatch
+// default arm's `near_ret_tail_` for a jmp/fallthrough — which routes to the
+// chunk that does own it. Best-effort under concurrency (two compilers racing
+// may both claim one function, a redundant copy, never a miss); `.funcs` is
+// written only after the `.so` is in place, so "owned" always implies a live
+// chunk the runtime can dispatch to.
+
+/// Union of function starts already owned by compiled chunks at this segbase,
+/// minus `entry` (its own function is always emitted).
+fn read_owned_funcs(
+    outdir: &std::path::Path,
+    image_base: i64,
+    entry: i64,
+) -> std::collections::BTreeSet<i64> {
+    let prefix = format!("jit_{image_base:05x}_");
+    let mut owned = std::collections::BTreeSet::new();
+    if let Ok(rd) = std::fs::read_dir(outdir) {
+        for ent in rd.flatten() {
+            let fname = ent.file_name();
+            let fname = fname.to_string_lossy();
+            if fname.starts_with(&prefix) && fname.ends_with(".funcs") {
+                if let Ok(txt) = std::fs::read_to_string(ent.path()) {
+                    for line in txt.lines() {
+                        let t = line.trim().trim_start_matches("0x");
+                        if let Ok(ip) = i64::from_str_radix(t, 16) {
+                            owned.insert(ip);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    owned.remove(&entry);
+    owned
+}
+
+/// The function starts this IR emits (for the `.funcs` sidecar).
+fn ir_func_starts(ir: &serde_json::Value) -> Vec<i64> {
+    ir.get("functions")
+        .and_then(|v| v.as_array())
+        .map(|fs| {
+            fs.iter()
+                .filter_map(|f| f.get("start").and_then(|v| v.as_i64()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Drop functions already owned by another chunk, always keeping the one that
+/// contains `entry`. Returns the filtered IR (unchanged when nothing is owned).
+fn filter_ir_functions(
+    mut ir: serde_json::Value,
+    owned: &std::collections::BTreeSet<i64>,
+    entry: i64,
+) -> serde_json::Value {
+    if owned.is_empty() {
+        return ir;
+    }
+    if let Some(funcs) = ir.get_mut("functions").and_then(|v| v.as_array_mut()) {
+        // The function containing the entry must always survive.
+        let entry_fn_start: Option<i64> = funcs.iter().find_map(|f| {
+            let start = f.get("start")?.as_i64()?;
+            let has_entry = start == entry
+                || f.get("blocks")
+                    .and_then(|b| b.as_array())
+                    .map_or(false, |bs| {
+                        bs.iter()
+                            .any(|bl| bl.get("start").and_then(|v| v.as_i64()) == Some(entry))
+                    });
+            if has_entry {
+                Some(start)
+            } else {
+                None
+            }
+        });
+        funcs.retain(|f| match f.get("start").and_then(|v| v.as_i64()) {
+            Some(start) => Some(start) == entry_fn_start || !owned.contains(&start),
+            None => true,
+        });
+    }
+    ir
+}
+
+/// Record the function starts a finished chunk owns (written after its `.so`).
+fn write_funcs_sidecar(outdir: &std::path::Path, name: &str, starts: &[i64]) {
+    let mut s = String::with_capacity(starts.len() * 6);
+    for st in starts {
+        s.push_str(&format!("{st:x}\n"));
+    }
+    std::fs::write(outdir.join(format!("{name}.funcs")), s).ok();
+}
+
 /// the runtime-invoked orchestrator.
 fn cmd_jit_compile(mut it: std::vec::IntoIter<String>) {
     let mut mem: Option<PathBuf> = None;
@@ -529,6 +708,8 @@ fn cmd_jit_compile(mut it: std::vec::IntoIter<String>) {
     let ir_str = disassemble::disassemble_ir(&blob, &[entry], true, image_base, 30000, None);
     let ir: serde_json::Value =
         serde_json::from_str(&ir_str).unwrap_or_else(|e| die(&format!("IR parse: {e}")));
+    // Drop functions another chunk at this segbase already owns (dedup).
+    let ir = filter_ir_functions(ir, &read_owned_funcs(&outdir, image_base, entry), entry);
 
     // Emit under a placeholder name, hash the name-independent text, then
     // stamp the real (content-addressed) name in.
@@ -553,6 +734,7 @@ fn cmd_jit_compile(mut it: std::vec::IntoIter<String>) {
     // Same emitted Rust + toolchain -> reuse the compiled .so (only the data
     // bytes around the code changed); record the alias for the fast path.
     if emit_cached(&name) {
+        write_funcs_sidecar(&outdir, &name, &ir_func_starts(&ir));
         std::fs::write(&alias_p, format!("{name}\n")).ok();
         return;
     }
@@ -574,6 +756,7 @@ fn cmd_jit_compile(mut it: std::vec::IntoIter<String>) {
     // Decoded byte coverage + decoded-address range from the IR functions.
     let (lo, hi, merged) = ir_spans(&ir, entry);
     write_chunk_sidecars(&outdir, &name, &keys, lo, hi, &merged, &key);
+    write_funcs_sidecar(&outdir, &name, &ir_func_starts(&ir));
     std::fs::write(&alias_p, format!("{name}\n")).ok();
 
     println!("SO {}", so.display());
@@ -595,16 +778,7 @@ struct SpecEmit {
     lo: i64,
     hi: i64,
     merged: Vec<(i64, i64)>,
-}
-
-/// Split a standalone chunk text into (prologue, body): the prologue is
-/// everything up to and including the `pub const SAISEI_SITE …` line — shared
-/// crate attrs, the prelude include, and the site constant — the body is all
-/// the chunk's fns, every one of whose names is prefixed with the chunk name.
-fn split_chunk_text(rs_text: &str) -> Option<(&str, &str)> {
-    let site_at = rs_text.find("pub const SAISEI_SITE")?;
-    let body_at = site_at + rs_text[site_at..].find('\n')? + 1;
-    Some((&rs_text[..site_at], &rs_text[body_at..]))
+    func_starts: Vec<i64>,
 }
 
 /// Translate one candidate entry exactly like `jit-compile` would (per-entry
@@ -628,6 +802,12 @@ fn spec_translate_one(
     }
     let ir_str = disassemble::disassemble_ir(blob, &[off], true, image_base, 30000, None);
     let ir: serde_json::Value = serde_json::from_str(&ir_str).ok()?;
+    // Drop functions another chunk at this segbase already owns (dedup). Within
+    // one speculate pass the parallel candidates can't see each other's not-yet-
+    // written .funcs, so this dedups mainly against the foreground and prior
+    // passes — enough for DM, whose speculation finds few static candidates.
+    let ir = filter_ir_functions(ir, &read_owned_funcs(outdir, image_base, off), off);
+    let func_starts = ir_func_starts(&ir);
     const PLACEHOLDER: &str = "SAISEI_CHUNKNAME";
     let rs_ph = codegen::emit_chunk(
         &ir,
@@ -660,6 +840,7 @@ fn spec_translate_one(
         lo,
         hi,
         merged,
+        func_starts,
     })
 }
 
@@ -691,6 +872,7 @@ fn spec_finalize(
         .ok();
     }
     write_chunk_sidecars(outdir, &e.name, &e.keys, e.lo, e.hi, &e.merged, &key);
+    write_funcs_sidecar(outdir, &e.name, &e.func_starts);
     std::fs::write(
         outdir.join(format!("{}_{blob_sha}.alias", e.base)),
         format!("{}\n", e.name),
@@ -741,9 +923,38 @@ fn cmd_speculate(mut it: std::vec::IntoIter<String>) {
         cleanup();
         return;
     }
+    // Single-flight: serialize speculation so exactly ONE full-core pass runs at
+    // a time. The runtime fires a detached `speculate` per touched segbase; on a
+    // cold burst that stacks ~N of them at once, each grabbing cores/2 threads
+    // (15×16 on a 32-core box) — the scheduler thrashes and the sum runs far
+    // below the parallel ceiling (measured ~7 chunks/s vs ~170/s achievable).
+    // An flock (auto-released when this process exits, even on a crash — no stale
+    // deadlock) turns the burst into a full-core pipeline: one segment decoded
+    // and compiled across every core, then the next. Queued waiters are cheap
+    // blocked processes; each re-checks done_marker once it owns the lock so no
+    // segment is compiled twice.
+    let _spec_lock = {
+        use std::os::unix::io::AsRawFd;
+        let lf = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(outdir.join("speculate.lock"));
+        if let Ok(ref f) = lf {
+            unsafe {
+                libc::flock(f.as_raw_fd(), libc::LOCK_EX);
+            }
+        }
+        lf // held (fd open) until cmd_speculate returns, releasing the lock
+    };
+    if done_marker.exists() {
+        cleanup();
+        return;
+    }
+    // One pass owns the machine, so take nearly all cores (leave one for the
+    // game's own foreground compile, which is what it may be blocked on).
     if jobs == 0 {
         jobs = std::thread::available_parallelism()
-            .map(|n| (n.get() / 2).max(2))
+            .map(|n| n.get().saturating_sub(1).max(2))
             .unwrap_or(2);
     }
 
@@ -823,81 +1034,24 @@ fn cmd_speculate(mut it: std::vec::IntoIter<String>) {
     emits.sort_by_key(|e| e.off);
     eprintln!("[speculate] {} entries to compile", emits.len());
 
-    // Compile: big chunks individually, small ones batched N-per-rustc (the
-    // median chunk is rustc-startup-bound). A batch failure falls back to
-    // individual compiles; an individual failure just skips that entry.
-    const SMALL_RS_BYTES: usize = 131_072;
-    const BATCH_N: usize = 10;
-    let (smalls, bigs): (Vec<&SpecEmit>, Vec<&SpecEmit>) =
-        emits.iter().partition(|e| e.rs_text.len() < SMALL_RS_BYTES);
-    let mut units: Vec<Vec<&SpecEmit>> = Vec::new();
-    for b in bigs {
-        units.push(vec![b]);
-    }
-    for group in smalls.chunks(BATCH_N) {
-        units.push(group.to_vec());
-    }
-    let unit_work = std::sync::Mutex::new(units.into_iter());
+    // Compile every entry individually across the thread pool. Batching several
+    // chunks per rustc crate used to amortize re-parsing the 941-line prelude,
+    // but the prelude is now the precompiled `saisei_rt` rlib (linked, not
+    // reparsed), so batching only trades away parallelism — on an idle many-core
+    // host N independent rustc jobs finish sooner than one N-body crate.
+    let unit_work = std::sync::Mutex::new(emits.iter());
     std::thread::scope(|s| {
         for _ in 0..jobs {
             s.spawn(|| loop {
-                let unit = match unit_work.lock().unwrap().next() {
-                    Some(u) => u,
+                let e = match unit_work.lock().unwrap().next() {
+                    Some(e) => e,
                     None => return,
                 };
-                if unit.len() == 1 {
-                    let e = unit[0];
-                    let so = outdir.join(format!("{}.so", e.name));
-                    if compile_chunk(&e.rs_text, &e.name, &outdir, &so).is_ok() {
-                        spec_finalize(e, &blob_sha, &outdir, None);
-                    } else {
-                        eprintln!("[speculate] skip 0x{:04X}: rustc failed", e.off);
-                    }
-                    continue;
-                }
-                // batch: one crate, one shared prologue + site const, N bodies
-                let mut member_shas = String::new();
-                for e in &unit {
-                    member_shas.push_str(&e.name);
-                }
-                let batch_name = format!(
-                    "jit_{image_base:05x}_batch_{}",
-                    sha_hex16(member_shas.as_bytes())
-                );
-                let batch_so = outdir.join(format!("{batch_name}.so"));
-                let mut text = String::new();
-                let mut ok = true;
-                for (i, e) in unit.iter().enumerate() {
-                    match split_chunk_text(&e.rs_text) {
-                        Some((prologue, body)) => {
-                            if i == 0 {
-                                text.push_str(prologue);
-                                text.push_str(&format!(
-                                    "pub const SAISEI_SITE: &core::ffi::CStr = c\"{batch_name}\";\n"
-                                ));
-                            }
-                            text.push_str(body);
-                        }
-                        None => {
-                            ok = false;
-                            break;
-                        }
-                    }
-                }
-                if ok && compile_chunk(&text, &batch_name, &outdir, &batch_so).is_ok() {
-                    for e in &unit {
-                        spec_finalize(e, &blob_sha, &outdir, Some(&batch_so));
-                    }
+                let so = outdir.join(format!("{}.so", e.name));
+                if compile_chunk(&e.rs_text, &e.name, &outdir, &so).is_ok() {
+                    spec_finalize(e, &blob_sha, &outdir, None);
                 } else {
-                    // fall back to individual compiles
-                    for e in &unit {
-                        let so = outdir.join(format!("{}.so", e.name));
-                        if compile_chunk(&e.rs_text, &e.name, &outdir, &so).is_ok() {
-                            spec_finalize(e, &blob_sha, &outdir, None);
-                        } else {
-                            eprintln!("[speculate] skip 0x{:04X}: rustc failed", e.off);
-                        }
-                    }
+                    eprintln!("[speculate] skip 0x{:04X}: rustc failed", e.off);
                 }
             });
         }

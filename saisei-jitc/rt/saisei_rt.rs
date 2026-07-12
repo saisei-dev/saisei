@@ -11,8 +11,16 @@
 // `cpu`, `virtual_memory` and every extern fn below resolve at load time
 // against the (still C) runtime — the same way the C chunks link today.
 
-// Wrapped in a module so this file can be `include!`d at item position: module
-// inner attributes are legal, and the private `use core::ffi` stays scoped.
+// Compiled ONCE per toolchain as the `saisei_rt` rlib and linked into every
+// chunk cdylib via `--extern` (the Rust analogue of a precompiled PCH), instead
+// of being `include!`d and reparsed per chunk. The 941-line prelude was ~86% of
+// a small chunk's rustc time; building it once and reusing the .rlib removes
+// that per-chunk cost. Items are re-exported at the crate root (`pub use rt::*`)
+// so chunks call them unqualified after `use saisei_rt::*`.
+#![no_std]
+#![allow(dead_code, non_snake_case, non_upper_case_globals, non_camel_case_types)]
+#![allow(unused_unsafe, unused_parens, unused_mut, unused_assignments, unused_imports)]
+#![allow(unused_variables, unreachable_code, unreachable_patterns)]
 pub mod rt {
 #![allow(dead_code, non_snake_case, non_upper_case_globals, non_camel_case_types)]
 #![allow(unused_unsafe, unused_parens, unused_mut, unused_assignments, unused_imports)]
@@ -229,14 +237,21 @@ fn cpu_ptr() -> *mut CpuState {
     unsafe { core::ptr::addr_of_mut!(cpu) }
 }
 
+extern "C" {
+    // The chunk's real name ("jit_<segbase5>_<off4>_<sha>"). Each chunk cdylib
+    // defines this (`#[no_mangle] saisei_site_name`, emitted by ir_to_rust); the
+    // prelude lives upstream in the rlib and can't name a downstream const, so
+    // it resolves the name through this linker symbol at cdylib link time.
+    fn saisei_site_name() -> *const c_char;
+}
 #[inline(always)]
 fn site() -> *const c_char {
-    // The chunk's real name ("jit_<segbase5>_<off4>_<sha>"), defined at the
-    // chunk crate root by ir_to_rust. Mirrors the C backend's `__FILE__` so the
-    // runtime's cross-binary-write tripwire recognizes a chunk writing within
-    // its own decode segment as legitimate self-modification (a generic "jit"
-    // tag defeats that check and false-fires on driver self-writes).
-    crate::SAISEI_SITE.as_ptr()
+    // Mirrors the C backend's `__FILE__` so the runtime's cross-binary-write
+    // tripwire recognizes a chunk writing within its own decode segment as
+    // legitimate self-modification (a generic "jit" tag defeats that check and
+    // false-fires on driver self-writes). Only reached on slow/FFI paths (the
+    // inline memb/memw fast path never calls it), so the extra call is free.
+    unsafe { saisei_site_name() }
 }
 
 // ---- register accessors -----------------------------------------------------
