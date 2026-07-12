@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::process::{exit, Command};
+use std::process::exit;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 const USAGE: &str =
@@ -262,6 +262,42 @@ fn mtime(p: &Path) -> Option<f64> {
         .duration_since(UNIX_EPOCH)
         .ok()
         .map(|d| d.as_secs_f64())
+}
+
+/// PIDs with `fifo` open, read straight from /proc/<pid>/fd — `status` used to
+/// shell out to `fuser`, which isn't installed by default anywhere. Best-effort:
+/// an empty result means nobody holds it (other users' fds are unreadable and
+/// simply don't match, which is fine — the game runs as us).
+#[cfg(target_os = "linux")]
+fn fifo_holders(fifo: &Path) -> Vec<String> {
+    let target = std::fs::canonicalize(fifo).unwrap_or_else(|_| fifo.to_path_buf());
+    let mut pids = Vec::new();
+    let Ok(procs) = std::fs::read_dir("/proc") else {
+        return pids;
+    };
+    for proc in procs.flatten() {
+        let name = proc.file_name();
+        let pid = name.to_string_lossy();
+        if pid.is_empty() || !pid.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if let Ok(fds) = std::fs::read_dir(proc.path().join("fd")) {
+            if fds
+                .flatten()
+                .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|l| l == target))
+            {
+                pids.push(pid.into_owned());
+            }
+        }
+    }
+    pids
+}
+
+/// macOS has no /proc, and the reader isn't discoverable without lsof — say so
+/// rather than claim there is no holder.
+#[cfg(not(target_os = "linux"))]
+fn fifo_holders(_fifo: &Path) -> Vec<String> {
+    Vec::new()
 }
 
 fn glob_files(dir: &Path, prefix: &str, suffix: &str) -> Vec<PathBuf> {
@@ -721,18 +757,13 @@ pub fn main(root: &Path, args: &[String]) -> ! {
             if !exists {
                 exit(0);
             }
-            // Best-effort: who has the FIFO open (fuser may not be installed).
-            let mut found_reader = false;
-            if let Ok(o) = Command::new("fuser").arg(&fifo_arg).output() {
-                let s = String::from_utf8_lossy(&o.stdout);
-                let s = s.trim();
-                if !s.is_empty() {
-                    println!("holders: {s}");
-                    found_reader = true;
-                }
-            }
-            if !found_reader {
-                println!("holders: (run `lsof {fifo_arg}` to check)");
+            let holders = fifo_holders(&fifo);
+            if !holders.is_empty() {
+                println!("holders: {}", holders.join(" "));
+            } else if cfg!(target_os = "linux") {
+                println!("holders: (none — no process has the FIFO open)");
+            } else {
+                println!("holders: (unknown — run `lsof {fifo_arg}` to check)");
             }
             let shots = resolve_shots_dir(root, &fifo_arg, shots_dir.as_deref());
             if shots.is_dir() {

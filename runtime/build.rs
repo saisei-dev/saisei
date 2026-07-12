@@ -1,7 +1,9 @@
 //! Native link flags for the runtime crate's linkable artifacts: the cdylib
 //! (`libsaisei_runtime.so`, dlopen'd by the shim unit tests) and any binary
-//! that depends on the rlib. SDL2 comes from pkg-config (with a homebrew
-//! fallback), plus the system libs the runtime calls directly.
+//! that depends on the rlib. SDL2 is located via pkg-config when it's installed
+//! and by probing the standard library paths when it isn't — so pkg-config is
+//! not itself a prerequisite, and a missing SDL2 fails with the install command
+//! rather than a linker error. Plus the system libs the runtime calls directly.
 //!
 //! Also bakes the pre-game splash logo into a raw RGB24 blob for `sdl.rs` — the
 //! decode and downscale happen once, here, so the display path links no image
@@ -9,7 +11,7 @@
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 // Longest edge of the embedded logo. The splash draws through a texture of its
@@ -59,32 +61,72 @@ fn bake_logo() {
     .expect("write logo.rs");
 }
 
-fn main() {
-    bake_logo();
-
-    let pkg = Command::new("pkg-config")
+/// SDL2's link flags from pkg-config, if pkg-config is installed and knows about
+/// it. Handles the unusual-prefix case (a hand-built SDL, a non-default brew
+/// prefix) that path probing can't.
+fn sdl2_from_pkg_config() -> Option<Vec<String>> {
+    let out = Command::new("pkg-config")
         .args(["--libs", "sdl2"])
         .output()
         .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+        .filter(|o| o.status.success())?;
+    let flags = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!flags.is_empty()).then(|| flags.split_whitespace().map(str::to_string).collect())
+}
 
-    match pkg {
-        Some(flags) => {
-            for tok in flags.split_whitespace() {
-                if let Some(dir) = tok.strip_prefix("-L") {
-                    println!("cargo:rustc-link-search=native={dir}");
-                } else if let Some(lib) = tok.strip_prefix("-l") {
-                    println!("cargo:rustc-link-lib={lib}");
-                }
-            }
-        }
-        None => {
-            // Homebrew fallback (mirrors the launcher's resolve_sdl_flags).
-            println!("cargo:rustc-link-search=native=/opt/homebrew/lib");
-            println!("cargo:rustc-link-lib=SDL2");
+/// The places a package manager actually drops libSDL2, so that pkg-config is
+/// not itself a prerequisite — `apt install libsdl2-dev` / `brew install sdl2`
+/// is the whole install, and this finds what they put down.
+///
+/// We look for the *linker* name (libSDL2.so / libSDL2.dylib), which only the
+/// dev package provides. A machine with just the runtime library
+/// (libSDL2-2.0.so.0) can run an SDL program but cannot link one, and reporting
+/// that as "found" would only defer the failure to a cryptic `-lSDL2` error.
+fn sdl2_from_probe() -> Option<Vec<String>> {
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let dirs = [
+        "/opt/homebrew/lib".to_string(),      // brew, Apple silicon
+        "/usr/local/lib".to_string(),         // brew on Intel, /usr/local builds
+        format!("/usr/lib/{arch}-linux-gnu"), // Debian/Ubuntu multiarch
+        "/usr/lib64".to_string(),             // Fedora/RHEL
+        "/usr/lib".to_string(),               // Arch and friends
+    ];
+    let names = ["libSDL2.so", "libSDL2.dylib"];
+    dirs.iter()
+        .find(|d| names.iter().any(|n| Path::new(d).join(n).exists()))
+        .map(|d| vec![format!("-L{d}"), "-lSDL2".to_string()])
+}
+
+/// Everything Saisei needs from the system, in one message. A missing SDL2 must
+/// not surface as `/usr/bin/ld: cannot find -lSDL2` — the first thing a new user
+/// sees should be the command that fixes it.
+fn sdl2_missing() -> ! {
+    panic!(
+        "\n\nSDL2 not found — Saisei opens its window with it.\n\n\
+         Install it, then run `cargo build --release` again:\n\n  \
+         Debian/Ubuntu   sudo apt install libsdl2-dev\n  \
+         Fedora          sudo dnf install SDL2-devel\n  \
+         Arch            sudo pacman -S sdl2\n  \
+         macOS           brew install sdl2\n\n\
+         (Already installed somewhere unusual? Then `pkg-config --libs sdl2` \
+         has to find it.)\n"
+    )
+}
+
+fn main() {
+    bake_logo();
+
+    let flags = sdl2_from_pkg_config()
+        .or_else(sdl2_from_probe)
+        .unwrap_or_else(|| sdl2_missing());
+    for tok in &flags {
+        if let Some(dir) = tok.strip_prefix("-L") {
+            println!("cargo:rustc-link-search=native={dir}");
+        } else if let Some(lib) = tok.strip_prefix("-l") {
+            println!("cargo:rustc-link-lib={lib}");
         }
     }
+
     println!("cargo:rustc-link-lib=dl");
     println!("cargo:rustc-link-lib=pthread");
     println!("cargo:rustc-link-lib=m");

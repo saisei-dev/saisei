@@ -132,9 +132,16 @@ address routes through the JIT.
 
 ## Where things live
 
-Everything is Rust (nightly, pinned by `rust-toolchain.toml`); the only C in
-the tree is the vendored capstone disassembler (`vendor/capstone-sys`, built
-statically inside cargo).
+Everything is Rust, on a *dated* nightly pinned by `rust-toolchain.toml` —
+`c_variadic` and `linkage` are unstable, so a floating nightly could break a
+fresh clone out from under it. The only C in the tree is the vendored capstone
+disassembler (`vendor/capstone-sys`), compiled statically inside cargo by the cc
+crate, using the same system C compiler rustc already needs as its linker.
+
+So the system prerequisites are exactly two — that C compiler/linker and SDL2 —
+plus rustup. The launcher spawns nothing else: `new-game` downloads over HTTPS
+and extracts zips in-process, and the build revision is baked in at compile
+time. (`cargo` and `rustc` are still invoked at *run* time — that is the JIT.)
 
 - `saisei-jitc/src/disassemble.rs` – byte image → IR + metadata.
 - `saisei-jitc/src/translate.rs` – the shared translation front-half.

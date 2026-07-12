@@ -1,7 +1,16 @@
-# Nightly is required because the runtime crate DEFINES
-# C-variadic functions (shim_log_stdout/shim_log_crash/... — printf-style logging
-# the whole runtime + JIT chunks call), which needs the `c_variadic` feature.
-# Still rustc, no clang. JIT chunks also compile under this toolchain.
+# Nightly is required because the runtime crate DEFINES C-variadic functions
+# (shim_log_stdout/shim_log_crash/... — printf-style logging the whole runtime +
+# JIT chunks call), which needs the `c_variadic` feature; `linkage` supplies the
+# weak game_config default. Still rustc, no clang. JIT chunks compile under this
+# same toolchain at run time.
+#
+# PINNED TO A DATE on purpose. Both features are unstable, so a floating
+# `nightly` would hand a new user whatever landed this morning and could break
+# the build with no recourse. Rustup fetches this exact toolchain automatically
+# on first `cargo build`. To move it: bump the date, `cargo build --release`,
+# run a game, then commit.
 [toolchain]
-channel = "nightly"
-components = ["rustc", "cargo", "rust-std"]
+channel = "nightly-2026-07-09"
+# rustfmt is listed because .githooks runs `cargo fmt --check` on every commit —
+# without it here, a minimal-profile rustup install can't even commit.
+components = ["rustc", "cargo", "rust-std", "rustfmt"]

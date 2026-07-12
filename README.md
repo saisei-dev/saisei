@@ -8,23 +8,21 @@ So a game stops being a sealed artifact and becomes something you can open up:
 
 - ▶️ **Play** — run the classics as fast, native programs.
 - 🔍 **Explore** — read the Rust Saisei generates and finally see how your favorite game actually works.
-- 🎨 **Remake** *(WIP)* — swap the art, remix the music, rewrite the gameplay, and ship your own cut.
+- 🎨 **Remix** *(WIP)* — swap the art, rescore the music, rewrite the gameplay, and ship your own cut.
 
 Packed, overlay-swapped, and self-modifying games all just work, because Saisei only ever compiles the bytes that are about to run. Old games don't have to stay frozen — give them a second life.
 
 ## Start playing
 
-Set up once. You'll need Rust (the whole toolchain is Rust) and SDL2:
+Two things to install — SDL2, for the window, and Rust. Then build:
 
 ```bash
-# Debian/Ubuntu:  sudo apt install libsdl2-dev pkg-config
-# macOS:          brew install sdl2 pkg-config
+# Debian/Ubuntu:  sudo apt install build-essential libsdl2-dev
+# macOS:          xcode-select --install && brew install sdl2
 # Rust:           https://rustup.rs
 
-# Build the toolchain (the `saisei` + `saisei-jitc` binaries):
-cargo build --release
-# Put it on your PATH (or invoke target/release/saisei directly):
-export PATH="$PWD/target/release:$PATH"
+cargo build --release                      # fetches the pinned toolchain itself
+export PATH="$PWD/target/release:$PATH"    # or just run target/release/saisei
 ```
 
 Then bring a game. Grab one from an abandonware archive like [My Abandonware](https://www.myabandonware.com/) and hand Saisei the link:
@@ -34,7 +32,7 @@ saisei new-game "https://.../coolgame.zip"
 saisei play coolgame
 ```
 
-`new-game` unpacks the archive — and asks which executable to run if there's more than one. `play` opens the game in a window, compiling each part to native code the moment control reaches it. No config files, no flags to weigh.
+`new-game` downloads and unpacks the zip — and asks which executable to run if there's more than one. `play` opens the game in a window, compiling each part to native code the moment control reaches it. No config files, no flags to weigh.
 
 Two more commands for when you need them: `saisei run <name> --headless` runs without a window (for scripting and CI), and `saisei build <name>` compiles without running. Run `saisei help` for the full command list. To drive a game from a script — keystrokes, screenshots, deterministic replay — see [Driving a program](docs/playing.md).
 

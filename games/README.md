@@ -7,9 +7,10 @@ machine parameters to load it with.
 
 ## Bring your own program
 
-Point Saisei at any DOS executable you have the right to use. The easiest way is
-the bundler, which fetches an archive (URL, `.zip`, or local directory),
-extracts it, and writes a seed config:
+Point Saisei at any DOS executable you have the right to use. Zip is the only
+archive format for now — unpack anything else yourself and pass the folder. The
+easiest way is the bundler, which fetches a zip (by URL or local path; a local
+directory works too), extracts it, and writes a seed config:
 
 ```bash
 saisei new-game <archive-url-or-path> --exe YOURGAME.EXE

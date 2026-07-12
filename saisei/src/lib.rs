@@ -11,6 +11,10 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
 
+/// The checkout's git short hash, baked in by build.rs (or "unknown" outside a
+/// git checkout) — so no `git` process is spawned at run time.
+pub const BUILD_REVISION: &str = env!("SAISEI_GIT_HASH");
+
 pub mod control;
 pub mod new_game;
 pub mod replay;
@@ -546,17 +550,10 @@ fn game_process_env(root: &Path, game: &GameDef) -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> = std::env::vars().collect();
     env.insert("SAISEI_REPO_ROOT".into(), root.display().to_string());
     // Crash manifests carry the repo git hash (runtime_version in shims.rs);
-    // exported at run time so the runtime never rebuilds per commit.
-    if let Some(hash) = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .current_dir(root)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
-        env.insert("SAISEI_RUNTIME_VERSION".into(), hash);
+    // exported at run time so the runtime never rebuilds per commit. Baked into
+    // this binary by build.rs — no `git` process per launch.
+    if BUILD_REVISION != "unknown" {
+        env.insert("SAISEI_RUNTIME_VERSION".into(), BUILD_REVISION.to_string());
     }
     // The Rust JIT translator; the runtime needs no the reference when this is set.
     if !env.contains_key("SAISEI_JITC") {
@@ -761,17 +758,9 @@ build options:
 
 Run 'saisei version' for the build revision.";
 
-/// Best-effort build revision (git short hash), for `saisei version`.
-fn version_string(root: &Path) -> String {
-    Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .current_dir(root)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string())
+/// Build revision for `saisei version` — baked in at compile time by build.rs.
+fn version_string() -> String {
+    BUILD_REVISION.to_string()
 }
 
 pub fn run() {
@@ -787,7 +776,7 @@ pub fn run() {
             exit(0)
         }
         "version" | "--version" | "-V" => {
-            println!("saisei {}", version_string(&root));
+            println!("saisei {}", version_string());
             exit(0)
         }
         "new-game" => new_game::main(&root, rest),

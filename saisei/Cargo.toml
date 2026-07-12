@@ -14,9 +14,15 @@ path = "src/main.rs"
 
 [dependencies]
 serde_json = { version = "1", features = ["preserve_order"] }
-# 's crash-bundle dir-name / dos_open failure regexes.
+# Crash-bundle dir-name / dos_open failure regexes.
 regex = "1"
-# forkpty/select for the source port.
+# forkpty/select for `saisei control`.
 libc = "0.2"
-# the image crate for the source's screenshot crop/upscale.
+# Screenshot crop/upscale.
 image = { version = "0.25", default-features = false, features = ["png"] }
+# `new-game <url>` downloads in-process — no curl. rustls (pure Rust, its own
+# webpki root store), so there is no system OpenSSL or CA-bundle dependency.
+ureq = "3"
+# `new-game <zip>` extracts in-process — no unzip. Pure Rust; stored + deflate
+# only, which is every zip a modern archive site serves.
+zip = { version = "8", default-features = false, features = ["deflate"] }

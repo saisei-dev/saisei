@@ -9,10 +9,20 @@ A **JIT binary recompiler** that turns DOS MZ executables into native Rust and r
 Everything is Rust, workspace at the repo root: `saisei-jitc/` (the translator +
 JIT, exposed as the `saisei-jitc` binary + library), `saisei/` (the `saisei`
 launcher), `runtime/` (the runtime crate, `saisei-runtime`), and `saisei-game/`
-(the thin per-game bin crate). No C is compiled anywhere and no C toolchain is
-invoked; the only C in the tree is the vendored capstone disassembler
-(`vendor/capstone-sys`, built by the cc crate inside cargo). The toolchain is
-pinned to nightly (`rust-toolchain.toml`) for `c_variadic` in the runtime.
+(the thin per-game bin crate). No clang and no C build system (make/cmake): the
+only C in the tree is the vendored capstone disassembler, which the cc crate
+compiles from inside cargo (`vendor/capstone-sys`) using the same system C
+compiler rustc already needs as its linker. The toolchain is pinned to a *dated*
+nightly (`rust-toolchain.toml`) for `c_variadic`/`linkage` in the runtime — the
+date is deliberate, since a floating nightly can break those unstable features
+out from under a fresh clone.
+
+The system prerequisites are exactly two — a C compiler/linker and SDL2 — plus
+rustup. The launcher shells out to nothing else: `new-game` downloads over HTTPS
+in-process (ureq) and extracts zips in-process (the zip crate), `control status`
+reads /proc, and the build revision is baked in by `saisei/build.rs`. Don't
+reintroduce a `curl`/`unzip`/`git`/`fuser` subprocess — a missing tool becomes a
+first-run failure for someone who just wants to play a game.
 
 ## Commands
 
