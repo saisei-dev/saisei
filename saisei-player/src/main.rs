@@ -6,8 +6,12 @@
 //! which is what the dev CLI (`saisei-cli run`/`play`) and the save-load re-exec
 //! both use.
 
+mod add;
 mod host;
+mod library;
 mod relaunch;
+mod save;
+mod shell;
 
 use host::LaunchSpec;
 
@@ -103,6 +107,3 @@ fn fail(msg: &str) -> ! {
     eprintln!("saisei: {msg}");
     std::process::exit(2);
 }
-
-mod library;
-mod shell;

@@ -350,6 +350,15 @@ fn rotate(now: u64) {
     }
 }
 
+/// Whether a snapshot taken right now would be a valid one.
+///
+/// The overlay asks before it stops the guest: it stops at a point where this is
+/// true, so its Save button always works. See `maybe_enter_overlay` (shims.rs).
+#[no_mangle]
+pub extern "C" fn save_manager_can_save_now() -> c_int {
+    can_save_now()
+}
+
 fn can_save_now() -> c_int {
     /* refuse nonzero lcall/isr depths */
     if unsafe { lcall_depth } != 0 || unsafe { isr_depth } != 0 {

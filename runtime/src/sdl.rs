@@ -77,12 +77,30 @@ struct SdlMouseButtonEvent {
     y: i32,
 }
 #[repr(C)]
+#[derive(Clone, Copy)]
+struct SdlTextInputEvent {
+    type_: u32,
+    timestamp: u32,
+    window_id: u32,
+    text: [c_char; 32],
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SdlDropEvent {
+    type_: u32,
+    timestamp: u32,
+    file: *mut c_char,
+    window_id: u32,
+}
+#[repr(C)]
 union SdlEvent {
     type_: u32,
     window: SdlWindowEvent,
     key: SdlKeyboardEvent,
     motion: SdlMouseMotionEvent,
     button: SdlMouseButtonEvent,
+    text: SdlTextInputEvent,
+    drop: SdlDropEvent,
     padding: [u8; 56],
 }
 
@@ -134,6 +152,14 @@ extern "C" {
     fn SDL_PumpEvents();
     fn SDL_PollEvent(e: *mut SdlEvent) -> c_int;
     fn SDL_GetKeyboardState(numkeys: *mut c_int) -> *const u8;
+    // The player's UI layer (see the `saisei_ui_*` entry points below).
+    fn SDL_GetRendererOutputSize(r: *mut c_void, w: *mut c_int, h: *mut c_int) -> c_int;
+    fn SDL_GetWindowSize(w: *mut c_void, width: *mut c_int, height: *mut c_int);
+    fn SDL_SetTextureBlendMode(t: *mut c_void, mode: c_int) -> c_int;
+    fn SDL_SetRenderDrawColor(r: *mut c_void, red: u8, g: u8, b: u8, a: u8) -> c_int;
+    fn SDL_StartTextInput();
+    fn SDL_EventState(type_: u32, state: c_int) -> u8;
+    fn SDL_free(mem: *mut c_void);
     // rest of the C runtime + save layer
     fn shim_save_video_memory();
     fn shim_bookend_start();
@@ -209,6 +235,11 @@ const SDLK_RCTRL: i32 = 228 | MASK;
 const SDLK_F1: i32 = SDL_SCANCODE_F1 | MASK;
 const SDLK_F2: i32 = (SDL_SCANCODE_F1 + 1) | MASK;
 const SDLK_F9: i32 = SDL_SCANCODE_F9 | MASK;
+// The overlay hotkey. F12, not the Alt+Esc a player would name, because GNOME and
+// KDE grab Alt+Esc as a window-switch shortcut and it would never reach us. F12
+// is claimed by no window manager and wanted by no DOS game we run.
+const SDL_SCANCODE_F12: i32 = 69;
+const SDLK_F12: i32 = SDL_SCANCODE_F12 | MASK;
 const SDLK_F10: i32 = (SDL_SCANCODE_F9 + 1) | MASK;
 
 /// Host numeric keypad (SDL scancodes 89..98 = KP_1..KP_9, KP_0) → the plain
@@ -254,6 +285,9 @@ static mut SPLASH_TEX_W: c_int = 0;
 static mut SPLASH_TEX_H: c_int = 0;
 static mut RGB_BUFFER: *mut u8 = core::ptr::null_mut();
 static mut RGB_BUFFER_SIZE: i32 = 0;
+// Geometry of the frame currently in RGB_BUFFER — the one on screen.
+static mut LAST_FRAME_W: c_int = 0;
+static mut LAST_FRAME_H: c_int = 0;
 static mut WIN_W: c_int = 0;
 static mut WIN_H: c_int = 0;
 static mut SCALE_HINT: c_int = 3;
@@ -367,11 +401,49 @@ fn blit_logo(buf: &mut [u8], w: usize, h: usize) {
     }
 }
 
+// Whether the splash shows the logo, or just holds a black window.
+//
+// The logo is the first thing you see when a game is launched straight from the
+// command line. But the player app has *already* shown it — the library fades in
+// out of the logo — and showing it a second time on the way into the game would
+// be a stutter, not a flourish. So the player turns the logo off, and what is
+// left is the splash's other job: holding the window from the moment it opens
+// until the game's first graphics frame, over the JIT's first compiles and over
+// a game's text-mode setup phase.
+static mut SPLASH_LOGO: bool = true;
+
+/// Show, or don't show, the logo in the pre-game splash. Off for a launch out of
+/// the player's library, which has shown it already.
+#[no_mangle]
+pub extern "C" fn virtual_display_set_splash_logo(enabled: bool) {
+    unsafe { SPLASH_LOGO = enabled };
+}
+
+fn splash_min_ms() -> u32 {
+    // With no logo there is nothing to hold *for*; the hold that remains is
+    // however long the game takes to put up its first frame.
+    if unsafe { SPLASH_LOGO } {
+        SPLASH_MIN_MS
+    } else {
+        0
+    }
+}
+
+fn splash_fade_ms() -> u32 {
+    if unsafe { SPLASH_LOGO } {
+        SPLASH_FADE_MS
+    } else {
+        0
+    }
+}
+
 // Build the splash image: the logo, centered on black. Split out from the present
 // path so its pixels are unit-testable without SDL.
 fn build_splash_rgb(w: usize, h: usize) -> Vec<u8> {
     let mut buf = vec![0u8; w * h * 3];
-    blit_logo(&mut buf, w, h);
+    if unsafe { SPLASH_LOGO } {
+        blit_logo(&mut buf, w, h);
+    }
     buf
 }
 
@@ -490,21 +562,22 @@ fn retire_splash() {
             return; // headless, or the logo never made it to a window: nothing to run out
         }
 
-        while SDL_GetTicks().wrapping_sub(SPLASH_SHOWN_AT) < SPLASH_MIN_MS {
+        while SDL_GetTicks().wrapping_sub(SPLASH_SHOWN_AT) < splash_min_ms() {
             handle_events();
             draw_splash_at(255);
             SDL_Delay(SPLASH_FRAME_MS);
         }
 
         let fade_start = SDL_GetTicks();
+        let fade = splash_fade_ms();
         loop {
             let t = SDL_GetTicks().wrapping_sub(fade_start);
-            if t >= SPLASH_FADE_MS {
+            if t >= fade {
                 break;
             }
             handle_events();
             // Smoothstep: linger near full, then fall away.
-            let k = 1.0 - t as f32 / SPLASH_FADE_MS as f32;
+            let k = 1.0 - t as f32 / fade as f32;
             let k = k * k * (3.0 - 2.0 * k);
             draw_splash_at((k * 255.0) as u8);
             SDL_Delay(SPLASH_FRAME_MS);
@@ -751,6 +824,14 @@ fn handle_events() {
                     let sym = k.keysym.sym;
                     if sym == SDLK_LCTRL || sym == SDLK_RCTRL {
                         CTRL_PRESSED = true;
+                        continue;
+                    }
+                    // The overlay hotkey. `continue` before any guest mapping, so
+                    // the game never sees F12 — it is ours, not its.
+                    if sym == SDLK_F12 {
+                        if k.repeat == 0 {
+                            crate::shims::saisei_request_overlay();
+                        }
                         continue;
                     }
                     let mods = k.keysym.r#mod;
@@ -1040,6 +1121,10 @@ pub extern "C" fn virtual_display_present(
                 *dst.add((x * 3 + 2) as usize) = vga6_to_8(b6);
             }
         }
+        // RGB_BUFFER now holds exactly what the window is about to show, mode
+        // already resolved. A save's thumbnail is taken from here.
+        LAST_FRAME_W = w;
+        LAST_FRAME_H = h;
         SDL_UpdateTexture(
             TEXTURE,
             core::ptr::null(),
@@ -1062,6 +1147,335 @@ pub extern "C" fn virtual_display_configure(width: c_int, height: c_int) {
         WIN_H = height;
     }
     recreate_texture(width, height);
+}
+
+// =============================================================================
+// The player's UI surface
+//
+// The player draws its library and its in-game overlay as software-composited
+// RGBA (see the saisei-ui crate) and hands the pixels to these entry points. The
+// runtime keeps the window, so all the player needs is: how big is it, what has
+// the person done, and here are the pixels.
+//
+// The overlay runs while the machine loop is blocked at a safepoint, so the guest
+// is not pumping events; these functions own the event queue for as long as a
+// menu is up, and deliberately never feed the guest's keyboard — the keys that
+// drive the menu must not also reach the game.
+// =============================================================================
+
+const SDL_TEXTINPUT: u32 = 0x303;
+const SDL_DROPFILE: u32 = 0x1000;
+const SDL_ENABLE: c_int = 1;
+const SDL_BLENDMODE_BLEND: c_int = 1;
+/// RGBA in memory order on a little-endian host (SDL_PIXELFORMAT_ABGR8888).
+const SDL_PIXELFORMAT_RGBA32: u32 = 0x16762004;
+
+pub const UI_EV_NONE: c_int = 0;
+pub const UI_EV_KEY: c_int = 1;
+pub const UI_EV_TEXT: c_int = 2;
+pub const UI_EV_QUIT: c_int = 3;
+pub const UI_EV_MOUSE_MOVE: c_int = 4;
+pub const UI_EV_MOUSE_DOWN: c_int = 5;
+pub const UI_EV_DROP: c_int = 6;
+
+pub const UI_KEY_UP: c_int = 1;
+pub const UI_KEY_DOWN: c_int = 2;
+pub const UI_KEY_LEFT: c_int = 3;
+pub const UI_KEY_RIGHT: c_int = 4;
+pub const UI_KEY_ENTER: c_int = 5;
+pub const UI_KEY_ESCAPE: c_int = 6;
+pub const UI_KEY_BACKSPACE: c_int = 7;
+/// F12 — opens the overlay, and closes it again.
+pub const UI_KEY_OVERLAY: c_int = 8;
+
+#[repr(C)]
+pub struct UiEvent {
+    pub kind: c_int,
+    /// A UI_KEY_* for UI_EV_KEY; a Unicode scalar for UI_EV_TEXT.
+    pub code: c_int,
+    /// Mouse position, already in the coordinates of the pixel buffer the caller
+    /// paints — not window coordinates, which differ from it on a HiDPI display.
+    pub x: c_int,
+    pub y: c_int,
+    /// The dropped path, for UI_EV_DROP.
+    pub path: [c_char; 1024],
+}
+
+static mut UI_TEXTURE: *mut c_void = core::ptr::null_mut();
+static mut UI_TEX_W: c_int = 0;
+static mut UI_TEX_H: c_int = 0;
+
+/// Open the window for the player's library, before any game exists.
+#[no_mangle]
+pub extern "C" fn saisei_ui_init(width: c_int, height: c_int) -> bool {
+    unsafe {
+        if !virtual_display_open_window(width, height, 1) {
+            return false;
+        }
+        SDL_SetWindowSize(WINDOW, width, height);
+        // Dropping a game's zip on the window is how a game gets added, and
+        // typing is how a link gets pasted.
+        SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
+        SDL_StartTextInput();
+        true
+    }
+}
+
+/// The size, in pixels, of the buffer the caller should paint. This is the
+/// renderer's output size rather than the window's: on a HiDPI display they
+/// differ, and painting at the window's size would come out soft.
+#[no_mangle]
+pub extern "C" fn saisei_ui_size(w: *mut c_int, h: *mut c_int) {
+    unsafe {
+        *w = 0;
+        *h = 0;
+        if !RENDERER.is_null() {
+            SDL_GetRendererOutputSize(RENDERER, w, h);
+        }
+    }
+}
+
+/// Window pixels per window point — 1 except on a HiDPI display. Mouse events
+/// arrive in points; the caller paints in pixels.
+unsafe fn ui_dpi_scale() -> f32 {
+    if WINDOW.is_null() || RENDERER.is_null() {
+        return 1.0;
+    }
+    let (mut ww, mut wh) = (0, 0);
+    let (mut ow, mut oh) = (0, 0);
+    SDL_GetWindowSize(WINDOW, &mut ww, &mut wh);
+    SDL_GetRendererOutputSize(RENDERER, &mut ow, &mut oh);
+    let _ = wh;
+    let _ = oh;
+    if ww > 0 {
+        ow as f32 / ww as f32
+    } else {
+        1.0
+    }
+}
+
+/// Take the next UI event, or UI_EV_NONE when the queue is empty.
+///
+/// This never enqueues a guest keypress: while a menu is up, the keyboard drives
+/// the menu, and the game — which is paused mid-instruction behind it — must not
+/// also see the keys.
+#[no_mangle]
+pub extern "C" fn saisei_ui_poll(out: *mut UiEvent) -> bool {
+    unsafe {
+        if RENDERER.is_null() {
+            return false;
+        }
+        let ev = &mut *out;
+        ev.kind = UI_EV_NONE;
+        ev.code = 0;
+        ev.x = 0;
+        ev.y = 0;
+        ev.path[0] = 0;
+
+        let mut e: SdlEvent = core::mem::zeroed();
+        SDL_PumpEvents();
+        if SDL_PollEvent(&mut e) == 0 {
+            return false;
+        }
+        let scale = ui_dpi_scale();
+        match e.type_ {
+            SDL_QUIT => ev.kind = UI_EV_QUIT,
+            SDL_KEYDOWN => {
+                let code = match e.key.keysym.sym {
+                    SDLK_UP => UI_KEY_UP,
+                    SDLK_DOWN => UI_KEY_DOWN,
+                    SDLK_LEFT => UI_KEY_LEFT,
+                    SDLK_RIGHT => UI_KEY_RIGHT,
+                    SDLK_RETURN => UI_KEY_ENTER,
+                    SDLK_ESCAPE => UI_KEY_ESCAPE,
+                    SDLK_BACKSPACE => UI_KEY_BACKSPACE,
+                    SDLK_F12 => UI_KEY_OVERLAY,
+                    _ => 0,
+                };
+                if code != 0 {
+                    ev.kind = UI_EV_KEY;
+                    ev.code = code;
+                }
+            }
+            SDL_TEXTINPUT => {
+                // SDL hands us UTF-8; the UI wants one scalar at a time.
+                let bytes: &[u8] = core::slice::from_raw_parts(
+                    e.text.text.as_ptr() as *const u8,
+                    e.text.text.len(),
+                );
+                let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                if let Some(ch) = core::str::from_utf8(&bytes[..end])
+                    .ok()
+                    .and_then(|s| s.chars().next())
+                {
+                    ev.kind = UI_EV_TEXT;
+                    ev.code = ch as c_int;
+                }
+            }
+            SDL_MOUSEMOTION => {
+                ev.kind = UI_EV_MOUSE_MOVE;
+                ev.x = (e.motion.x as f32 * scale) as c_int;
+                ev.y = (e.motion.y as f32 * scale) as c_int;
+            }
+            SDL_MOUSEBUTTONDOWN => {
+                if e.button.button == 1 {
+                    ev.kind = UI_EV_MOUSE_DOWN;
+                    ev.x = (e.button.x as f32 * scale) as c_int;
+                    ev.y = (e.button.y as f32 * scale) as c_int;
+                }
+            }
+            SDL_DROPFILE => {
+                let file = e.drop.file;
+                if !file.is_null() {
+                    let n = libc::strlen(file).min(ev.path.len() - 1);
+                    core::ptr::copy_nonoverlapping(file, ev.path.as_mut_ptr(), n);
+                    ev.path[n] = 0;
+                    ev.kind = UI_EV_DROP;
+                    // SDL allocated it; SDL frees it.
+                    SDL_free(file as *mut c_void);
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+}
+
+// The UI texture is created at exactly the size the caller painted, so its pixels
+// land 1:1 on the window instead of being resampled.
+unsafe fn ensure_ui_texture(w: c_int, h: c_int) -> bool {
+    if RENDERER.is_null() || w <= 0 || h <= 0 {
+        return false;
+    }
+    if !UI_TEXTURE.is_null() && UI_TEX_W == w && UI_TEX_H == h {
+        return true;
+    }
+    if !UI_TEXTURE.is_null() {
+        SDL_DestroyTexture(UI_TEXTURE);
+        UI_TEXTURE = core::ptr::null_mut();
+    }
+    let tex = SDL_CreateTexture(
+        RENDERER,
+        SDL_PIXELFORMAT_RGBA32,
+        SDL_TEXTUREACCESS_STREAMING,
+        w,
+        h,
+    );
+    if tex.is_null() {
+        return false;
+    }
+    // The overlay is drawn over the game, so its transparency has to mean
+    // something.
+    SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+    UI_TEXTURE = tex;
+    UI_TEX_W = w;
+    UI_TEX_H = h;
+    true
+}
+
+/// Put a painted UI frame on screen.
+///
+/// With `over_game`, the game's last frame is drawn underneath first — the guest
+/// is frozen, so this is the exact frame it was showing when the player pressed
+/// the hotkey — and the UI (which is transparent where it wants to be) composites
+/// on top.
+#[no_mangle]
+pub extern "C" fn saisei_ui_present(rgba: *const u8, w: c_int, h: c_int, over_game: bool) {
+    unsafe {
+        if RENDERER.is_null() || rgba.is_null() {
+            return;
+        }
+        // The UI is laid out in window pixels, so it must not be squeezed into
+        // the guest's logical space. Turn logical scaling off for the duration
+        // and put it back before the game's next present, which relies on it for
+        // its aspect and letterboxing.
+        SDL_RenderSetLogicalSize(RENDERER, 0, 0);
+        SDL_SetRenderDrawColor(RENDERER, 0, 0, 0, 255);
+        SDL_RenderClear(RENDERER);
+
+        if over_game && !TEXTURE.is_null() {
+            SDL_RenderSetLogicalSize(RENDERER, TEXTURE_W, TEXTURE_H);
+            SDL_RenderCopy(RENDERER, TEXTURE, core::ptr::null(), core::ptr::null());
+            SDL_RenderSetLogicalSize(RENDERER, 0, 0);
+        }
+
+        if ensure_ui_texture(w, h) {
+            SDL_UpdateTexture(UI_TEXTURE, core::ptr::null(), rgba as *const c_void, w * 4);
+            SDL_RenderCopy(RENDERER, UI_TEXTURE, core::ptr::null(), core::ptr::null());
+        }
+        SDL_RenderPresent(RENDERER);
+
+        if !TEXTURE.is_null() {
+            SDL_RenderSetLogicalSize(RENDERER, TEXTURE_W, TEXTURE_H);
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn saisei_ui_delay(ms: u32) {
+    unsafe { SDL_Delay(ms) };
+}
+
+/// Let go of every key the guest currently believes is held.
+///
+/// Called as the overlay opens. The player is mid-keystroke from the guest's
+/// point of view, and whatever was down when we froze would still be down when we
+/// resume — a held arrow would walk the character into a wall while the menu is
+/// up and for as long as it takes the player to notice.
+#[no_mangle]
+pub extern "C" fn virtual_display_release_keys() {
+    release_pressed_scancodes();
+}
+
+/// Put the game's own frame back on screen.
+///
+/// The overlay leaves the menu as the last thing presented. Rather than wait for
+/// the guest to present again — which a game sitting on a static screen may not
+/// do for a while — redraw the frame it was frozen on the moment we resume.
+#[no_mangle]
+pub extern "C" fn virtual_display_repaint() {
+    unsafe {
+        if RENDERER.is_null() || TEXTURE.is_null() {
+            return;
+        }
+        SDL_RenderSetLogicalSize(RENDERER, TEXTURE_W, TEXTURE_H);
+        SDL_RenderClear(RENDERER);
+        SDL_RenderCopy(RENDERER, TEXTURE, core::ptr::null(), core::ptr::null());
+        SDL_RenderPresent(RENDERER);
+    }
+}
+
+/// The frame the player is looking at, as RGB24, or null if there isn't one yet.
+///
+/// This is the *presented* frame — the pixels that actually went to the window,
+/// resolved through whichever video mode the game is in. It is what a save's
+/// thumbnail is made from, deliberately rather than `shim_render_screenshot_png`:
+/// that one re-reads guest VRAM assuming a linear 320x200 at 0xA000, with no
+/// planar branch, so it produces garbage for an EGA game (Dungeon Master is one).
+#[no_mangle]
+pub extern "C" fn saisei_last_frame(w: *mut c_int, h: *mut c_int) -> *const u8 {
+    unsafe {
+        *w = LAST_FRAME_W;
+        *h = LAST_FRAME_H;
+        if LAST_FRAME_W <= 0 || LAST_FRAME_H <= 0 {
+            return core::ptr::null();
+        }
+        RGB_BUFFER
+    }
+}
+
+/// Drop the UI texture once the menu is gone, so a paused game does not hold a
+/// window-sized RGBA texture for the rest of the session.
+#[no_mangle]
+pub extern "C" fn saisei_ui_release() {
+    unsafe {
+        if !UI_TEXTURE.is_null() {
+            SDL_DestroyTexture(UI_TEXTURE);
+            UI_TEXTURE = core::ptr::null_mut();
+            UI_TEX_W = 0;
+            UI_TEX_H = 0;
+        }
+    }
 }
 
 #[cfg(test)]

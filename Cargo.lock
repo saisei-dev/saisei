@@ -499,9 +499,11 @@ dependencies = [
 name = "saisei-player"
 version = "0.0.0"
 dependencies = [
+ "image",
  "libc",
  "saisei",
  "saisei-runtime",
+ "saisei-ui",
  "serde_json",
 ]
 

@@ -91,13 +91,28 @@ fn paint_library(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
     ui.cols = cols;
 
     let n = ui.games.len() + 1; // + the "Add game" tile
+    let rows = n.div_ceil(cols);
+
+    // Scroll by whole rows, keeping the cursor on screen. Without this the grid
+    // simply stops at the bottom edge — and since "Add game" is the *last* tile,
+    // a library with enough games in it would hide the only way to add another.
+    let avail = (r.y + r.h - 30.0 * s) - top; // 30: the hint line at the foot
+    let per_screen = (((avail + gap) / (card_h + gap)).floor() as usize).clamp(1, rows);
+    let sel_row = ui.game / cols;
+    if sel_row < ui.scroll {
+        ui.scroll = sel_row;
+    } else if sel_row >= ui.scroll + per_screen {
+        ui.scroll = sel_row + 1 - per_screen;
+    }
+    ui.scroll = ui.scroll.min(rows.saturating_sub(per_screen));
+
     for i in 0..n {
         let (row, col) = (i / cols, i % cols);
-        let x = r.x + col as f32 * (card_w + gap);
-        let y = top + row as f32 * (card_h + gap);
-        if y + card_h > r.y + r.h {
-            break; // off the bottom; the grid does not scroll yet
+        if row < ui.scroll || row >= ui.scroll + per_screen {
+            continue;
         }
+        let x = r.x + col as f32 * (card_w + gap);
+        let y = top + (row - ui.scroll) as f32 * (card_h + gap);
         let card = Rect::new(x, y, card_w, card_h);
         let sel = ui.game == i;
         if i < ui.games.len() {
@@ -107,6 +122,20 @@ fn paint_library(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
             paint_add_tile(ui, cv, card, sel, s);
             ui.push_hot(card, Hit::Add);
         }
+    }
+
+    if rows > per_screen {
+        let of = format!("{} of {rows} rows", ui.scroll + per_screen);
+        let w = ui.fonts.width(&of, Weight::Regular, 12.5 * s);
+        ui.fonts.draw_top(
+            cv,
+            &of,
+            r.x + r.w - w,
+            r.y + 8.0 * s,
+            Weight::Regular,
+            12.5 * s,
+            t::TEXT_OFF,
+        );
     }
 
     hint(

@@ -104,18 +104,10 @@ fn is_zip(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Resolve `src` to a local file: download it if it's a URL, else use it as-is.
-/// HTTP(S) is served in-process by ureq — redirects followed, TLS via rustls, so
-/// there is no curl, no OpenSSL, and no system CA bundle in the picture.
-fn fetch(src: &str, workdir: &Path) -> PathBuf {
-    if !(src.starts_with("http://") || src.starts_with("https://")) {
-        let p = PathBuf::from(src);
-        if !p.exists() {
-            die(&format!("not found: {src}"));
-        }
-        return p;
-    }
-
+/// Download `src` into `workdir`. HTTP(S) is served in-process by ureq —
+/// redirects followed, TLS via rustls, so there is no curl, no OpenSSL, and no
+/// system CA bundle in the picture.
+fn download(src: &str, workdir: &Path) -> Result<PathBuf, String> {
     // Name the download after the URL's last path segment, minus any ?query#frag.
     let name = src
         .rsplit('/')
@@ -124,20 +116,17 @@ fn fetch(src: &str, workdir: &Path) -> PathBuf {
         .filter(|s| !s.is_empty())
         .unwrap_or("archive.zip");
     let dest = workdir.join(name);
-    println!("fetch: downloading {src}");
 
     let resp = ureq::get(src)
         .call()
-        .unwrap_or_else(|e| die(&format!("download failed: {src}\n  {e}")));
+        .map_err(|e| format!("Could not download {src}: {e}"))?;
     // No read limit: game archives run to tens of MB and ureq's default body cap
     // would silently truncate them.
     let mut body = resp.into_body().into_with_config().limit(u64::MAX).reader();
-    let mut out = std::fs::File::create(&dest)
-        .unwrap_or_else(|e| die(&format!("create {}: {e}", dest.display())));
-    let n = std::io::copy(&mut body, &mut out)
-        .unwrap_or_else(|e| die(&format!("download failed: {src}\n  {e}")));
-    println!("fetch: {n} bytes -> {name}");
-    dest
+    let mut out =
+        std::fs::File::create(&dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
+    std::io::copy(&mut body, &mut out).map_err(|e| format!("Could not download {src}: {e}"))?;
+    Ok(dest)
 }
 
 /// Unpack `archive` into `dest`. A zip is extracted in-process (no unzip on
@@ -317,6 +306,104 @@ pub fn build_seed_config(name: &str, exe: &Path, game_dir: &Path) -> Value {
     })
 }
 
+/// A bundle unpacked into `games/<name>/`, with the executables found in it.
+///
+/// The only question left is which of them starts the game — which the CLI asks
+/// on a tty and the player app asks with a list of tiles.
+pub struct Staged {
+    pub name: String,
+    pub game_dir: PathBuf,
+    pub execs: Vec<PathBuf>,
+}
+
+impl Staged {
+    /// The executables by bare file name, for showing to a person.
+    pub fn exe_names(&self) -> Vec<String> {
+        self.execs
+            .iter()
+            .map(|e| e.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+}
+
+/// Fetch `src` (a URL, a zip, or a folder) and unpack it into `games/<name>/`.
+///
+/// Returns errors rather than exiting: the CLI can print them and stop, but the
+/// player app is a window and has to be able to say "that didn't work" and carry
+/// on.
+pub fn stage(
+    root: &Path,
+    src: &str,
+    name_hint: Option<&str>,
+    force: bool,
+) -> Result<Staged, String> {
+    let stem = Path::new(src.trim_end_matches('/'))
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let name = crate::sanitize_identifier(&name_hint.map(str::to_string).unwrap_or(stem));
+    if name.is_empty() {
+        return Err("could not work out a name for this game".into());
+    }
+    let game_dir = root.join("games").join(&name);
+    if game_dir.exists() {
+        if !force {
+            return Err(format!("You already have a game called '{name}'."));
+        }
+        std::fs::remove_dir_all(&game_dir).ok();
+    }
+
+    // Refuse what we cannot unpack *before* unpacking, so the extract path has
+    // nothing left to fail on.
+    let is_url = src.starts_with("http://") || src.starts_with("https://");
+    if !is_url {
+        let p = Path::new(src);
+        if !p.exists() {
+            return Err(format!("not found: {src}"));
+        }
+        if !p.is_dir() && !is_zip(p) && !is_executable(p) {
+            return Err("Only .zip archives and folders can be added.".into());
+        }
+    }
+
+    let tmp = std::env::temp_dir().join(format!("saisei_newgame_{name}"));
+    std::fs::create_dir_all(&tmp).ok();
+    let fetched = if is_url {
+        download(src, &tmp)?
+    } else {
+        PathBuf::from(src)
+    };
+    extract_into(&fetched, &game_dir);
+    std::fs::remove_dir_all(&tmp).ok();
+
+    let mut execs = Vec::new();
+    walk(&game_dir, &mut execs);
+    execs.retain(|p| p.is_file() && is_executable(p));
+    execs.sort_by_key(|p| p.file_name().unwrap().to_string_lossy().to_lowercase());
+    if execs.is_empty() {
+        std::fs::remove_dir_all(&game_dir).ok();
+        return Err("No DOS program (.exe/.com) in there.".into());
+    }
+
+    Ok(Staged {
+        name,
+        game_dir,
+        execs,
+    })
+}
+
+/// Write the bundle's config, naming `exe` as the program to run.
+pub fn finish(staged: &Staged, exe: &Path) -> Result<PathBuf, String> {
+    let config = build_seed_config(&staged.name, exe, &staged.game_dir);
+    let config_path = staged.game_dir.join(format!("{}.json", staged.name));
+    std::fs::write(
+        &config_path,
+        format!("{}\n", serde_json::to_string_pretty(&config).unwrap()),
+    )
+    .map_err(|e| format!("write {}: {e}", config_path.display()))?;
+    Ok(config_path)
+}
+
 pub fn main(root: &Path, args: &[String]) -> ! {
     let mut archive: Option<String> = None;
     let mut exe: Option<String> = None;
@@ -336,54 +423,20 @@ pub fn main(root: &Path, args: &[String]) -> ! {
     }
     let archive = archive.unwrap_or_else(|| die("usage: saisei new-game <url|zip|dir> [--exe NAME] [--name NAME] [--force] [--no-probe]"));
 
-    let stem = Path::new(archive.trim_end_matches('/'))
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let name = crate::sanitize_identifier(&name_arg.unwrap_or(stem));
-    let game_dir = root.join("games").join(&name);
-    if game_dir.exists() {
-        if !force {
-            die(&format!(
-                "games/{name}/ already exists (use --force to overwrite)"
-            ));
-        }
-        std::fs::remove_dir_all(&game_dir).ok();
-    }
-
-    let tmp = std::env::temp_dir().join(format!("saisei_newgame_{name}"));
-    std::fs::create_dir_all(&tmp).ok();
-    let fetched = fetch(&archive, &tmp);
+    let staged = stage(root, &archive, name_arg.as_deref(), force).unwrap_or_else(|e| die(&e));
+    let name = staged.name.clone();
     println!("extract: -> games/{name}/");
-    extract_into(&fetched, &game_dir);
-    std::fs::remove_dir_all(&tmp).ok();
-
-    let mut execs = Vec::new();
-    walk(&game_dir, &mut execs);
-    execs.retain(|p| p.is_file() && is_executable(p));
-    execs.sort_by_key(|p| p.file_name().unwrap().to_string_lossy().to_lowercase());
-    let exe_path = choose_entry(&execs, exe.as_deref());
+    let exe_path = choose_entry(&staged.execs, exe.as_deref());
     println!(
         "detect: {} executable(s): {}",
-        execs.len(),
-        execs
-            .iter()
-            .map(|e| e.file_name().unwrap().to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join(", ")
+        staged.execs.len(),
+        staged.exe_names().join(", ")
     );
 
-    let config = build_seed_config(&name, &exe_path, &game_dir);
-    let config_path = game_dir.join(format!("{name}.json"));
-    std::fs::write(
-        &config_path,
-        format!("{}\n", serde_json::to_string_pretty(&config).unwrap()),
-    )
-    .ok();
+    finish(&staged, &exe_path).unwrap_or_else(|e| die(&e));
     println!(
-        "scaffold: wrote games/{name}/{name}.json\n  program_path  = {}\n  runtime files = {}",
-        exe_path.file_name().unwrap().to_string_lossy(),
-        config["runtime"].as_array().map(|a| a.len()).unwrap_or(0)
+        "scaffold: wrote games/{name}/{name}.json\n  program_path  = {}",
+        exe_path.file_name().unwrap().to_string_lossy()
     );
 
     if no_probe {
@@ -392,6 +445,6 @@ pub fn main(root: &Path, args: &[String]) -> ! {
     println!("\nprobe: building bundle '{name}' (emit config + link runtime)...");
     let game = crate::load_game_definition(root, &name, None);
     crate::build(root, &game); // dies on build failure
-    println!("\nprobe: OK -- bundle '{name}' builds.\n  next: saisei run {name} --headless   to see it boot.");
+    println!("\nprobe: OK -- bundle '{name}' builds.\n  next: saisei-cli run {name} --headless   to see it boot.");
     exit(0);
 }

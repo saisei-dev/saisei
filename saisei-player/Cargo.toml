@@ -23,8 +23,11 @@ force_exit_after_10s = ["saisei-runtime/force_exit_after_10s"]
 [dependencies]
 saisei-runtime = { path = "../runtime" }
 saisei = { path = "../saisei" }
+saisei-ui = { path = "../saisei-ui" }
 libc = "0.2"
 serde_json = { version = "1", features = ["preserve_order"] }
+# Encodes the save thumbnails.
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [[bin]]
 name = "saisei"

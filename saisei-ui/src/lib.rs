@@ -127,6 +127,8 @@ pub struct Ui {
     hot: Vec<(Rect, Hit)>,
     /// Columns the library grid last used, so Up/Down move by a row.
     cols: usize,
+    /// First visible row of the library grid.
+    scroll: usize,
 }
 
 impl Ui {
@@ -146,6 +148,7 @@ impl Ui {
             message: None,
             hot: Vec::new(),
             cols: 1,
+            scroll: 0,
         }
     }
 
@@ -155,9 +158,21 @@ impl Ui {
         self.can_save = can_save;
         self.screen = Screen::Game;
         self.game = game;
-        self.action = 0;
         self.focus = Focus::Actions;
         self.message = None;
+        self.action = self.first_enabled_action();
+    }
+
+    /// Where the cursor goes when a game's page opens.
+    ///
+    /// Never onto a disabled action. A game with no saves opens with Continue
+    /// dead, and a cursor resting there is a page whose Enter key does nothing —
+    /// and, since a disabled action draws no selection, one that doesn't even look
+    /// like it has a cursor.
+    fn first_enabled_action(&self) -> usize {
+        (0..self.actions().len())
+            .find(|&i| self.action_enabled(i))
+            .unwrap_or(0)
     }
 
     /// The labels of the action column, which differ between "not started yet"
@@ -220,9 +235,9 @@ impl Ui {
                     self.add = AddState::default();
                 } else {
                     self.screen = Screen::Game;
-                    self.action = 0;
                     self.save = 0;
                     self.focus = Focus::Actions;
+                    self.action = self.first_enabled_action();
                 }
             }
             // In the library with a game paused behind us, Escape goes back to it
@@ -465,13 +480,16 @@ mod tests {
     fn continue_is_disabled_until_there_is_a_save() {
         let mut u = ui(&[("Zeliard", 0)]);
         u.key(Key::Enter);
+        assert_eq!(u.actions()[0], "Continue");
         assert!(!u.action_enabled(0), "Continue with no saves");
-        // Enter on it does nothing rather than launching into nowhere.
+        // Even reached deliberately, Enter on it launches nothing.
+        u.action = 0;
         assert_eq!(u.key(Key::Enter), Action::None);
 
         let mut u = ui(&[("Zeliard", 2)]);
         u.key(Key::Enter);
         assert!(u.action_enabled(0));
+        assert_eq!(u.actions()[u.action], "Continue");
         // Continue resumes the NEWEST save, which the host sorts to index 0.
         assert_eq!(
             u.key(Key::Enter),
@@ -483,10 +501,39 @@ mod tests {
     }
 
     #[test]
-    fn the_cursor_steps_over_disabled_actions() {
-        // No saves => Continue is disabled, so Down from it must land on New game.
+    fn a_page_never_opens_with_the_cursor_on_a_dead_action() {
+        // An unplayed game has no Continue. Opening its page with the cursor
+        // parked there is a page where Enter does nothing and — since a disabled
+        // action draws no highlight — one that doesn't look like it has a cursor.
         let mut u = ui(&[("Zeliard", 0)]);
         u.key(Key::Enter);
+        assert!(u.action_enabled(u.action));
+        assert_eq!(u.actions()[u.action], "New game");
+        assert_eq!(
+            u.key(Key::Enter),
+            Action::Launch {
+                game: 0,
+                restore: None
+            },
+            "Enter on a freshly-opened page must start the game"
+        );
+
+        // Same in the overlay, when the machine stopped somewhere unsavable.
+        let mut u = ui(&[("Zeliard", 0)]);
+        u.open_overlay(0, false);
+        assert!(u.action_enabled(u.action));
+        assert_eq!(u.actions()[u.action], "Resume");
+    }
+
+    #[test]
+    fn the_cursor_steps_over_disabled_actions() {
+        // No saves => Continue is disabled. Wrapping upward from New game must
+        // skip past it to Back, not come to rest on a dead row.
+        let mut u = ui(&[("Zeliard", 0)]);
+        u.key(Key::Enter);
+        assert_eq!(u.actions()[u.action], "New game");
+        u.key(Key::Up);
+        assert_eq!(u.actions()[u.action], "Back");
         u.key(Key::Down);
         assert_eq!(u.actions()[u.action], "New game");
     }
@@ -574,6 +621,41 @@ mod tests {
         assert_eq!(u.game, 2);
         u.key(Key::Enter);
         assert_eq!(u.screen, Screen::AddGame);
+    }
+
+    #[test]
+    fn a_library_taller_than_the_window_scrolls_to_keep_the_cursor_in_view() {
+        // Enough games that the grid cannot fit, and "Add game" — the last tile —
+        // is below the fold. It must still be reachable, or there is no way left
+        // to add a game at all.
+        let games: Vec<(&str, usize)> = (0..24).map(|_| ("Game", 0)).collect();
+        let mut u = ui(&games);
+        let mut cv = Canvas::new(1280, 800);
+        u.paint(&mut cv, false);
+
+        let painted = |u: &Ui, h: Hit| u.hot.iter().any(|(_, x)| *x == h);
+        assert!(painted(&u, Hit::Game(0)), "the first row is on screen");
+        assert!(!painted(&u, Hit::Add), "Add starts below the fold");
+
+        // Walk to the very end.
+        for _ in 0..30 {
+            u.key(Key::Down);
+        }
+        assert_eq!(u.game, 24, "the cursor lands on the Add tile");
+        u.paint(&mut cv, false);
+        assert!(painted(&u, Hit::Add), "Add scrolled into view");
+        assert!(
+            !painted(&u, Hit::Game(0)),
+            "the first row scrolled off the top"
+        );
+
+        // ...and back to the top.
+        for _ in 0..30 {
+            u.key(Key::Up);
+        }
+        u.paint(&mut cv, false);
+        assert_eq!(u.scroll, 0);
+        assert!(painted(&u, Hit::Game(0)));
     }
 
     #[test]

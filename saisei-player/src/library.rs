@@ -103,11 +103,6 @@ pub fn saves(game_key: &str) -> Vec<Save> {
     out
 }
 
-/// The newest save, i.e. what "Continue" resumes.
-pub fn latest_save(game_key: &str) -> Option<Save> {
-    saves(game_key).into_iter().next()
-}
-
 /// A fresh, unused save directory for `game_key`.
 ///
 /// Named by UTC timestamp so the directory listing sorts chronologically, with a
@@ -143,11 +138,33 @@ const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
+/// How a save's time is shown to the person who made it.
+///
+/// In *their* timezone, not UTC: a save made at ten past two in the afternoon has
+/// to read as ten past two, or the list is useless for the one thing it is for —
+/// telling you which of these is the one you were just playing. (The save's own
+/// meta.json keeps the unix seconds and a UTC stamp; that is storage, this is
+/// for reading.)
 fn format_when(unix: u64) -> String {
     if unix == 0 {
         return "unknown".into();
     }
-    let (y, mo, d, h, mi, _) = civil_from_unix(unix);
+    let t = unix as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // localtime_r honours TZ; if it fails for any reason, fall back to UTC rather
+    // than show nothing.
+    let (y, mo, d, h, mi) = if unsafe { !libc::localtime_r(&t, &mut tm).is_null() } {
+        (
+            tm.tm_year as i64 + 1900,
+            tm.tm_mon as u32 + 1,
+            tm.tm_mday as u32,
+            tm.tm_hour as u32,
+            tm.tm_min as u32,
+        )
+    } else {
+        let (y, mo, d, h, mi, _) = civil_from_unix(unix);
+        (y, mo, d, h, mi)
+    };
     format!(
         "{d} {} {y}, {h:02}:{mi:02}",
         MONTHS[(mo as usize - 1).min(11)]
@@ -195,8 +212,8 @@ mod tests {
     #[test]
     fn civil_from_unix_matches_known_instants() {
         assert_eq!(civil_from_unix(0), (1970, 1, 1, 0, 0, 0));
-        // 2026-07-12T14:03:09Z
-        assert_eq!(civil_from_unix(1_784_006_589), (2026, 7, 12, 14, 3, 9));
+        // `date -u -d @1783864989` => 2026-07-12 14:03:09
+        assert_eq!(civil_from_unix(1_783_864_989), (2026, 7, 12, 14, 3, 9));
         // A leap day, to catch the era arithmetic.
         assert_eq!(civil_from_unix(1_709_164_800), (2024, 2, 29, 0, 0, 0));
     }

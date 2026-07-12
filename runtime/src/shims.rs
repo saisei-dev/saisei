@@ -3206,6 +3206,89 @@ unsafe fn maybe_safe_point(file: *const c_char, func: *const c_char, line: c_int
     }
 }
 
+// ============================================================================
+// The in-game overlay
+//
+// The player presses F12 and the game stops dead while a menu is up. Nothing new
+// is needed to stop it: this blocks inside the safepoint, exactly as
+// `retire_splash` already blocks the machine loop to run the logo out. Virtual
+// time is instruction-driven, so it simply does not advance while the guest is
+// not running, and the pacer re-anchors rather than fast-forwarding after a stall
+// (PACING_FORGIVE_NS) — so a menu left open for a minute costs the guest no time
+// at all and delivers it no backlog of timer interrupts. The virtual clock is
+// halted on top of that, so even the paths that advance time off the host clock
+// (`shim_idle_wait`) stay still.
+//
+// The one thing that is NOT free is *where* we stop. A snapshot is only valid at
+// a dispatcher resting point — `can_save_now()` wants zero lcall/isr depth and an
+// `ip` the dispatcher can re-enter, and restore refuses a bundle without them. So
+// arming the overlay does not stop the guest on the spot: it lets it run on to
+// the next resting point and stops it there. A game's main loop passes through
+// these constantly, so it is microseconds of guest time and reads as instant, and
+// Save is then always available rather than mysteriously greyed out. If a game is
+// wedged somewhere that never rests, we open anyway after a bounded wait, with
+// Save off — a player must always be able to reach the menu and walk away.
+// ============================================================================
+
+/// The overlay the host draws. Told whether a save is possible at the point we
+/// stopped; returns when the player is done with it.
+pub type OverlayFn = Option<unsafe extern "C" fn(can_save: bool)>;
+
+static mut OVERLAY_ENTRY: OverlayFn = None;
+static mut OVERLAY_REQUESTED: bool = false;
+static mut OVERLAY_ARMED_AT_NS: u64 = 0;
+
+/// How long we let the guest run looking for a savable resting point before
+/// giving up and opening the menu anyway. In *virtual* time, so a slow host
+/// cannot turn it into a longer wait for the player.
+const OVERLAY_SAVEPOINT_WAIT_NS: u64 = 250_000_000;
+
+/// Install the player's overlay. With none installed, F12 does nothing.
+#[no_mangle]
+pub unsafe extern "C" fn saisei_set_overlay_entry(f: OverlayFn) {
+    OVERLAY_ENTRY = f;
+}
+
+/// Ask for the overlay. Called from the SDL key handler on F12; the menu opens at
+/// the next resting point, not here.
+#[no_mangle]
+pub extern "C" fn saisei_request_overlay() {
+    unsafe {
+        if core::ptr::addr_of!(OVERLAY_ENTRY).read().is_none() || OVERLAY_REQUESTED {
+            return;
+        }
+        OVERLAY_REQUESTED = true;
+        OVERLAY_ARMED_AT_NS = shim_virtual_now_ns();
+    }
+}
+
+unsafe fn maybe_enter_overlay(now_ns: u64) {
+    use crate::save_manager::save_manager_can_save_now;
+    use crate::sdl::{saisei_ui_release, virtual_display_release_keys, virtual_display_repaint};
+
+    let savable = save_manager_can_save_now() != 0;
+    if !savable && now_ns.saturating_sub(OVERLAY_ARMED_AT_NS) < OVERLAY_SAVEPOINT_WAIT_NS {
+        return; // keep running; stop at the next point a save would be valid
+    }
+    let Some(overlay) = core::ptr::addr_of!(OVERLAY_ENTRY).read() else {
+        OVERLAY_REQUESTED = false;
+        return;
+    };
+    OVERLAY_REQUESTED = false;
+
+    // The guest is frozen mid-keystroke as far as it knows. Let go of anything the
+    // player was holding, or it will still be held when we resume — and F12 itself
+    // must never reach the game.
+    virtual_display_release_keys();
+    vclock_halt();
+    overlay(savable);
+    vclock_resume();
+    // Hand the window back: drop the menu's texture and put the game's own frame
+    // on screen now, rather than leaving the menu up until the game next presents.
+    saisei_ui_release();
+    virtual_display_repaint();
+}
+
 // Host-clock probe cache for the safepoint slow path: a fresh clock_gettime
 // (and a pacing check) only when virtual time moved ≥50µs since the last
 // probe. Rep-block debits drain the budget in large bites, so bursts of
@@ -3234,6 +3317,9 @@ pub unsafe extern "C" fn safe_point_impl(_file: *const c_char, func: *const c_ch
 
     if headless_mode == 0 {
         virtual_display_poll_input();
+        if OVERLAY_REQUESTED {
+            maybe_enter_overlay(now_ns);
+        }
     }
     if isr_depth == 0
         && headless_mode != 0
