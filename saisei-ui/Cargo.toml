@@ -1,0 +1,21 @@
+# saisei-ui — the player's interface, as a pure software compositor.
+#
+# It knows nothing about SDL, the runtime, or the machine: it takes a model and
+# paints RGBA pixels into a buffer, and turns key/mouse events into actions. That
+# is what lets the same code draw the library (in the player, before any game
+# exists) and the in-game overlay (over a frozen game frame), and be unit-tested
+# with no window on screen.
+[package]
+name = "saisei-ui"
+version = "0.0.0"
+edition = "2021"
+description = "Saisei player UI: software-composited library and in-game overlay."
+
+[dependencies]
+# Pure-Rust glyph rasterizer — no C, no system font library, nothing added to the
+# two system prerequisites (a C linker and SDL2). The window is resizable, so
+# glyphs are rasterized at the size actually needed rather than baked into a
+# fixed atlas that would go soft when scaled.
+fontdue = "0.9"
+# Decodes the save thumbnails (PNG) the runtime writes.
+image = { version = "0.25", default-features = false, features = ["png"] }
