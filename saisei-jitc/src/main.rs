@@ -338,6 +338,17 @@ fn compile_chunk(
                 "debug-assertions=off",
                 "-C",
                 "panic=abort",
+                // Each chunk defines `#[no_mangle] saisei_site_name()` (the
+                // chunk's own name, read back by rt::site() in the shared rlib
+                // for the cross-binary-write tripwire). That symbol is global,
+                // so with the chunks dlopen'd RTLD_GLOBAL the FIRST-loaded
+                // chunk's copy would interpose for EVERY chunk's site() — every
+                // write then attributed to chunk #0's segbase, false-firing the
+                // tripwire the moment any other binary (e.g. Zeliard's AdLib
+                // driver in its ISR) writes its own region. -Bsymbolic-functions
+                // binds each .so's site() call to its own saisei_site_name.
+                "-C",
+                "link-arg=-Wl,-Bsymbolic-functions",
                 "-o",
             ])
             .arg(&so_tmp)
