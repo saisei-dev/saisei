@@ -91,7 +91,7 @@ on the same flat loop.
 
 Pick a packed/overlay program `<name>` as the regression gate — it exercises
 cross-chunk + ISR transfers heavily. Run after every step:
-`saisei run <name> --headless --screenshot-secs 3` (expect exit 124, no `Unhandled pc`/abort, screenshots).
+`saisei-cli run <name> --headless --screenshot-secs 3` (expect exit 124, no `Unhandled pc`/abort, screenshots).
 
 1. **Scaffold top-level loop + chunk-exit `default:`** alongside the existing
    path (gated), so resolve_chunk + the for-loop exit protocol exist and are

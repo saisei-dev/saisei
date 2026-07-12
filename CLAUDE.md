@@ -7,41 +7,58 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A **JIT binary recompiler** that turns DOS MZ executables into native Rust and runs them. The runtime loads a game's program image, takes the entry `cs:ip` from its MZ header, and — the first time control reaches any code segment — dumps the live 64KB, decodes it to a lossless JSON IR, emits it as Rust, compiles it with rustc, and `dlopen`s the result. The translated Rust *is* the game; there is **no interpreter, no external emulator, and no ahead-of-time whole-image decode**. Code is discovered and compiled on demand as the program executes, which is exactly what makes packed / overlay / self-modifying games work with no special-casing.
 
 Everything is Rust, workspace at the repo root: `saisei-jitc/` (the translator +
-JIT, exposed as the `saisei-jitc` binary + library), `saisei/` (the `saisei`
-launcher), `runtime/` (the runtime crate, `saisei-runtime`), and `saisei-game/`
-(the thin per-game bin crate). No clang and no C build system (make/cmake): the
-only C in the tree is the vendored capstone disassembler, which the cc crate
-compiles from inside cargo (`vendor/capstone-sys`) using the same system C
-compiler rustc already needs as its linker. The toolchain is pinned to a *dated*
-nightly (`rust-toolchain.toml`) for `c_variadic`/`linkage` in the runtime — the
-date is deliberate, since a floating nightly can break those unstable features
-out from under a fresh clone.
+JIT, exposed as the `saisei-jitc` binary + library), `saisei-player/` (the
+**`saisei`** binary — the player app, and the one host that runs every game),
+`saisei-ui/` (its interface, as a pure software compositor), `saisei/` (the
+**`saisei-cli`** binary + the launcher library), `runtime/` (the runtime crate,
+`saisei-runtime`), and `saisei-game/` (the thin per-game bin crate, now built
+only for the future freeze — nothing in the play path compiles per game). No
+clang and no C build system (make/cmake): the only C in the tree is the vendored
+capstone disassembler, which the cc crate compiles from inside cargo
+(`vendor/capstone-sys`) using the same system C compiler rustc already needs as
+its linker. The toolchain is pinned to a *dated* nightly (`rust-toolchain.toml`)
+for `c_variadic`/`linkage` in the runtime — the date is deliberate, since a
+floating nightly can break those unstable features out from under a fresh clone.
 
 The system prerequisites are exactly two — a C compiler/linker and SDL2 — plus
-rustup. The launcher shells out to nothing else: `new-game` downloads over HTTPS
-in-process (ureq) and extracts zips in-process (the zip crate), `control status`
-reads /proc, and the build revision is baked in by `saisei/build.rs`. Don't
-reintroduce a `curl`/`unzip`/`git`/`fuser` subprocess — a missing tool becomes a
-first-run failure for someone who just wants to play a game.
+rustup. Nothing shells out: `new-game` downloads over HTTPS in-process (ureq) and
+extracts zips in-process (the zip crate), `control status` reads /proc, the build
+revision is baked in by `saisei/build.rs`, and glyphs are rasterized by fontdue
+against a bundled font. Don't reintroduce a `curl`/`unzip`/`git`/`fuser`
+subprocess or a system font library — a missing tool becomes a first-run failure
+for someone who just wants to play a game.
 
 ## Commands
 
-Build the toolchain once with `cargo build --release`; the driver is
-the `saisei` binary at `target/release/saisei` (put it on your PATH, or run
-it directly / via `cargo run --release -p saisei --`). No programs ship with the
-repo — bootstrap a bundle with `saisei new-game <archive> --exe FOO.EXE`, which
-creates `games/<name>/` with a `<name>.json` config. Then:
+Build once with `cargo build --release`. That produces two binaries in
+`target/release/` (put it on your PATH):
+
+**`saisei` — the player.** With no arguments it opens its window: the logo, then
+your library, then the game you pick, then the in-game overlay, all in the *same*
+window and the *same* process. Games are added by dropping a zip on the window or
+pasting a link. F12 pauses the running game and brings up the overlay (save /
+load / switch game / resume). `saisei --play <name>` boots straight into a game,
+which is what the CLI and the save-load re-exec both use.
+
+**`saisei-cli` — everything else.** The dev/automation surface:
 
 ```bash
-saisei build <name>                 # generate the config + build the game binary
-saisei run   <name> --headless      # build + run (headless = no SDL window)
-saisei play  <name>                 # build + run in the SDL window
-saisei run   <name> --program setup # a bundle may define multiple programs
+saisei-cli new-game <archive> --exe FOO.EXE   # create games/<name>/<name>.json
+saisei-cli run   <name> --headless            # run without a window (scripting/CI)
+saisei-cli play  <name>                       # run in the window
+saisei-cli run   <name> --program setup       # a bundle may define multiple programs
+saisei-cli build <name>                       # emit the per-game GameConfig + binary
 ```
 
-`build` does **not** decode anything ahead of time — it generates the per-program GameConfig (Rust) and has cargo build the `saisei-game` bin (runtime rlib + config, linked `-rdynamic`), copied to `build/<name>/<program>`. All program code is JIT-compiled at run time.
+`run`/`play` do **not** compile anything per game: they build the player and hand
+it the game by name, and the player reads the bundle's `<name>.json` at run time
+(`saisei_set_game_config`, then `shim_boot_machine`). `build` is what still emits
+the per-program GameConfig (Rust) and cargo-builds the `saisei-game` bin (runtime
+rlib + config, linked `-rdynamic`) to `build/<name>/<program>` — that artifact is
+what a *frozen* build will be made of; it is not on the play path. All program
+code is JIT-compiled at run time either way.
 
-Useful `run` flags: `--verbose` (runs are silent by default; this prints the shim trace to stdout), `--trace-file <path>` (write execution trace), `--lifecycle-file <path>` (stream LOAD/CALL/JMP/… events), `--patch-bundle <path>` (load a game-function patch `.so`), `--features <list>` (cargo features for the game build — e.g. `--features force_exit_after_10s` for a self-terminating smoke run). Screenshots: pass `--screenshot-secs N` (headless runs) to auto-dump PNGs to `build/<name>/screenshots/`. All user config is passed as CLI flags (the launcher forwards them to the game binary's argv); the only env vars left are internal plumbing the launcher sets itself — `SAISEI_REPO_ROOT`/`SAISEI_JITC`/`SAISEI_JIT_DIR` (the runtime JIT needs them to invoke the `saisei-jitc` translator and cache chunks). Run `saisei help` for the full command surface (Player / Developer / Drive tiers) and `saisei control help` for the drive console; `docs/console.md` is the written reference.
+Useful `run` flags: `--verbose` (runs are silent by default; this prints the shim trace to stdout), `--trace-file <path>` (write execution trace), `--lifecycle-file <path>` (stream LOAD/CALL/JMP/… events), `--patch-bundle <path>` (load a game-function patch `.so`), `--features <list>` (cargo features for the player build — e.g. `--features force_exit_after_10s` for a self-terminating smoke run). Screenshots: pass `--screenshot-secs N` (headless runs) to auto-dump PNGs to `build/<name>/screenshots/`. All user config is passed as CLI flags (forwarded to the host's argv); the only env vars left are internal plumbing the launcher sets itself — `SAISEI_REPO_ROOT`/`SAISEI_JITC`/`SAISEI_JIT_DIR` (the runtime JIT needs them to invoke the `saisei-jitc` translator and cache chunks). Run `saisei-cli help` for the full command surface (Player / Developer / Drive tiers) and `saisei-cli control help` for the drive console; `docs/console.md` is the written reference.
 
 Tests are Rust `cargo test` — the translator unit tests (`saisei-jitc/tests/`,
 asserting on the chunk emitter's Rust output and the shared front-half) and the
@@ -79,7 +96,43 @@ cargo test -p saisei-jitc --test ported_disasm disassemble_retf__retf  # one tes
 
 **Function patches (`runtime/src/shims.rs`):** a `GamePatch` replaces or augments a game function identified by `(binary basename, file_off)` — the stable identity the dispatcher resolves addresses to, so one patch applies across cs-aliases. Patches register at startup or from separately-delivered `.so` bundles (`patch_load_bundle`, `--patch-bundle`); a patch fn returns `PATCH_HANDLED`/`PATCH_DECLINED` and can call `patch_call_original`/`patch_call_function`/`patch_ret_near`.
 
-**Per-game config (`games/<name>/<name>.json`):** `name`, `program_path` (the MZ image to load), optional `programs` (multi-executable bundles, each with its own `program_path`/`psp_seg`), `psp_seg`/`init_cs` (machine params), `protected_slots` (runtime memory-protection ranges), and `runtime` (files copied into `build/<game>/` at run). The per-binary `<binary>.json` sidecars and the `aliases`/`callgraph`/`regions`/`vars`/`enums` files are reverse-engineering annotations (function names, comments, discovered entries) — not part of the JIT run path. Diagnosis artifacts land in `build/<game>/` (`lifecycle.log`, `watchw.log`) and `crashes/`.
+**Per-game config (`games/<name>/<name>.json`):** `name`, `program_path` (the MZ image to load), optional `programs` (multi-executable bundles, each with its own `program_path`/`psp_seg`), `psp_seg`/`init_cs` (machine params), `protected_slots` (runtime memory-protection ranges), and `runtime` (files copied into `build/<game>/` at run). Both consumers read it through `saisei::game_config_values` — `generate_game_config` bakes those values into a frozen per-game binary, and the player installs them at run time — so the two cannot drift. The per-binary `<binary>.json` sidecars and the `aliases`/`callgraph`/`regions`/`vars`/`enums` files are reverse-engineering annotations (function names, comments, discovered entries) — not part of the JIT run path. Diagnosis artifacts land in `build/<game>/` (`lifecycle.log`, `watchw.log`) and `crashes/`.
+
+**Player (`saisei-player/` = the `saisei` binary, `saisei-ui/` = its interface):**
+one window and one process for a whole session — logo, library, the game itself,
+the overlay. `saisei-ui` is a *pure* software compositor (RGBA in, actions out):
+no SDL, no runtime, no machine, so the whole interface unit-tests with no window
+on screen, and the same code paints the library and the in-game overlay. The
+runtime owns the SDL surface it paints onto (`saisei_ui_*` in `runtime/src/sdl.rs`).
+
+- **Hosting.** The player installs the bundle's `GameConfig` at run time
+  (`saisei_set_game_config`) and calls `shim_boot_machine` + `saisei_main`
+  in-process. `init_memory` is an `.init_array` ctor that loads the program image
+  *before main*, which is fine for a per-game binary (it knows its game at link
+  time) and useless for a host that learns its game from argv — hence
+  `shim_boot_machine`, written as a **reset**, not an increment.
+- **The overlay pauses by blocking in the safepoint**, exactly as `retire_splash`
+  already does. No new pause machinery: virtual time is instruction-driven, the
+  vclock is halted, and the pacer re-anchors instead of fast-forwarding — so a
+  menu left open costs the guest no time and no interrupt backlog. F12 is
+  swallowed in the key handler before any guest mapping; held keys are released
+  on entry.
+- **It opens at a *savable* point, not on the spot.** A snapshot is only valid at
+  a dispatcher resting point (`save_manager_can_save_now`: zero lcall/isr depth,
+  `ip` a case key — restore refuses anything else). So F12 arms, the guest runs
+  on to the next resting point, and *there* it stops. That is why Save is always
+  live rather than mysteriously grey.
+- **Leaving a game re-execs** (`relaunch.rs`). The guest has run — memory, DOS
+  file table, JIT registry all populated — and there is no honest way to unwind
+  that in place. The runtime's own save-load path re-execs for the same reason,
+  and takes its argv from the host (`saisei_set_relaunch_argv`), since a GUI
+  launch's bare `saisei` cmdline names no game to come back into.
+- **Player saves** live under XDG (`~/.local/share/saisei/saves/<game>/`), never
+  overwrite, and carry a thumbnail of the *presented* frame — **not**
+  `shim_render_screenshot_png`, which re-reads guest VRAM as a linear 320x200 at
+  0xA000 with no planar branch and yields garbage for an EGA game. They are a
+  different thing from the runtime's `saves/slot_N` rewind ring, which is
+  untouched.
 
 ## Working principles (non-obvious, enforced)
 

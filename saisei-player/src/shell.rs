@@ -6,6 +6,7 @@
 //! points); this owns what is on screen and what the keys do.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use saisei_runtime::sdl as rt;
 use saisei_ui::{Action, Canvas, GameView, Image, Key, SaveView, Ui};
@@ -29,9 +30,14 @@ fn logo() -> Image {
     Image::decode_png(include_bytes!("../../runtime/assets/saisei_logo.png")).unwrap_or_default()
 }
 
-/// The running game, for the overlay: the runtime calls back into us with no
-/// context of its own, so we leave it here on the way in.
-static mut RUNNING: Option<(PathBuf, String)> = None;
+/// The running game (repo root, bundle key), for the overlay: the runtime calls
+/// back into us with no context of its own, so we leave it here on the way in.
+///
+/// A `OnceLock` and not a `static mut`: this owns heap, and it is read once per
+/// F12 — moving it out by `ptr::read` would bitwise-copy it while the static
+/// still held the same buffers, and the second overlay would be reading memory
+/// the first one's copy had already freed.
+static RUNNING: OnceLock<(PathBuf, String)> = OnceLock::new();
 
 // ---- painting ---------------------------------------------------------------
 
@@ -230,8 +236,24 @@ pub fn run(root: &Path) -> ! {
     }
 }
 
-/// Start a game. This does not return: the game runs in this process, in this
-/// window, and the runtime exits when it is done.
+/// Arm the in-game overlay for `game_key`, then run it. Does not return: the game
+/// runs in this process, in this window, and the runtime exits when it is done.
+///
+/// EVERY way into a game goes through here — the library, `saisei --play`, and
+/// the re-exec that loads a save — because F12 has to work in all of them. Wiring
+/// it up in the library path alone left the overlay dead on the command line and,
+/// worse, dead in the game you re-execed into *from the overlay*.
+pub fn play(root: &Path, spec: &LaunchSpec, show_logo: bool) -> ! {
+    // The logo is the first thing you see on a cold start. But when the library
+    // showed it seconds ago, or we are re-execing out of a menu, showing it again
+    // is a stutter, not a flourish. What remains of the splash either way is the
+    // hold that covers the JIT's first compiles and a game's text-mode setup.
+    rt::virtual_display_set_splash_logo(show_logo);
+    RUNNING.set((root.to_path_buf(), spec.game.clone())).ok();
+    unsafe { saisei_runtime::shims::saisei_set_overlay_entry(Some(overlay_entry)) };
+    std::process::exit(crate::host::run(root, spec));
+}
+
 fn launch(root: &Path, ui: &Ui, game: usize, restore: Option<usize>) -> ! {
     let Some(g) = ui.games.get(game) else {
         std::process::exit(0);
@@ -243,16 +265,7 @@ fn launch(root: &Path, ui: &Ui, game: usize, restore: Option<usize>) -> ! {
             spec.runtime_args.push(s.dir.display().to_string());
         }
     }
-
-    // The library already showed the logo; the game must not show it again on the
-    // way in. What is left of the splash is the black hold that covers the JIT's
-    // first compiles and a game's text-mode setup.
-    rt::virtual_display_set_splash_logo(false);
-    unsafe {
-        RUNNING = Some((root.to_path_buf(), g.key.clone()));
-        saisei_runtime::shims::saisei_set_overlay_entry(Some(overlay_entry));
-    }
-    std::process::exit(crate::host::run(root, &spec));
+    play(root, &spec, false)
 }
 
 // ---- the overlay ------------------------------------------------------------
@@ -261,11 +274,11 @@ fn launch(root: &Path, ui: &Ui, game: usize, restore: Option<usize>) -> ! {
 /// the player does here happens while the guest is stopped; returning resumes it
 /// exactly where it was.
 unsafe extern "C" fn overlay_entry(can_save: bool) {
-    let Some((root, key)) = core::ptr::addr_of!(RUNNING).read() else {
+    let Some((root, key)) = RUNNING.get() else {
         return;
     };
-    let mut ui = Ui::new(logo(), games_view(&root));
-    let Some(idx) = ui.games.iter().position(|g| g.key == key) else {
+    let mut ui = Ui::new(logo(), games_view(root));
+    let Some(idx) = ui.games.iter().position(|g| &g.key == key) else {
         return;
     };
     ui.open_overlay(idx, can_save);
@@ -278,12 +291,12 @@ unsafe extern "C" fn overlay_entry(can_save: bool) {
             // Back to the game, exactly where it was.
             Action::Resume => return,
             Action::Save => {
-                ui.message = Some(match save::write(&root, &key) {
+                ui.message = Some(match save::write(root, key) {
                     Ok(()) => "Saved.".to_string(),
                     Err(e) => format!("Could not save: {e}"),
                 });
                 // The new save should be in the list the player is looking at.
-                ui.games = games_view(&root);
+                ui.games = games_view(root);
                 dirty = true;
             }
             // Leaving the game, or loading a save, or starting over: all of these
@@ -293,7 +306,8 @@ unsafe extern "C" fn overlay_entry(can_save: bool) {
             Action::ToLibrary => crate::relaunch::exec_player(&[]),
             Action::Launch { game, restore } => {
                 let g = &ui.games[game];
-                let mut args = vec!["--play".to_string(), g.key.clone()];
+                // --no-logo: we came out of a menu, not off a cold start.
+                let mut args = vec!["--play".to_string(), g.key.clone(), "--no-logo".into()];
                 if let Some(i) = restore {
                     if let Some(s) = library::saves(&g.key).into_iter().nth(i) {
                         args.push("--restore-from".into());

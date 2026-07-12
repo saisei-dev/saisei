@@ -32,7 +32,7 @@ Developer commands live in `saisei-cli` (run `saisei-cli help`).";
 /// Flags we hand through to the runtime untouched. Everything the runtime's own
 /// argv parser understands, minus the ones we consume ourselves.
 fn is_runtime_flag(a: &str) -> bool {
-    matches!(a, "--headless" | "--verbose" | "--replay" | "--no-splash")
+    matches!(a, "--headless" | "--verbose" | "--replay")
 }
 fn is_runtime_flag_with_value(a: &str) -> bool {
     matches!(
@@ -52,6 +52,9 @@ fn main() {
 
     let mut spec = LaunchSpec::default();
     let mut play = false;
+    // The logo opens a cold start. Suppressed when we are re-execing out of a
+    // menu that has already shown it.
+    let mut show_logo = true;
     let mut it = argv.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -72,6 +75,7 @@ fn main() {
                     .cloned()
                     .unwrap_or_else(|| fail("--play needs a game name"));
             }
+            "--no-logo" => show_logo = false,
             "--program" => {
                 spec.program = Some(
                     it.next()
@@ -98,7 +102,10 @@ fn main() {
     }
 
     if play {
-        std::process::exit(host::run(&root, &spec));
+        // Through shell::play, not host::run: that is what arms the F12 overlay,
+        // and it has to work here too — this is the path `saisei-cli run` takes,
+        // and the path the overlay itself re-execs into.
+        shell::play(&root, &spec, show_logo);
     }
     shell::run(&root);
 }

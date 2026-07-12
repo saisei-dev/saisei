@@ -7,12 +7,18 @@
 //! tiles here.
 
 use std::path::Path;
+use std::sync::Mutex;
 
 use saisei::new_game::{self, Staged};
 use saisei_ui::Ui;
 
 /// The bundle we unpacked and are waiting on an executable choice for.
-static mut STAGED: Option<Staged> = None;
+///
+/// Behind a Mutex rather than a `static mut`: `Staged` owns heap (a String, a Vec
+/// of PathBuf), and moving it out of a `static mut` by `ptr::read` hands you a
+/// bitwise copy while the static still holds one — two owners, and a double free
+/// the moment both are dropped. `take()` moves it out exactly once.
+static STAGED: Mutex<Option<Staged>> = Mutex::new(None);
 
 fn offer(ui: &mut Ui, staged: Staged) {
     // One executable and there is nothing to ask: that is the game.
@@ -23,7 +29,7 @@ fn offer(ui: &mut Ui, staged: Staged) {
     ui.add.status = Some(format!("Unpacked '{}'.", staged.name));
     ui.add.exes = staged.exe_names();
     ui.add.exe_idx = 0;
-    unsafe { STAGED = Some(staged) };
+    *STAGED.lock().unwrap() = Some(staged);
 }
 
 fn finish(ui: &mut Ui, staged: &Staged, exe: usize) {
@@ -70,9 +76,8 @@ pub fn from_url(root: &Path, ui: &mut Ui, url: &str) {
 
 /// The player picked which executable starts the game.
 pub fn pick_exe(_root: &Path, ui: &mut Ui, exe: usize) {
-    let staged = unsafe { core::ptr::addr_of!(STAGED).read() };
+    let staged = STAGED.lock().unwrap().take();
     if let Some(s) = staged {
         finish(ui, &s, exe);
-        unsafe { STAGED = None };
     }
 }

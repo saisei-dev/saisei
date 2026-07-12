@@ -1,4 +1,4 @@
-//! `saisei control` — drive an emulated game over its stdin control FIFO.
+//! `saisei-cli control` — drive an emulated game over its stdin control FIFO.
 //! . Attaches to the FIFO owned by the running
 //! game process and writes the byte protocol the shim reads in safe_point_impl.
 //! It does NOT start, stop, build, or restart the game.
@@ -15,13 +15,13 @@ use std::process::exit;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 const USAGE: &str =
-    "control: usage: saisei control [--fifo PATH] [--shots-dir PATH] [--snapshots-dir PATH] [--gap MS] <command> [args]\n  run 'saisei control help' for the full command list";
+    "control: usage: saisei-cli control [--fifo PATH] [--shots-dir PATH] [--snapshots-dir PATH] [--gap MS] <command> [args]\n  run 'saisei-cli control help' for the full command list";
 
-/// Full command reference, printed by `saisei control help` / `--help`.
+/// Full command reference, printed by `saisei-cli control help` / `--help`.
 const CONTROL_HELP: &str = "\
-saisei control — drive a running game through its input/control FIFO.
+saisei-cli control — drive a running game through its input/control FIFO.
 
-usage: saisei control [global options] <command> [args]
+usage: saisei-cli control [global options] <command> [args]
 
 global options:
   --fifo <path>          control FIFO (default /tmp/saisei_fifo)
@@ -779,7 +779,7 @@ pub fn main(root: &Path, args: &[String]) -> ! {
             }
         }
         other => die(&format!(
-            "control: unknown command: {other}\n  run 'saisei control help' for the command list"
+            "control: unknown command: {other}\n  run 'saisei-cli control help' for the command list"
         )),
     }
     exit(0);

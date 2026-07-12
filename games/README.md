@@ -13,13 +13,13 @@ easiest way is the bundler, which fetches a zip (by URL or local path; a local
 directory works too), extracts it, and writes a seed config:
 
 ```bash
-saisei new-game <archive-url-or-path> --exe YOURGAME.EXE
+saisei-cli new-game <archive-url-or-path> --exe YOURGAME.EXE
 ```
 
 This creates `games/<name>/` with a `<name>.json`. Then:
 
 ```bash
-saisei run <name> --headless      # or: saisei play <name>
+saisei-cli run <name> --headless      # or: saisei-cli play <name>
 ```
 
 ## Config shape

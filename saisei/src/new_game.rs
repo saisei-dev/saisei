@@ -310,6 +310,7 @@ pub fn build_seed_config(name: &str, exe: &Path, game_dir: &Path) -> Value {
 ///
 /// The only question left is which of them starts the game — which the CLI asks
 /// on a tty and the player app asks with a list of tiles.
+#[derive(Debug)]
 pub struct Staged {
     pub name: String,
     pub game_dir: PathBuf,

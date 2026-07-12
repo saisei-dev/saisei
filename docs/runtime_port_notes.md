@@ -36,7 +36,7 @@ for anyone comparing behavior against the original design.
    are identical.
 7. **FORCE_EXIT_AFTER_10S:** was `-DFORCE_EXIT_AFTER_10S` via CFLAGS; now the
    cargo feature `force_exit_after_10s` (launcher: `--features
-   force_exit_after_10s` on `saisei run`).
+   force_exit_after_10s` on `saisei-cli run`).
 
 ## Cross-module structs mirrored in shims.rs (repr(C), byte-exact)
 

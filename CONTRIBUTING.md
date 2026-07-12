@@ -52,8 +52,8 @@ DOS / BIOS spec, and fix the model.
 
 A change is proven when a real game reaches its known scene, not when the tests
 pass. `cargo test` covers translation and shim units; it is not the acceptance
-bar for a runtime behavior change. Run the game (`saisei play <name>`, or
-`saisei run <name> --headless --screenshot-secs N` to capture PNGs) and say in
+bar for a runtime behavior change. Run the game (`saisei-cli play <name>`, or
+`saisei-cli run <name> --headless --screenshot-secs N` to capture PNGs) and say in
 your PR which game you ran and what you saw.
 
 ## Reporting a game

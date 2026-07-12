@@ -1,10 +1,16 @@
-//! saisei launcher — builds/runs game bundles and generates their GameConfig.
-//! Commands: build / run / play / new-game / triage / replay /
+//! `saisei-cli` — the developer / automation tool, and the launcher library the
+//! player app shares (game definitions, staging a bundle, the run env).
+//!
+//! To *play*, run `saisei` (saisei-player): it opens a library. This is
+//! everything else. Commands: build / run / play / new-game / triage / replay /
 //! state-discover / control / run-with-pty / zbookend-diff / zoom (+ help /
 //! version). See `docs/console.md` for the tiered command + flag reference.
-//! JIT-only: `build` generates the per-game config and has cargo build the
-//! saisei-game binary; all program code is JIT-compiled at run time by the
-//! `saisei-jitc` binary.
+//!
+//! JIT-only, and nothing is compiled per game: `run`/`play` build the player and
+//! hand it the game by name, and it reads the bundle's `<name>.json` at run time.
+//! `build` still emits the per-game GameConfig + `saisei-game` binary — that is
+//! the artifact a future *frozen* build is made of, not a step on the play path.
+//! All program code is JIT-compiled at run time by the `saisei-jitc` binary.
 
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -780,14 +786,16 @@ pub fn validate_speedup(v: f64) -> Result<f64, String> {
 /// The full command surface, grouped by audience (see `print_usage`). Printed
 /// on `help`/`--help`, and (to stderr) when invoked with no command.
 const USAGE: &str = "\
-saisei — runs DOS MZ executables by JIT-recompiling them to native code.
+saisei-cli — develop, debug and drive games that Saisei JIT-recompiles to native
+code. To *play*, run `saisei` (no arguments): it opens your library.
 
-usage: saisei <command> [options]
+usage: saisei-cli <command> [options]
 
 Player — play a game:
-  play <game>              build and run in the SDL window
-  run <game>               build and run (headless-capable; for automation)
-  build <game>             build the game binary (run/play do this for you)
+  play <game>              run in the SDL window
+  run <game>               run (headless-capable; for automation)
+  build <game>             emit the per-game binary (for the future frozen build;
+                           run/play do not need it)
   new-game <archive>       create a game bundle from a zip / directory / url
 
 Developer — debug and reverse-engineer:
@@ -819,7 +827,7 @@ run / play options:
 build options:
   --warm[-secs <n>]        after building, warm the JIT cache for n seconds
 
-Run 'saisei version' for the build revision.";
+Run 'saisei-cli version' for the build revision.";
 
 /// Build revision for `saisei version` — baked in at compile time by build.rs.
 fn version_string() -> String {

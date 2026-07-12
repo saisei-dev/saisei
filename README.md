@@ -25,16 +25,29 @@ cargo build --release                      # fetches the pinned toolchain itself
 export PATH="$PWD/target/release:$PATH"    # or just run target/release/saisei
 ```
 
-Then bring a game. Grab one from an abandonware archive like [My Abandonware](https://www.myabandonware.com/) and hand Saisei the link:
+Then just run it:
 
 ```bash
-saisei new-game "https://.../coolgame.zip"
-saisei play coolgame
+saisei
 ```
 
-`new-game` downloads and unpacks the zip — and asks which executable to run if there's more than one. `play` opens the game in a window, compiling each part to native code the moment control reaches it. No config files, no flags to weigh.
+That opens your library. To put a game in it, grab one from an abandonware archive like [My Abandonware](https://www.myabandonware.com/) and **drop the zip on the window** — or paste the link into *Add game*. Saisei unpacks it, asks which executable starts the game if there's more than one, and it's in your library from then on. Pick it and it plays, compiling each part of the game to native code the moment control reaches it. No config files, no flags to weigh.
 
-Two more commands for when you need them: `saisei run <name> --headless` runs without a window (for scripting and CI), and `saisei build <name>` compiles without running. Run `saisei help` for the full command list. To drive a game from a script — keystrokes, screenshots, deterministic replay — see [Driving a program](docs/playing.md).
+While you're playing, **F12** brings up the menu over the paused game: save where you are, jump back into an earlier save, switch to another game, or just close it and carry on. Saves keep a picture of the moment you made them, so you can tell one from another.
+
+<sub>(F12 rather than a more obvious chord because GNOME and KDE grab most of those for themselves, and a shortcut the desktop eats is a feature that doesn't exist.)</sub>
+
+### Doing more than playing
+
+Everything else lives in `saisei-cli` — building bundles, driving a game from a script, and the reverse-engineering tools:
+
+```bash
+saisei-cli new-game "https://.../coolgame.zip"   # add a game from a terminal
+saisei-cli run coolgame --headless               # no window: scripting and CI
+saisei-cli help                                  # the full command list
+```
+
+To drive a game from a script — keystrokes, screenshots, deterministic replay — see [Driving a program](docs/playing.md).
 
 ## Where Saisei is going
 

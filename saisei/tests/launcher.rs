@@ -4,7 +4,7 @@
 //! (games are uncommitted/copyrighted), so we build a synthetic MZ fixture in a
 //! temp dir instead.
 
-use saisei::new_game::{build_seed_config, is_executable};
+use saisei::new_game::{build_seed_config, finish, is_executable, stage};
 use saisei::triage::{class_map_has, summarize, triage, CLASS_MAP};
 use saisei::validate_speedup;
 
@@ -42,6 +42,64 @@ fn is_executable_detects_mz_and_extension() {
     assert!(!is_executable(&cat_json));
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `stage` + `finish` are the whole of adding a game, and both the CLI's
+/// `new-game` and the player's drop-a-zip-on-the-window path run them — so a
+/// bundle added from a terminal and one added from the window are the same
+/// bundle. They return errors rather than exiting, because the player is a
+/// window and has to be able to say "that didn't work" and carry on.
+#[test]
+fn staging_a_folder_finds_its_programs_and_writes_a_config() {
+    let root = temp_parent("stage");
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("GAME.EXE"), b"MZ\x90\x00\x03\x00").unwrap();
+    std::fs::write(src.join("SETUP.EXE"), b"MZ\x90\x00\x03\x00").unwrap();
+    std::fs::write(src.join("DATA.DAT"), b"\x00\x01\x02").unwrap();
+    std::fs::write(src.join("readme.txt"), b"hi").unwrap();
+
+    let staged = stage(&root, &src.display().to_string(), Some("mygame"), false).unwrap();
+    assert_eq!(staged.name, "mygame");
+    // Both programs are offered; which one starts the game is the player's call.
+    assert_eq!(staged.exe_names(), ["GAME.EXE", "SETUP.EXE"]);
+
+    let cfg_path = finish(&staged, &staged.execs[0]).unwrap();
+    let cfg: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cfg_path).unwrap()).unwrap();
+    assert_eq!(cfg["program_path"], "GAME.EXE");
+    let runtime: Vec<String> = cfg["runtime"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["dest"].as_str().unwrap().to_string())
+        .collect();
+    assert!(runtime.contains(&"DATA.DAT".to_string()));
+    assert!(
+        !runtime.iter().any(|d| d.ends_with(".txt")),
+        "a readme is not a runtime file: {runtime:?}"
+    );
+
+    // Adding it twice does not silently clobber the one you already have.
+    let again = stage(&root, &src.display().to_string(), Some("mygame"), false);
+    assert!(again.is_err(), "a second add must not overwrite the first");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn staging_something_with_no_program_in_it_is_an_error_not_a_bundle() {
+    let root = temp_parent("stage_empty");
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("DATA.DAT"), b"\x00\x01\x02").unwrap();
+
+    let e = stage(&root, &src.display().to_string(), Some("nothing"), false).unwrap_err();
+    assert!(e.contains("No DOS program"), "unhelpful message: {e}");
+    // And it leaves no half-made bundle behind for the library to show.
+    assert!(!root.join("games/nothing").exists());
+
+    std::fs::remove_dir_all(&root).ok();
 }
 
 #[test]

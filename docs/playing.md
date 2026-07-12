@@ -6,15 +6,15 @@ runs. It's written for an agent or automation script that needs to navigate a
 program without a human at the keyboard. For the human-facing build/run flow, see
 `README.md`; for the full command + flag reference (every `saisei` and `saisei
 control` command, grouped Player / Developer / Drive), see `docs/console.md` or
-run `saisei help` / `saisei control help`.
+run `saisei-cli help` / `saisei-cli control help`.
 
 The mechanism is the same whether you run with or without the SDL window. The
 two modes differ only in whether the program also accepts SDL keyboard events.
 
 Throughout, `<name>` is the bundle name under `games/<name>/`; its build output
 (and runtime working directory) is `build/<name>/`. Examples use
-`saisei run <name>`; where the `saisei` wrapper is installed,
-`saisei run <name>` is the equivalent shorthand.
+`saisei-cli run <name>`; where the `saisei` wrapper is installed,
+`saisei-cli run <name>` is the equivalent shorthand.
 
 ## Starting the program with a control FIFO
 
@@ -26,7 +26,7 @@ and re-opens the pipe:
 rm -f /tmp/saisei_fifo
 mkfifo /tmp/saisei_fifo
 (exec 9<>/tmp/saisei_fifo;
- saisei run <name> --headless <&9 \
+ saisei-cli run <name> --headless <&9 \
    > /tmp/saisei_stdout.log 2>&1) &
 ```
 
@@ -59,7 +59,7 @@ dedicated cursor/nav cluster, which real keyboards send E0-prefixed (and, with
 NumLock on — our boot default, as on real ATs — wrapped in the fake-shift
 framing `E0 2A … E0 AA`). E.g. `\x10\xC8` presses grey-Up, `\x10\x48`
 presses keypad-8. Games that key on the grey cluster (DM's movement) need the
-extended variant; `saisei control` resolves `up/down/left/right` to it.
+extended variant; `saisei-cli control` resolves `up/down/left/right` to it.
 | `\x14` | Save a screenshot to `build/<name>/screenshots/screenshot<N>.png`. The counter is per-process. |
 | `\r` | Press Enter (auto-paired make/break, like real BIOS keyboard input). |
 | printable ASCII | Same as `\r` for the corresponding ASCII character. |
@@ -100,7 +100,7 @@ The control CLI wraps this as `tap` (see below). To hit it directly, write the
 
 ```bash
 # press Right and release it after 100 BIOS ticks (~5.5 s of game time)
-saisei control raw 12 4D 64 00
+saisei-cli control raw 12 4D 64 00
 ```
 
 Each tap logs to stderr:
@@ -188,7 +188,7 @@ To add a new watch: append a `{lo, hi, "name"}` entry to `write_watches[]`.
 Watches add a few comparisons per byte/word write — keep the list short
 (<20 entries).
 
-## Driver CLI: `saisei control`
+## Driver CLI: `saisei-cli control`
 
 Program-agnostic wrapper around the stdin protocol. Attaches to whatever
 process owns the FIFO — it does **not** start, stop, or rebuild the
@@ -199,18 +199,18 @@ launches.
 # Launch the program (any way; here, background with FIFO-redirected stdin)
 mkfifo /tmp/saisei_fifo
 (exec 9<>/tmp/saisei_fifo;
- saisei run <name> --headless --speedup 1.0 <&9 \
+ saisei-cli run <name> --headless --speedup 1.0 <&9 \
    > /tmp/saisei_stdout.log 2> /tmp/saisei_stderr.log) &
 
 # Drive it
-saisei control shot                # capture frame; prints PNG path
-saisei control space 5             # 5 Space taps
-saisei control tap right 30        # right-arrow held for 30 BIOS ticks
-saisei control press up            # held key (no auto-release)
-saisei control release up
-saisei control enter 3             # 3 Enters (auto-paired make/break)
-saisei control raw 12 4D 14 00     # raw protocol bytes (escape hatch)
-saisei control status              # FIFO + latest screenshot path
+saisei-cli control shot                # capture frame; prints PNG path
+saisei-cli control space 5             # 5 Space taps
+saisei-cli control tap right 30        # right-arrow held for 30 BIOS ticks
+saisei-cli control press up            # held key (no auto-release)
+saisei-cli control release up
+saisei-cli control enter 3             # 3 Enters (auto-paired make/break)
+saisei-cli control raw 12 4D 14 00     # raw protocol bytes (escape hatch)
+saisei-cli control status              # FIFO + latest screenshot path
 ```
 
 Keys accepted by `tap`/`press`/`release`: `up down left right space
@@ -224,8 +224,8 @@ Configuration:
 
 The CLI is the durable contract for driving. The byte protocol (press/release/
 tap opcodes, `\x14` screenshot, `\r` Enter) is the underlying contract;
-`saisei control` is just a friendly skin over it. If you need something the
-CLI doesn't expose, `saisei control raw …` writes arbitrary hex.
+`saisei-cli control` is just a friendly skin over it. If you need something the
+CLI doesn't expose, `saisei-cli control raw …` writes arbitrary hex.
 
 ## Closed-loop driving via the virtual clock
 
@@ -242,7 +242,7 @@ Together with the read (`\x18 <addr_4B> <len_1B>`) and snapshot (`\x1A`)
 opcodes, this turns the program into a turn-by-turn engine: `step → read →
 decide → step → …`. Driver latency drops out of the program's perception of
 time because the world only advances when a step says so. CLI wrappers
-in `saisei control`: `halt`, `resume`, `step <ticks>`, `read <addr> [len]`,
+in `saisei-cli control`: `halt`, `resume`, `step <ticks>`, `read <addr> [len]`,
 `snapshot [--out PATH]`.
 
 The same primitives also make `--speedup` the single knob that sets
@@ -251,7 +251,7 @@ fixed ratio regardless of host capacity.
 
 ## Inspecting program state (no symbols required)
 
-`saisei control read <addr> [len]` and `saisei control snapshot` dump live RAM (to
+`saisei-cli control read <addr> [len]` and `saisei-cli control snapshot` dump live RAM (to
 `build/<name>/snapshots/`) without pausing or rebuilding. A common loop for
 locating a state variable with no symbols: halt, snapshot, perform a known
 input, halt, snapshot again, and diff the two dumps — bytes that changed only
@@ -265,7 +265,7 @@ coordinate must be (a) identical across all idle ticks and (b) responsive to
 held input at the tick scale. Coarser-step comparisons phase-lock onto
 animation cycles and mis-identify them as state.
 
-`saisei zoom SRC COL ROW` crops a fixed 4×4 grid cell (80×50 pixels) out of a
+`saisei-cli zoom SRC COL ROW` crops a fixed 4×4 grid cell (80×50 pixels) out of a
 screenshot when you need to inspect a region more closely than the full 320×200
 frame allows.
 
@@ -274,17 +274,17 @@ frame allows.
 `tap right N` schedules the release at "virtual-now when the tap opcode was
 processed + N ticks". A following `step N` schedules its own halt at
 "virtual-now when the step opcode was processed + N ticks". Those two
-`virtual_now()` reads happen at slightly different moments (saisei control issues
+`virtual_now()` reads happen at slightly different moments (saisei-cli control issues
 them as two separate FIFO writes), so the release deadline can land just before
 or just after the step's halt. When it lands after, the key stays "pressed" past
 the end of the step, and the next action behaves as if the previous direction is
 still held. Workaround between actions:
 
 ```bash
-saisei control release left
-saisei control release right
-saisei control release up
-saisei control step 3       # let the releases land
+saisei-cli control release left
+saisei-cli control release right
+saisei-cli control release up
+saisei-cli control step 3       # let the releases land
 ```
 
 The proper fix is a fused press-step-release opcode that does all three inside
@@ -303,7 +303,7 @@ one safepoint pass; the workaround is fine for now.
   `0x12` handler busy-loops up to 1000 times to assemble the 3-byte payload.
   If you see `[TAP] short read got=N` lines, the writer isn't using unbuffered
   writes. Atomic 4-byte writes via
-  `saisei control raw …` (arbitrary hex) always succeed.
+  `saisei-cli control raw …` (arbitrary hex) always succeed.
 - **Unhandled pc lands at a chunk-swap region** → check whether the
   `[BUG]` report diagnoses `overlapping mappings at same linear`. If yes,
   the upstream bug is stale ret-target attribution — the chunk that owned

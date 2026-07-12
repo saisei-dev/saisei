@@ -1,7 +1,7 @@
 # Command & configuration reference
 
-Everything you can tell Saisei to do, grouped by who needs it. Run `saisei help`
-for the same list in the terminal, and `saisei control help` for the console.
+Everything you can tell Saisei to do, grouped by who needs it. Run `saisei-cli help`
+for the same list in the terminal, and `saisei-cli control help` for the console.
 
 The surface is deliberately tiered:
 
@@ -19,27 +19,27 @@ only environment variables left are internal plumbing the launcher sets for you
 
 | Command | What it does |
 | --- | --- |
-| `saisei play <game>` | Build and run in the SDL window. |
-| `saisei run <game>` | Build and run; headless-capable (good for automation). |
-| `saisei build <game>` | Build the game binary. `run`/`play` do this for you. |
-| `saisei new-game <archive>` | Create a game bundle from a zip / directory / URL. |
+| `saisei-cli play <game>` | Build and run in the SDL window. |
+| `saisei-cli run <game>` | Build and run; headless-capable (good for automation). |
+| `saisei-cli build <game>` | Build the game binary. `run`/`play` do this for you. |
+| `saisei-cli new-game <archive>` | Create a game bundle from a zip / directory / URL. |
 
 ### Developer
 
 | Command | What it does |
 | --- | --- |
-| `saisei triage` | Inspect the newest crash bundle. |
-| `saisei state-discover …` | Discover memory-state predicates across snapshots. |
-| `saisei zbookend-diff <a> <b>` | Diff two snapshots to find who wrote an address. |
-| `saisei zoom <img> <col> <row>` | Pixel-zoom a screenshot tile. |
+| `saisei-cli triage` | Inspect the newest crash bundle. |
+| `saisei-cli state-discover …` | Discover memory-state predicates across snapshots. |
+| `saisei-cli zbookend-diff <a> <b>` | Diff two snapshots to find who wrote an address. |
+| `saisei-cli zoom <img> <col> <row>` | Pixel-zoom a screenshot tile. |
 
 ### Drive (automation / AI)
 
 | Command | What it does |
 | --- | --- |
-| `saisei control <cmd>` | Drive a running game through its FIFO (see below). |
-| `saisei replay <log>` | Replay a recorded session against a `--replay` run. |
-| `saisei run-with-pty <cmd>` | Run a command under a pseudo-terminal. |
+| `saisei-cli control <cmd>` | Drive a running game through its FIFO (see below). |
+| `saisei-cli replay <log>` | Replay a recorded session against a `--replay` run. |
+| `saisei-cli run-with-pty <cmd>` | Run a command under a pseudo-terminal. |
 
 ## `run` / `play` options
 
@@ -66,7 +66,7 @@ after building.
 
 ## The `control` console
 
-`saisei control [global options] <command> [args]` drives a running game through
+`saisei-cli control [global options] <command> [args]` drives a running game through
 its control FIFO. Global options: `--fifo <path>` (default `/tmp/saisei_fifo`),
 `--shots-dir <path>`, `--snapshots-dir <path>`, `--gap <ms>` (default 80).
 
@@ -81,7 +81,7 @@ Keys accept names (`up`, `enter`, `esc`, `f1`, `a`) or a hex scancode (`0x39`).
 `snapshot [name] [--out P]` · `status`
 
 Malformed input (unknown command, bad key, out-of-range address, wrong argument
-count) fails with a specific message; `saisei control help` lists everything.
+count) fails with a specific message; `saisei-cli control help` lists everything.
 
 ## Environment variables (internal only)
 

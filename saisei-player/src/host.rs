@@ -149,3 +149,32 @@ pub fn run(root: &Path, spec: &LaunchSpec) -> i32 {
 
     unsafe { saisei_main((argv.len() - 1) as i32, argv.as_mut_ptr()) }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The runtime re-execs to load a save, and it re-execs with *this* argv. It
+    /// has to come back into the same game, with the same program and the same
+    /// flags — a re-exec that dropped `--play` would land the player in its
+    /// library instead of in the save it was asked for.
+    #[test]
+    fn relaunch_argv_names_the_game_it_came_from() {
+        let mut spec = LaunchSpec::new("zeliard_dos_en");
+        spec.program = Some("setup".into());
+        spec.runtime_args = vec!["--speedup".into(), "2".into()];
+
+        assert_eq!(
+            spec.relaunch_argv("/usr/bin/saisei"),
+            [
+                "/usr/bin/saisei",
+                "--play",
+                "zeliard_dos_en",
+                "--program",
+                "setup",
+                "--speedup",
+                "2"
+            ]
+        );
+    }
+}

@@ -24,10 +24,10 @@ shim_idle_wait, pacing) see the comments in `runtime/src/timer.rs` and
   much cheaper for rustc — the worst DM chunk (10.9k lines) dropped from
   ~5.4s to **~1.0s**; a cold DM boot reaches the title screen inside the
   first 10s run.
-- `saisei build <name> --warm [--warm-secs N]` drives the real program
+- `saisei-cli build <name> --warm [--warm-secs N]` drives the real program
   headless once and ships the hot cache with the bundle (60s default). No
   ahead-of-time decode, no heuristics — the cache is the byproduct of a real
-  run. First `saisei play` after a warm build starts hot.
+  run. First `saisei-cli play` after a warm build starts hot.
 
 ## What was done (by backlog item)
 
@@ -82,7 +82,7 @@ shim_idle_wait, pacing) see the comments in `runtime/src/timer.rs` and
    spill + reload. Bonus: the noalias local made rustc ~5× faster per chunk.
 
 5. **First-ever-run entry discovery** — DONE, deterministically (no decode
-   heuristics, per the prime directive): `saisei build --warm` runs the real
+   heuristics, per the prime directive): `saisei-cli build --warm` runs the real
    boot path headless once, waits for the speculative compiles to quiesce,
    and reports the shipped cache size.
 
