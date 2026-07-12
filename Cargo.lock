@@ -357,6 +357,7 @@ dependencies = [
 name = "saisei-runtime"
 version = "0.0.0"
 dependencies = [
+ "image",
  "libc",
 ]
 

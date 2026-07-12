@@ -615,7 +615,7 @@ unsafe fn stage_and_present_planar_mode() {
 pub extern "C" fn stage_and_present_current_buffer() {
     unsafe {
         let mode = (*bv()).video_mode;
-        // Pre-game phase: hold the placeholder logo through the game's text-mode
+        // Pre-game phase: hold the Saisei logo through the game's text-mode
         // console/setup screens (e.g. Dungeon Master's drive prompt) rather than
         // presenting the text buffer. Only real graphics output retires the logo
         // (see sdl::splash_is_up); input still flows via virtual_display_poll_input.
@@ -710,7 +710,7 @@ pub extern "C" fn apply_video_mode_state(mode: u8) {
         if headless_mode == 0 {
             crate::sdl::virtual_display_set_mode(mode as c_int);
             if is_text_mode(mode) != 0 {
-                // Keep the fixed placeholder-logo window while it's still up; a
+                // Keep the fixed splash-logo window while it's still up; a
                 // text-console mode-set must not resize it to 80x25 geometry
                 // (that resize is the "reset to odd setup" during DM's prompt).
                 if !crate::sdl::splash_is_up() {
@@ -1050,13 +1050,6 @@ fn crc32(data: &[u8]) -> u32 {
 }
 
 // ---- 8x8 font (public domain, from font8x8_basic.h) ------------------------
-
-/// One glyph from the shared 8x8 font, indexed by 7-bit code. Row `gy`, bit
-/// `1<<gx` set → pixel lit at column `gx` (LSB = leftmost), matching the
-/// text-mode renderer. Used by the SDL splash to draw the pre-game placeholder.
-pub(crate) fn font8x8_glyph(code: u8) -> &'static [u8; 8] {
-    &FONT8X8_BASIC[(code & 0x7F) as usize]
-}
 
 static FONT8X8_BASIC: [[u8; 8]; 128] = [
     [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],

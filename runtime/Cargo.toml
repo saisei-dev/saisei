@@ -18,6 +18,11 @@ force_exit_after_10s = []
 # FILE* owned by shims.c, so dos.rs must use the same libc FILE type.
 libc = "0.2"
 
+[build-dependencies]
+# Build-time only: decodes + downscales the splash logo PNG into the raw RGB the
+# display path embeds. Nothing image-related is linked into the runtime itself.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
 [lib]
 crate-type = ["rlib", "cdylib"]
 path = "src/lib.rs"
