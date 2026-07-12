@@ -51,15 +51,20 @@ Playing is the front door. The point is to make these games **open to tinker wit
 
 At run time Saisei loads the program image, takes the entry point from the MZ header, and JIT-compiles each code segment the first time control reaches it: decode → lossless IR → Rust → rustc → `dlopen`. Nothing is decoded ahead of time, and compiled chunks are keyed by the bytes that are actually live — so a decompressed or overlaid region is recompiled from whatever is really there. The full design is in the [architecture overview](docs/architecture.md).
 
+## Tested games
+
+Saisei's x86, BIOS, and DOS emulation is **still being built out, and many games do not work yet** — they hang, glitch, or stop on something we haven't implemented. These are the ones known to play:
+
+- **Zeliard**
+- **Prince of Persia**
+- **Dungeon Master**
+- **Alley Cat**
+
+Every game you try is a test case, so please tell us either way: if one works, report it and we'll add it to this list; if one breaks, [open an issue](https://github.com/saisei-dev/saisei/issues) with the game and how far it got. A game that stops on an unimplemented port or an unfaithful instruction is exactly the signal that pushes the emulation forward.
+
 ## Contributing
 
-Saisei is early and there's plenty to build. Set up the dev tooling once:
-
-```bash
-git config core.hooksPath .githooks   # runs `cargo fmt --check` before each commit
-```
-
-Run `cargo fmt` and `cargo test` before you push. Start with the [architecture overview](docs/architecture.md) and the [runtime memory model](docs/runtime_memory_model.md).
+Saisei is early and there's plenty to build — the dev setup, the design docs, and how to report a game are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
