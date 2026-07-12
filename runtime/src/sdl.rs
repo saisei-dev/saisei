@@ -652,7 +652,7 @@ fn sync_pressed_scancodes_with_keyboard_state() {
 /// split on `_`/`-`, drop trailing bundle tokens, and title-case so the window
 /// reads like the game ("Kings Bounty", not "kings_bounty_dos_en"). Returns
 /// `None` for an empty/all-noise id.
-fn prettify_name(raw: &str) -> Option<String> {
+pub fn prettify_name(raw: &str) -> Option<String> {
     let mut words: Vec<&str> = raw
         .split(|c: char| c == '_' || c == '-' || c == ' ')
         .filter(|w| !w.is_empty())
@@ -684,7 +684,7 @@ fn prettify_name(raw: &str) -> Option<String> {
 /// The running game's display name from the linked-in `game_config` (`None`
 /// when no game is linked — weak-default config / shim tests).
 fn pretty_game_name() -> Option<String> {
-    let ptr = crate::shims::game_config.name;
+    let ptr = crate::shims::cfg().name;
     if ptr.is_null() {
         return None;
     }
@@ -910,18 +910,23 @@ pub extern "C" fn virtual_display_poll_input() {
     }
 }
 
+/// Open the window (and renderer), if one isn't open already. Split out of
+/// `virtual_display_init` because the player host opens the window for its
+/// library UI *before* a game is chosen: by the time a game starts there is
+/// already a window on screen, and the game must adopt it rather than open a
+/// second one. Returns false if SDL or the window could not come up.
 #[no_mangle]
-pub extern "C" fn virtual_display_init(width: c_int, height: c_int, scale: c_int) {
+pub extern "C" fn virtual_display_open_window(width: c_int, height: c_int, scale: c_int) -> bool {
     unsafe {
-        DISPLAY_READY = false;
         if scale > 0 {
             SCALE_HINT = scale;
         }
-        WIN_W = width;
-        WIN_H = height;
+        if !WINDOW.is_null() {
+            return !RENDERER.is_null();
+        }
         SDL_SetHint(c"SDL_NO_SIGNAL_HANDLERS".as_ptr(), c"1".as_ptr());
         if SDL_Init(SDL_INIT_VIDEO) != 0 {
-            return;
+            return false;
         }
         shim_reinstall_crash_handlers();
         SDL_SetHint(c"SDL_RENDER_SCALE_QUALITY".as_ptr(), c"0".as_ptr());
@@ -936,15 +941,43 @@ pub extern "C" fn virtual_display_init(width: c_int, height: c_int, scale: c_int
         );
         if WINDOW.is_null() {
             SDL_Quit();
-            return;
+            return false;
         }
         RENDERER = SDL_CreateRenderer(WINDOW, -1, SDL_RENDERER_ACCELERATED);
         if RENDERER.is_null() {
             SDL_DestroyWindow(WINDOW);
             WINDOW = core::ptr::null_mut();
             SDL_Quit();
+            return false;
+        }
+        true
+    }
+}
+
+/// Re-title the window for the game that is now running. The title is built
+/// from the game config, which the host installs only once a game is chosen —
+/// so a window opened early for the library carries the bare "Saisei" title
+/// until this is called.
+#[no_mangle]
+pub extern "C" fn virtual_display_retitle() {
+    unsafe {
+        if !WINDOW.is_null() {
+            let title = window_title(None);
+            SDL_SetWindowTitle(WINDOW, title.as_ptr());
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn virtual_display_init(width: c_int, height: c_int, scale: c_int) {
+    unsafe {
+        DISPLAY_READY = false;
+        WIN_W = width;
+        WIN_H = height;
+        if !virtual_display_open_window(width, height, scale) {
             return;
         }
+        virtual_display_retitle();
         recreate_texture(width, height);
     }
 }

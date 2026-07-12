@@ -506,9 +506,14 @@ pub struct GameConfig {
 }
 
 // Weak default `game_config` so the runtime links standalone (the shim-test
-// harness dlopens the runtime .a with no per-game config). The generated
-// per-game config provides a STRONG `game_config` that overrides this at the
-// real game link. Mirrors the original C shims.c weak default.
+// harness dlopens the runtime .a with no per-game config). A *frozen* per-game
+// binary provides a STRONG `game_config` that overrides this at link time —
+// that path is what the dispatch tables below are shaped for. The player host
+// links no such symbol and instead calls `saisei_set_game_config` at run time,
+// so one binary can run any bundle without a per-game relink.
+//
+// Read it through `cfg()`, never directly: a direct read sees the weak default
+// even when the host has installed one.
 unsafe impl Sync for GameConfig {}
 static EMPTY_CSTR: [u8; 1] = [0];
 #[linkage = "weak"]
@@ -528,6 +533,31 @@ pub static game_config: GameConfig = GameConfig {
     patches: core::ptr::null(),
     patch_count: 0,
 };
+
+// The host's run-time config, when it installed one. Null => the linked-in
+// `game_config` (weak default, or a frozen build's strong override) applies.
+static mut GAME_CONFIG_OVERRIDE: *const GameConfig = core::ptr::null();
+
+/// Install a `GameConfig` at run time. The player host calls this — with the
+/// config it read from `games/<name>/<name>.json` — before `saisei_main`, which
+/// is what lets one binary run any bundle. The pointee must outlive the process.
+#[no_mangle]
+pub unsafe extern "C" fn saisei_set_game_config(config: *const GameConfig) {
+    GAME_CONFIG_OVERRIDE = config;
+}
+
+/// The active game config: the host's, if it installed one, else the linked-in
+/// `game_config`. Every read of the config goes through here.
+#[inline]
+pub fn cfg() -> &'static GameConfig {
+    unsafe {
+        if GAME_CONFIG_OVERRIDE.is_null() {
+            &game_config
+        } else {
+            &*GAME_CONFIG_OVERRIDE
+        }
+    }
+}
 
 extern "C" {
     // Provided by sdl.rs (strong definitions).
@@ -2099,11 +2129,11 @@ pub unsafe extern "C" fn shim_active_binary() -> *const c_char {
 
 #[no_mangle]
 pub unsafe extern "C" fn shim_dispatch_fn_by_module(module: *const c_char) -> ShimDispatchFn {
-    if module.is_null() || game_config.binary_dispatch.is_null() {
+    if module.is_null() || cfg().binary_dispatch.is_null() {
         return None;
     }
-    for i in 0..game_config.binary_dispatch_count {
-        let bd = &*game_config.binary_dispatch.add(i);
+    for i in 0..cfg().binary_dispatch_count {
+        let bd = &*cfg().binary_dispatch.add(i);
         if !bd.module.is_null() && bd.fn_.is_some() && libc::strcmp(bd.module, module) == 0 {
             return bd.fn_;
         }
@@ -3792,7 +3822,7 @@ unsafe fn init_psp() {
     let env_seg = psp_seg.wrapping_sub(0x10);
     env_block = seg_off(env_seg, 0);
     libc::memset(env_block as *mut c_void, 0, 0x100);
-    let mut program_path = game_config.program_path;
+    let mut program_path = cfg().program_path;
     if program_path.is_null() {
         program_path = cstr!("program.exe");
     }
@@ -6546,15 +6576,15 @@ unsafe fn protected_slots_check_write(
     func: *const c_char,
     line: c_int,
 ) {
-    if game_config.protected_slot_count == 0 {
+    if cfg().protected_slot_count == 0 {
         return;
     }
-    if cs() == game_config.init_cs {
+    if cs() == cfg().init_cs {
         return;
     }
-    for i in 0..game_config.protected_slot_count {
-        let slot_lo = (*game_config.protected_slots.add(i)).lo;
-        let slot_hi = (*game_config.protected_slots.add(i)).hi;
+    for i in 0..cfg().protected_slot_count {
+        let slot_lo = (*cfg().protected_slots.add(i)).lo;
+        let slot_hi = (*cfg().protected_slots.add(i)).hi;
         if addr + size as u32 <= slot_lo || addr > slot_hi {
             continue;
         }
@@ -6563,7 +6593,7 @@ unsafe fn protected_slots_check_write(
             msg.as_mut_ptr() as *mut c_char,
             msg.len(),
             cstr!("[RCB OVERWRITE] post-init write into protected slot %s @ 0x%05X size=%zu val=0x%X\n  cs:ip=%04X:%04X active=%s ds=%04X es=%04X ax=%04X bx=%04X cx=%04X dx=%04X si=%04X di=%04X bp=%04X ss:sp=%04X:%04X\n  via %s:%s:%d\n  diagnosis: this slot holds an indirect ljmp/lcall target the game reads every timer tick. A write here from non-init code is a buffer overrun stomping the dispatch table; the next dispatch through the slot would land at a bogus target. The cs:ip above is the instruction whose write overflowed.\n"),
-            (*game_config.protected_slots.add(i)).name,
+            (*cfg().protected_slots.add(i)).name,
             addr as c_uint,
             size,
             value as c_uint,
@@ -6811,9 +6841,9 @@ pub unsafe extern "C" fn mem_page_flags_recompute() {
         mem_page_flag_range(aliasreg_var_lo, aliasreg_var_hi.saturating_add(1));
     }
     // protected slots
-    for i in 0..game_config.protected_slot_count {
-        let lo = (*game_config.protected_slots.add(i)).lo;
-        let hi = (*game_config.protected_slots.add(i)).hi;
+    for i in 0..cfg().protected_slot_count {
+        let lo = (*cfg().protected_slots.add(i)).lo;
+        let hi = (*cfg().protected_slots.add(i)).hi;
         mem_page_flag_range(lo, hi.saturating_add(1));
     }
 }
@@ -7642,15 +7672,39 @@ pub unsafe extern "C" fn rcb_write16_impl(
 // [C lines 4917-5140]
 // ============================================================================
 
-unsafe extern "C" fn init_memory() {
-    if game_config.psp_seg != 0 {
-        psp_seg = game_config.psp_seg;
+/// Boot the machine: RAM, the PSP, the interrupt-vector table and BIOS data
+/// area, the virtual clock, and the program image the active `GameConfig` names
+/// — everything that must be true before the first guest instruction runs.
+///
+/// This is machine boot, not process init; it runs from a constructor (below)
+/// only because a frozen per-game binary carries its `GameConfig` as a link-time
+/// symbol, so by the time constructors run the program to load is already known.
+/// The player host is one binary for every game and only learns which one from
+/// its arguments — which is after constructors have run. So it installs the
+/// config with `saisei_set_game_config` and calls this again.
+///
+/// Booting twice is therefore expected, and this is written to be a *reset*
+/// rather than an increment: guest RAM is reused and re-zeroed instead of
+/// reallocated, the file mappings are dropped, and the exit report is registered
+/// once. The first boot, with no config installed, finds an empty program path
+/// and simply loads nothing.
+#[no_mangle]
+pub unsafe extern "C" fn shim_boot_machine() {
+    if cfg().psp_seg != 0 {
+        psp_seg = cfg().psp_seg;
     }
 
-    virtual_memory = libc::calloc(1, MEMORY_SIZE) as *mut u8;
     if virtual_memory.is_null() {
-        shim_flush_all_streams();
-        libc::exit(1);
+        virtual_memory = libc::calloc(1, MEMORY_SIZE) as *mut u8;
+        if virtual_memory.is_null() {
+            shim_flush_all_streams();
+            libc::exit(1);
+        }
+    } else {
+        // Re-boot: the guest starts from cold RAM, and nothing the previous boot
+        // mapped is still true.
+        libc::memset(virtual_memory as *mut c_void, 0, MEMORY_SIZE);
+        file_mapping_count = 0;
     }
 
     psp = seg_off(psp_seg, 0) as *mut PSP;
@@ -7690,7 +7744,12 @@ unsafe extern "C" fn init_memory() {
     jit_instr_budget = JIT_BUDGET_QUANTUM;
     jit_budget_last_refill = JIT_BUDGET_QUANTUM;
     mem_page_flags_recompute();
-    libc::atexit(report_retired_at_exit);
+    // Once per process, not once per boot — a second registration would print
+    // the retired-instruction report twice at exit.
+    if !RETIRED_REPORT_REGISTERED {
+        RETIRED_REPORT_REGISTERED = true;
+        libc::atexit(report_retired_at_exit);
+    }
     last_host_time_ns = shim_virtual_now_ns();
     host_time_origin_ns = last_host_time_ns;
     pit_cycle_accum = 0;
@@ -7720,7 +7779,7 @@ unsafe extern "C" fn init_memory() {
     let mut new_ip: u16 = 0;
     let mut new_ss: u16 = 0;
     let mut new_sp: u16 = 0;
-    let mut program_path = game_config.program_path;
+    let mut program_path = cfg().program_path;
     if program_path.is_null() {
         program_path = cstr!("program.exe");
     }
@@ -7742,6 +7801,12 @@ unsafe extern "C" fn init_memory() {
     for i in 0..16 {
         null_guard_initial[i] = *virtual_memory.add(i);
     }
+}
+
+static mut RETIRED_REPORT_REGISTERED: bool = false;
+
+unsafe extern "C" fn init_memory() {
+    shim_boot_machine();
 }
 
 #[used]
@@ -8908,9 +8973,9 @@ unsafe fn try_call_target(addr: u32) -> GameFunc {
             }
         }
     }
-    if !game_config.call_targets.is_null() {
-        for i in 0..game_config.call_target_count {
-            let target = &*game_config.call_targets.add(i);
+    if !cfg().call_targets.is_null() {
+        for i in 0..cfg().call_target_count {
+            let target = &*cfg().call_targets.add(i);
             if target.addr == addr {
                 if (target.file.is_null() && mapped_file.is_null())
                     || (!target.file.is_null()
@@ -9589,8 +9654,8 @@ unsafe fn report_unmapped(
         if !dot.is_null() {
             *dot = 0;
         }
-        let game_name = if !game_config.name.is_null() {
-            game_config.name
+        let game_name = if !cfg().name.is_null() {
+            cfg().name
         } else {
             cstr!("game")
         };
@@ -9605,8 +9670,8 @@ unsafe fn report_unmapped(
             offset as c_uint, mapped_file, offset as c_uint, stem.as_ptr() as *const c_char, game_name,
         );
     } else {
-        let game_name = if !game_config.name.is_null() {
-            game_config.name
+        let game_name = if !cfg().name.is_null() {
+            cfg().name
         } else {
             cstr!("game")
         };
@@ -9922,7 +9987,7 @@ pub unsafe extern "C" fn call_table_impl(
 }
 
 unsafe fn find_dispatch_by_source_file(file: *const c_char) -> *const BinaryDispatch {
-    if file.is_null() || game_config.binary_dispatch.is_null() {
+    if file.is_null() || cfg().binary_dispatch.is_null() {
         return ptr::null();
     }
     let slash = libc::strrchr(file, b'/' as c_int);
@@ -9931,8 +9996,8 @@ unsafe fn find_dispatch_by_source_file(file: *const c_char) -> *const BinaryDisp
     if n > 2 && *base.add(n - 2) as u8 == b'.' && *base.add(n - 1) as u8 == b'c' {
         n -= 2;
     }
-    for i in 0..game_config.binary_dispatch_count {
-        let bd = &*game_config.binary_dispatch.add(i);
+    for i in 0..cfg().binary_dispatch_count {
+        let bd = &*cfg().binary_dispatch.add(i);
         if !bd.module.is_null()
             && bd.fn_.is_some()
             && libc::strlen(bd.module) == n
@@ -9955,7 +10020,7 @@ unsafe fn find_binary_for_addr(
     addr: u32,
     out_fm: *mut *const FileMapping,
 ) -> *const BinaryDispatch {
-    if game_config.binary_dispatch.is_null() {
+    if cfg().binary_dispatch.is_null() {
         return ptr::null();
     }
     let fm = find_file_mapping(addr);
@@ -9968,8 +10033,8 @@ unsafe fn find_binary_for_addr(
     } else {
         (*fm).path
     };
-    for i in 0..game_config.binary_dispatch_count {
-        let bd = &*game_config.binary_dispatch.add(i);
+    for i in 0..cfg().binary_dispatch_count {
+        let bd = &*cfg().binary_dispatch.add(i);
         if !bd.file.is_null() && bd.fn_.is_some() && libc::strcmp(bd.file, bn) == 0 {
             if !out_fm.is_null() {
                 *out_fm = fm;
@@ -10954,8 +11019,8 @@ unsafe fn ensure_patch_reg() {
         return;
     }
     patch_reg_inited = 1;
-    if !game_config.patches.is_null() && game_config.patch_count != 0 {
-        patch_register(game_config.patches, game_config.patch_count);
+    if !cfg().patches.is_null() && cfg().patch_count != 0 {
+        patch_register(cfg().patches, cfg().patch_count);
     }
 }
 
@@ -11944,7 +12009,7 @@ pub unsafe extern "C" fn saisei_main(argc: c_int, argv: *mut *mut c_char) -> c_i
             if shim_active_binary().is_null() { cstr!("<none>") } else { shim_active_binary() },
         );
         libc::fflush(stderr);
-    } else if !game_config.program_path.is_null() {
+    } else if !cfg().program_path.is_null() {
         run_machine();
         libc::fprintf(
             stderr,

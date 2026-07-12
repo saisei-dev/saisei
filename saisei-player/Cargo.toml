@@ -1,0 +1,31 @@
+# saisei-player — the player-facing app, and the one host that runs every game.
+#
+# It links the runtime rlib directly and calls `saisei_main` in-process, after
+# installing a GameConfig read from `games/<name>/<name>.json` at run time
+# (`saisei_set_game_config`). That is what lets ONE binary run any bundle: the
+# per-game `saisei-game` binary exists only for the future frozen build, and
+# nothing in the play path compiles per game any more.
+#
+# It owns the SDL window for the whole session — logo, library, the game itself,
+# and the in-game overlay all render into it.
+[package]
+name = "saisei-player"
+version = "0.0.0"
+edition = "2021"
+description = "Saisei — play DOS games."
+
+[features]
+# Self-terminating smoke runs, as `saisei-cli run <game> --features
+# force_exit_after_10s`. The runtime is linked into this binary, so the feature
+# has to be selected on *this* crate's build.
+force_exit_after_10s = ["saisei-runtime/force_exit_after_10s"]
+
+[dependencies]
+saisei-runtime = { path = "../runtime" }
+saisei = { path = "../saisei" }
+libc = "0.2"
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[[bin]]
+name = "saisei"
+path = "src/main.rs"

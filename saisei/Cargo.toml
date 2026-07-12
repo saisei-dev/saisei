@@ -8,8 +8,11 @@ description = "Saisei launcher CLI (new-game / build / run / play)."
 name = "saisei"
 path = "src/lib.rs"
 
+# The developer / automation tool. The player-facing app is the `saisei` binary
+# (see saisei-player), which is also the one host that runs every game; this CLI
+# builds bundles, drives a running game, and does the reverse-engineering work.
 [[bin]]
-name = "saisei"
+name = "saisei-cli"
 path = "src/main.rs"
 
 [dependencies]

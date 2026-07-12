@@ -463,6 +463,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "saisei-player"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "saisei",
+ "saisei-runtime",
+ "serde_json",
+]
+
+[[package]]
 name = "saisei-runtime"
 version = "0.0.0"
 dependencies = [

@@ -599,6 +599,45 @@ fn find_latest_slot_dir(out: *mut c_char, cap: usize) -> c_int {
 
 /* Slurp /proc/self/cmdline (NUL-separated argv) into a heap array.
  * Caller frees both the strings and the returned argv. */
+// The argv a re-exec should use, when the host has supplied one. Loading a save
+// re-execs the process (clean host state is the only honest way to restore into
+// the JIT), rebuilding argv from /proc/self/cmdline. That works for a binary
+// invoked as `<game> --flags`, but the player app is one binary for every game
+// and can be launched from its library UI with a bare `saisei` cmdline that
+// names no game at all — re-execing that would land the player back in the
+// library instead of in the save. The host installs the argv that reproduces
+// the running game; when it has, that wins over /proc/self/cmdline.
+static mut RELAUNCH_ARGV: *const *const c_char = core::ptr::null();
+static mut RELAUNCH_ARGC: c_int = 0;
+
+/// Install the argv a save-load re-exec should use. The pointee must outlive the
+/// process. Passing a null/empty argv restores the /proc/self/cmdline behaviour.
+#[no_mangle]
+pub unsafe extern "C" fn saisei_set_relaunch_argv(argv: *const *const c_char, argc: c_int) {
+    RELAUNCH_ARGV = argv;
+    RELAUNCH_ARGC = argc;
+}
+
+/// The base argv for a re-exec: the host's, if it installed one, else this
+/// process's own cmdline. Ownership matches `read_proc_cmdline` — a calloc'd
+/// vector of strdup'd strings the caller frees.
+unsafe fn relaunch_base_argv(argc_out: *mut c_int) -> *mut *mut c_char {
+    if RELAUNCH_ARGV.is_null() || RELAUNCH_ARGC <= 0 {
+        return read_proc_cmdline(argc_out);
+    }
+    let n = RELAUNCH_ARGC;
+    let v = libc::calloc(n as usize, core::mem::size_of::<*mut c_char>()) as *mut *mut c_char;
+    if v.is_null() {
+        *argc_out = 0;
+        return core::ptr::null_mut();
+    }
+    for i in 0..n {
+        *v.add(i as usize) = libc::strdup(*RELAUNCH_ARGV.add(i as usize));
+    }
+    *argc_out = n;
+    v
+}
+
 fn read_proc_cmdline(argc_out: *mut c_int) -> *mut *mut c_char {
     unsafe {
         *argc_out = 0;
@@ -704,7 +743,7 @@ pub extern "C" fn save_manager_request_load_latest() {
     }
 
     let mut orig_argc: c_int = 0;
-    let orig_argv = read_proc_cmdline(&mut orig_argc);
+    let orig_argv = unsafe { relaunch_base_argv(&mut orig_argc) };
 
     /* Build new argv: orig argv with any existing --restore-from stripped,
      * then append --restore-from <abs_dir>. */

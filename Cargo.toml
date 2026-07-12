@@ -2,7 +2,7 @@
 # former compiler/*.py — validated byte-identical against it) and `saisei` (the
 # launcher). This is the whole toolchain; everything is Rust.
 [workspace]
-members = ["saisei-jitc", "saisei", "runtime", "saisei-game"]
+members = ["saisei-jitc", "saisei", "runtime", "saisei-game", "saisei-player"]
 resolver = "2"
 
 # Statically build the vendored capstone 5.0.7 x86 sources (the exact C core the

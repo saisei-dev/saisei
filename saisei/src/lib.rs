@@ -223,13 +223,23 @@ fn as_int(v: Option<&Value>) -> i64 {
     }
 }
 
-/// Emit the per-game GameConfig (Rust data file) from the <name>.json config.
-pub fn generate_game_config(root: &Path, game: &GameDef) -> PathBuf {
-    let out_path = root
-        .join("build")
-        .join(format!("{}_game_config.rs", game.program_key));
+/// The machine parameters a GameConfig carries, read out of `<name>.json`.
+///
+/// Two consumers need these and must not disagree: `generate_game_config` bakes
+/// them into a frozen per-game binary, and the player host installs them at run
+/// time via `saisei_set_game_config`. Both go through here.
+pub struct GameConfigValues {
+    pub name: String,
+    pub program_path: String,
+    pub init_cs: u16,
+    pub psp_seg: u16,
+    /// (lo, hi, name) — runtime memory-protection ranges.
+    pub protected_slots: Vec<(u32, u32, String)>,
+}
+
+pub fn game_config_values(game: &GameDef) -> GameConfigValues {
     let data: Value = serde_json::from_slice(&std::fs::read(&game.config_path).unwrap()).unwrap();
-    let game_name = data
+    let name = data
         .get("name")
         .and_then(Value::as_str)
         .map(str::to_string)
@@ -259,17 +269,47 @@ pub fn generate_game_config(root: &Path, game: &GameDef) -> PathBuf {
             ps.iter()
                 .find(|p| p.get("name").and_then(Value::as_str) == Some(want))
                 .cloned()
-                .unwrap_or_else(|| die("generate_game_config: no matching program"))
+                .unwrap_or_else(|| die("game_config_values: no matching program"))
         }
     };
 
     let pick = |k: &str| prog.get(k).or_else(|| data.get(k));
-    let init_cs = as_int(pick("init_cs"));
-    let psp_seg = as_int(pick("psp_seg"));
-    let slots = pick("protected_slots")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    GameConfigValues {
+        name,
+        program_path: game.program_path.clone(),
+        init_cs: (as_int(pick("init_cs")) & 0xFFFF) as u16,
+        psp_seg: (as_int(pick("psp_seg")) & 0xFFFF) as u16,
+        protected_slots: pick("protected_slots")
+            .and_then(Value::as_array)
+            .map(|slots| {
+                slots
+                    .iter()
+                    .map(|s| {
+                        (
+                            as_int(s.get("lo")) as u32,
+                            as_int(s.get("hi")) as u32,
+                            s.get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// Emit the per-game GameConfig (Rust data file) from the <name>.json config.
+pub fn generate_game_config(root: &Path, game: &GameDef) -> PathBuf {
+    let out_path = root
+        .join("build")
+        .join(format!("{}_game_config.rs", game.program_key));
+    let vals = game_config_values(game);
+    let game_name = vals.name;
+    let init_cs = vals.init_cs;
+    let psp_seg = vals.psp_seg;
+    let slots = vals.protected_slots;
 
     // Emit the per-game GameConfig data file, include!d into the saisei-game
     // bin crate. The `#[repr(C)]` struct layout MUST match the `game_config`
@@ -318,8 +358,7 @@ pub fn generate_game_config(root: &Path, game: &GameDef) -> PathBuf {
     let slots_expr = if slots.is_empty() {
         "core::ptr::null()".to_string()
     } else {
-        for (i, s) in slots.iter().enumerate() {
-            let nm = s.get("name").and_then(Value::as_str).unwrap_or("");
+        for (i, (_, _, nm)) in slots.iter().enumerate() {
             let (arr, len) = byte_arr(nm);
             out.push_str(&format!("static SLOT_NAME_{i}: [u8; {len}] = {arr};\n"));
         }
@@ -327,9 +366,7 @@ pub fn generate_game_config(root: &Path, game: &GameDef) -> PathBuf {
             "static PROTECTED_SLOTS: [ProtectedSlot; {}] = [\n",
             slots.len()
         ));
-        for (i, s) in slots.iter().enumerate() {
-            let lo = as_int(s.get("lo"));
-            let hi = as_int(s.get("hi"));
+        for (i, (lo, hi, _)) in slots.iter().enumerate() {
             out.push_str(&format!(
                 "    ProtectedSlot {{ lo: 0x{lo:05X}, hi: 0x{hi:05X}, name: SLOT_NAME_{i}.as_ptr() as *const c_char }},\n"
             ));
@@ -396,7 +433,7 @@ fn compile_game(root: &Path, game: &GameDef, config_source: &Path, features: &[S
     binary_path
 }
 
-fn copy_runtime(root: &Path, game: &GameDef) -> PathBuf {
+pub fn copy_runtime(root: &Path, game: &GameDef) -> PathBuf {
     let output_dir = root.join("build").join(&game.key);
     std::fs::create_dir_all(&output_dir).ok();
     for (source, dest) in &game.runtime {
@@ -546,7 +583,7 @@ struct RunOpts {
 
 /// The environment every game process gets (run, play, and the build --warm
 /// cache run): repo root, translator path, per-game JIT cache dir, git hash.
-fn game_process_env(root: &Path, game: &GameDef) -> BTreeMap<String, String> {
+pub fn game_process_env(root: &Path, game: &GameDef) -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> = std::env::vars().collect();
     env.insert("SAISEI_REPO_ROOT".into(), root.display().to_string());
     // Crash manifests carry the repo git hash (runtime_version in shims.rs);
@@ -573,14 +610,40 @@ fn game_process_env(root: &Path, game: &GameDef) -> BTreeMap<String, String> {
     env
 }
 
+/// Build the player, which is the host that runs every game.
+///
+/// `run`/`play` go through it rather than through a per-game binary: the game's
+/// GameConfig is read from its `<name>.json` at run time, so nothing is compiled
+/// per game and switching games costs nothing. (`build` still produces the
+/// per-game binary — that is the artifact the future frozen build is made of.)
+fn build_player(root: &Path, features: &[String]) -> PathBuf {
+    let mut cmd = Command::new("cargo");
+    cmd.current_dir(root)
+        .args(["build", "--release", "-p", "saisei-player"]);
+    for f in features {
+        cmd.args(["--features", &format!("saisei-player/{f}")]);
+    }
+    if !matches!(cmd.status(), Ok(s) if s.success()) {
+        die("cargo build -p saisei-player failed");
+    }
+    root.join("target/release/saisei")
+}
+
 fn run_game(root: &Path, game: &GameDef, o: &RunOpts) -> ! {
-    let binary_path = build_with(root, game, &o.features);
+    let player = build_player(root, &o.features);
     let runtime_dir = copy_runtime(root, game);
 
-    let mut cmd = vec![format!(
-        "./{}",
-        binary_path.file_name().unwrap().to_string_lossy()
-    )];
+    // The player does its own staging (it copies the bundle's runtime files and
+    // enters build/<game>/), so it is given the game by name, not a path.
+    let mut cmd = vec![
+        player.display().to_string(),
+        "--play".into(),
+        game.key.clone(),
+    ];
+    if !game.program.is_empty() {
+        cmd.push("--program".into());
+        cmd.push(game.program.clone());
+    }
     if o.headless {
         cmd.push("--headless".into());
     }
