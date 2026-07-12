@@ -127,6 +127,7 @@ fn pump(ui: &mut Ui) -> (Action, bool) {
                 rt::UI_KEY_BACKSPACE => ui.key(Key::Backspace),
                 rt::UI_KEY_OVERLAY => ui.key(Key::Overlay),
                 rt::UI_KEY_PASTE => ui.key(Key::Paste),
+                rt::UI_KEY_DELETE => ui.key(Key::Delete),
                 _ => Action::None,
             },
             rt::UI_EV_TEXT => {
@@ -243,6 +244,17 @@ pub fn run(root: &Path) -> ! {
                     ui.pasted(&text);
                 }
             }
+            Action::DeleteGame(i) => {
+                if let Some(g) = ui.games.get(i) {
+                    if let Err(e) = library::delete_game(root, &library::saves_root(), &g.key) {
+                        eprintln!("saisei: {e}");
+                    }
+                }
+                ui.games = games_view(root);
+                // The cursor was on the game that is no longer there.
+                ui.game = ui.game.min(ui.games.len());
+                dirty = true;
+            }
             Action::PickExe(i) => {
                 crate::add::pick_exe(root, &mut ui, i);
                 ui.games = games_view(root);
@@ -343,6 +355,7 @@ unsafe extern "C" fn overlay_entry(can_save: bool) {
             | Action::AddUrl(_)
             | Action::PickExe(_)
             | Action::Paste
+            | Action::DeleteGame(_)
             | Action::None => {}
         }
         if touched || dirty || p.resize_to_window() {

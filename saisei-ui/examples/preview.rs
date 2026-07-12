@@ -52,8 +52,15 @@ fn main() {
     u.paint(&mut cv, true);
     save(&cv, &format!("{dir}/ui_overlay.png"));
 
-    u.screen = Screen::AddGame;
+    u.screen = Screen::Library;
     u.in_game = false;
+    u.key(Key::Delete);
+    let mut cv = Canvas::new(1280, 800);
+    u.paint(&mut cv, false);
+    save(&cv, &format!("{dir}/ui_delete.png"));
+    u.key(Key::Escape);
+
+    u.screen = Screen::AddGame;
     let mut cv = Canvas::new(1280, 800);
     u.paint(&mut cv, false);
     save(&cv, &format!("{dir}/ui_add.png"));

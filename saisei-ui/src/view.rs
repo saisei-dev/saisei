@@ -38,6 +38,16 @@ pub fn paint(ui: &mut Ui, cv: &mut Canvas, over_game: bool) {
 
     let full = Rect::new(pad, pad, cv.w as f32 - 2.0 * pad, cv.h as f32 - 2.0 * pad);
 
+    if ui.deleting.is_some() {
+        paint_library(ui, cv, full, s);
+        // Modal: everything behind the question stops being clickable, not just
+        // stops being drawn. Hit rects for the library were pushed above; drop
+        // them, or a click meant for the dialog could fall through onto a card.
+        ui.hot.clear();
+        paint_confirm_delete(ui, cv, cv_rect(cv), s);
+        return;
+    }
+
     match ui.screen {
         Screen::Library => paint_library(ui, cv, full, s),
         Screen::Game => {
@@ -60,6 +70,154 @@ pub fn paint(ui: &mut Ui, cv: &mut Canvas, over_game: bool) {
         }
         Screen::Settings => paint_settings(ui, cv, full, s, over_game),
         Screen::AddGame => paint_add(ui, cv, full, s),
+    }
+}
+
+fn cv_rect(cv: &Canvas) -> Rect {
+    Rect::new(0.0, 0.0, cv.w as f32, cv.h as f32)
+}
+
+// ---- removing a game --------------------------------------------------------
+
+/// The question asked before a game is removed.
+///
+/// It names what will go — the bundle *and* the saves — because both do, and
+/// because a library is the only record you have of either. Cancel holds the
+/// focus: the answer that destroys something should never be the one a stray
+/// Enter gives you.
+fn paint_confirm_delete(ui: &mut Ui, cv: &mut Canvas, screen: Rect, s: f32) {
+    let Some(i) = ui.deleting else { return };
+    let Some(g) = ui.games.get(i) else { return };
+    let title = g.title.clone();
+    let saves = g.saves.len();
+
+    cv.fill(screen, t::SCRIM);
+
+    let w = (520.0 * s).min(screen.w - 40.0 * s);
+    let h = 230.0 * s;
+    let d = Rect::new((screen.w - w) / 2.0, (screen.h - h) / 2.0, w, h);
+    shadow(cv, d, t::RADIUS * 1.6, 20.0 * s);
+    cv.rounded(d, t::RADIUS * 1.6, t::SURFACE);
+    cv.stroke(d, t::RADIUS * 1.6, 1.0, t::BORDER);
+
+    let x = d.x + 28.0 * s;
+    ui.fonts.draw_top(
+        cv,
+        &format!("Remove {title}?"),
+        x,
+        d.y + 26.0 * s,
+        Weight::Bold,
+        22.0 * s,
+        t::TEXT,
+    );
+    let detail = match saves {
+        0 => "The game and its files will be deleted.".to_string(),
+        1 => "The game, its files and 1 save will be deleted.".to_string(),
+        n => format!("The game, its files and {n} saves will be deleted."),
+    };
+    ui.fonts.draw_top(
+        cv,
+        &detail,
+        x,
+        d.y + 62.0 * s,
+        Weight::Regular,
+        14.5 * s,
+        t::TEXT_DIM,
+    );
+    ui.fonts.draw_top(
+        cv,
+        "This cannot be undone.",
+        x,
+        d.y + 84.0 * s,
+        Weight::Regular,
+        14.5 * s,
+        t::TEXT_OFF,
+    );
+
+    // Buttons, bottom-right: Cancel then Remove, so the safe one is nearer.
+    let bh = 42.0 * s;
+    let by = d.y + d.h - bh - 24.0 * s;
+    let rm_w = ui.fonts.width("Remove", Weight::Bold, 15.0 * s) + 40.0 * s;
+    let ca_w = ui.fonts.width("Cancel", Weight::Bold, 15.0 * s) + 40.0 * s;
+    let rm = Rect::new(d.x + d.w - 28.0 * s - rm_w, by, rm_w, bh);
+    let ca = Rect::new(rm.x - 10.0 * s - ca_w, by, ca_w, bh);
+
+    let yes = ui.delete_yes;
+    // The destructive button carries the warning colour only when it is the one
+    // that is actually armed.
+    cv.rounded(rm, 8.0, if yes { t::DANGER } else { t::SURFACE_HI });
+    cv.stroke(rm, 8.0, 1.0, if yes { t::DANGER } else { t::BORDER });
+    ui.fonts.draw_centered(
+        cv,
+        "Remove",
+        rm.x,
+        rm.w,
+        rm.y + 11.0 * s,
+        Weight::Bold,
+        15.0 * s,
+        if yes {
+            Color::rgb(0xFF, 0xF2, 0xF5)
+        } else {
+            t::TEXT
+        },
+    );
+    ui.push_hot(rm, Hit::ConfirmYes);
+
+    cv.rounded(ca, 8.0, if yes { t::SURFACE_HI } else { t::ACCENT });
+    cv.stroke(ca, 8.0, 1.0, if yes { t::BORDER } else { t::ACCENT });
+    ui.fonts.draw_centered(
+        cv,
+        "Cancel",
+        ca.x,
+        ca.w,
+        ca.y + 11.0 * s,
+        Weight::Bold,
+        15.0 * s,
+        if yes {
+            t::TEXT
+        } else {
+            Color::rgb(0x1A, 0x0C, 0x14)
+        },
+    );
+    ui.push_hot(ca, Hit::ConfirmNo);
+
+    ui.fonts.draw_top(
+        cv,
+        "Arrows choose    Enter confirm    Esc cancel",
+        x,
+        d.y + 116.0 * s,
+        Weight::Regular,
+        13.0 * s,
+        t::TEXT_OFF,
+    );
+}
+
+/// A trash can, drawn from rectangles — there is no icon font here, and one glyph
+/// is not worth becoming a reason to add one.
+fn trash_icon(cv: &mut Canvas, r: Rect, c: Color, bg: Color) {
+    let w = r.w;
+    let h = r.h;
+    let lid_h = (h * 0.12).max(1.0);
+    // Handle.
+    cv.rounded(
+        Rect::new(r.x + w * 0.34, r.y, w * 0.32, lid_h * 1.4),
+        1.0,
+        c,
+    );
+    // Lid.
+    cv.rounded(Rect::new(r.x, r.y + lid_h * 1.6, w, lid_h), 1.0, c);
+    // Body.
+    let body = Rect::new(r.x + w * 0.12, r.y + lid_h * 3.0, w * 0.76, h - lid_h * 3.2);
+    cv.rounded(body, 2.0, c);
+    // Two slots, punched back out in the card's colour beneath.
+    let slot_w = (w * 0.07).max(1.0);
+    for k in 0..2 {
+        let sx = body.x + body.w * (0.32 + 0.36 * k as f32) - slot_w / 2.0;
+        cv.rounded(
+            Rect::new(sx, body.y + body.h * 0.2, slot_w, body.h * 0.55),
+            0.5,
+            bg,
+        );
     }
 }
 
@@ -295,6 +453,24 @@ fn paint_card(ui: &mut Ui, cv: &mut Canvas, card: Rect, i: usize, sel: bool, s: 
 
     if sel {
         cv.stroke(card, t::RADIUS, 2.0, t::ACCENT);
+
+        // The trash, on the card the cursor is on — and only that one, so a
+        // library of covers is not also a row of little buttons to misclick.
+        // Hovering a card selects it, so with a mouse this is "on hover"; with the
+        // keyboard it follows the selection, which is where Delete would act
+        // anyway.
+        let d = 30.0 * s;
+        let btn = Rect::new(card.x + card.w - d - 8.0 * s, card.y + 8.0 * s, d, d);
+        cv.rounded(btn, d / 2.0, t::BG.alpha(235));
+        cv.stroke(btn, d / 2.0, 1.0, t::BORDER);
+        let g = d * 0.26;
+        trash_icon(
+            cv,
+            Rect::new(btn.x + g, btn.y + g * 0.95, d - 2.0 * g, d - 2.0 * g),
+            t::TEXT,
+            t::BG,
+        );
+        ui.push_hot(btn, Hit::Trash(i));
     }
 }
 

@@ -29,6 +29,8 @@ pub enum Key {
     Overlay,
     /// Ctrl+V. The UI cannot read a clipboard; it asks the host to.
     Paste,
+    /// Offer to remove the game the cursor is on.
+    Delete,
 }
 
 /// What the host must go and do. The UI itself performs nothing: it has no idea
@@ -57,6 +59,9 @@ pub enum Action {
     /// Put the clipboard's text in the link field. Only the host can read a
     /// clipboard, so the UI can only ask.
     Paste,
+    /// Remove a game, and everything of it: the bundle and the saves. Only ever
+    /// raised from a confirmation the player answered.
+    DeleteGame(usize),
 }
 
 pub struct SaveView {
@@ -102,11 +107,15 @@ pub struct AddState {
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Hit {
     Game(usize),
+    /// The trash button on a game's card.
+    Trash(usize),
     Add,
     Action(usize),
     Save(usize),
     Exe(usize),
     Paste,
+    ConfirmYes,
+    ConfirmNo,
 }
 
 pub struct Ui {
@@ -128,6 +137,12 @@ pub struct Ui {
     pub add: AddState,
     /// A transient line under the actions ("Saved.", "Could not save.").
     pub message: Option<String>,
+    /// The game a delete has been offered for, and is waiting on an answer to.
+    /// Nothing is removed until this is answered yes.
+    pub deleting: Option<usize>,
+    /// Which button the confirmation has focus on. Starts on Cancel: the
+    /// dangerous answer should never be the one a stray Enter gives.
+    delete_yes: bool,
 
     /// Filled by paint; read by the mouse. Cleared each frame.
     hot: Vec<(Rect, Hit)>,
@@ -152,6 +167,8 @@ impl Ui {
             can_save: true,
             add: AddState::default(),
             message: None,
+            deleting: None,
+            delete_yes: false,
             hot: Vec::new(),
             cols: 1,
             scroll: 0,
@@ -213,6 +230,11 @@ impl Ui {
 
     pub fn key(&mut self, k: Key) -> Action {
         self.message = None;
+        // A confirmation is modal on purpose: while it is up, nothing behind it
+        // can be reached, by key or by click.
+        if self.deleting.is_some() {
+            return self.key_confirm(k);
+        }
         match self.screen {
             Screen::Library => self.key_library(k),
             Screen::Game => self.key_game(k),
@@ -223,6 +245,32 @@ impl Ui {
                 Action::None
             }
             Screen::AddGame => self.key_add(k),
+        }
+    }
+
+    fn key_confirm(&mut self, k: Key) -> Action {
+        match k {
+            Key::Left | Key::Right => self.delete_yes = !self.delete_yes,
+            Key::Escape => self.deleting = None,
+            Key::Enter => {
+                let game = self.deleting.take();
+                if self.delete_yes {
+                    if let Some(i) = game {
+                        return Action::DeleteGame(i);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// Offer to remove the game at `game`. Answering is the only way anything is
+    /// actually deleted.
+    fn offer_delete(&mut self, game: usize) {
+        if game < self.games.len() {
+            self.deleting = Some(game);
+            self.delete_yes = false;
         }
     }
 
@@ -263,6 +311,7 @@ impl Ui {
                     self.action = self.first_enabled_action();
                 }
             }
+            Key::Delete => self.offer_delete(self.game),
             // In the library with a game paused behind us, Escape goes back to it
             // rather than killing it.
             Key::Escape | Key::Overlay => {
@@ -429,6 +478,18 @@ impl Ui {
                     Hit::Action(_) | Hit::Save(_) => self.activate(),
                     Hit::Exe(i) => Action::PickExe(i),
                     Hit::Paste => Action::Paste,
+                    Hit::Trash(i) => {
+                        self.offer_delete(i);
+                        Action::None
+                    }
+                    Hit::ConfirmYes => {
+                        self.delete_yes = true;
+                        self.key(Key::Enter)
+                    }
+                    Hit::ConfirmNo => {
+                        self.deleting = None;
+                        Action::None
+                    }
                 }
             }
             None => Action::None,
@@ -450,6 +511,11 @@ impl Ui {
                 self.save = i;
             }
             Hit::Exe(i) => self.add.exe_idx = i,
+            // Hovering the trash must not arm it — only pressing it opens the
+            // question.
+            Hit::Trash(i) => self.game = i,
+            Hit::ConfirmYes => self.delete_yes = true,
+            Hit::ConfirmNo => self.delete_yes = false,
             Hit::Paste => {}
         }
     }
@@ -755,6 +821,73 @@ mod tests {
             u.key(Key::Enter),
             Action::AddUrl("http://x/g.zip".to_string())
         );
+    }
+
+    #[test]
+    fn removing_a_game_takes_an_answer_and_defaults_to_not() {
+        let mut u = ui(&[("Zeliard", 2), ("Pop", 0)]);
+        let mut cv = Canvas::new(1280, 800);
+        u.paint(&mut cv, false);
+
+        // The trash is on the card the cursor is on, and only that one.
+        assert!(painted(&u, Hit::Trash(0)));
+        assert!(
+            !painted(&u, Hit::Trash(1)),
+            "only the selected card has one"
+        );
+
+        // Pressing it asks, and asks nothing of the filesystem.
+        let (r, _) = *u.hot.iter().find(|(_, h)| *h == Hit::Trash(0)).unwrap();
+        assert_eq!(u.click(r.x + r.w / 2.0, r.y + r.h / 2.0), Action::None);
+        assert_eq!(u.deleting, Some(0));
+
+        // Enter straight away must NOT delete: the focus starts on Cancel, so the
+        // dangerous answer is never the one a stray keypress gives.
+        assert_eq!(u.key(Key::Enter), Action::None);
+        assert_eq!(u.deleting, None, "the question is answered either way");
+
+        // Escape cancels too.
+        u.key(Key::Delete);
+        assert_eq!(u.deleting, Some(0));
+        assert_eq!(u.key(Key::Escape), Action::None);
+        assert_eq!(u.deleting, None);
+
+        // Choosing Remove, and only that, asks the host to delete it.
+        u.key(Key::Delete);
+        u.key(Key::Right); // Cancel -> Remove
+        assert_eq!(u.key(Key::Enter), Action::DeleteGame(0));
+        assert_eq!(u.deleting, None);
+    }
+
+    #[test]
+    fn the_confirmation_is_modal() {
+        // While the question is up, nothing behind it can be reached — by key or by
+        // click. A click meant for the dialog must never fall through onto a card.
+        let mut u = ui(&[("Zeliard", 0), ("Pop", 0)]);
+        let mut cv = Canvas::new(1280, 800);
+        u.paint(&mut cv, false);
+        let (card, _) = *u.hot.iter().find(|(_, h)| *h == Hit::Game(1)).unwrap();
+
+        u.key(Key::Delete);
+        u.paint(&mut cv, false);
+        assert!(
+            !painted(&u, Hit::Game(1)),
+            "the library stopped being clickable"
+        );
+        assert!(painted(&u, Hit::ConfirmYes) && painted(&u, Hit::ConfirmNo));
+
+        // Clicking where a card used to be does nothing at all.
+        assert_eq!(
+            u.click(card.x + card.w / 2.0, card.y + card.h / 2.0),
+            Action::None
+        );
+        assert_eq!(u.screen, Screen::Library);
+        assert_eq!(u.deleting, Some(0), "still waiting on an answer");
+
+        // Arrows drive the dialog, not the grid.
+        assert_eq!(u.game, 0);
+        u.key(Key::Right);
+        assert_eq!(u.game, 0, "the grid did not move behind the dialog");
     }
 
     #[test]

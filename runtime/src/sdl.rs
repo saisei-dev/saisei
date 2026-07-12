@@ -224,6 +224,7 @@ const SDL_SCANCODE_UP: i32 = 82;
 const SDLK_RETURN: i32 = b'\r' as i32;
 const SDLK_ESCAPE: i32 = 27;
 const SDLK_BACKSPACE: i32 = 8;
+const SDLK_DELETE: i32 = 127;
 const SDLK_TAB: i32 = 9;
 const SDLK_V: i32 = b'v' as i32;
 const SDLK_1: i32 = b'1' as i32;
@@ -1199,6 +1200,8 @@ pub const UI_KEY_OVERLAY: c_int = 8;
 /// Ctrl+V (Cmd+V on a Mac). A pasted link never arrives as typed text, so it has
 /// to be asked for.
 pub const UI_KEY_PASTE: c_int = 9;
+/// Delete. Offers to remove the game the cursor is on.
+pub const UI_KEY_DELETE: c_int = 10;
 
 #[repr(C)]
 pub struct UiEvent {
@@ -1312,6 +1315,7 @@ pub extern "C" fn saisei_ui_poll(out: *mut UiEvent) -> bool {
                     SDLK_ESCAPE => UI_KEY_ESCAPE,
                     SDLK_BACKSPACE => UI_KEY_BACKSPACE,
                     SDLK_F12 => UI_KEY_OVERLAY,
+                    SDLK_DELETE => UI_KEY_DELETE,
                     _ => 0,
                 };
                 if code != 0 {

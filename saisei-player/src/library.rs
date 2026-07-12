@@ -34,6 +34,39 @@ pub fn games(root: &Path) -> Vec<Game> {
     out
 }
 
+/// Remove a game: its bundle, its build directory, and its saves.
+///
+/// All three, because all three are the game — a bundle left behind would come
+/// straight back in the library, and saves left behind would attach themselves to
+/// whatever was added under the same name next. The player is told exactly this
+/// before being asked to confirm.
+///
+/// `saves` is passed in rather than taken from `saves_root()`, and that is not
+/// ceremony: the saves live outside the repo, under the user's data directory, so
+/// a version of this that reached for them itself would delete a *real* person's
+/// saves the moment a test called it with a plausible-looking key. (It did. That
+/// is how this signature came to be.) Now the only thing that can name the real
+/// save store is the caller who means to.
+///
+/// `key` is a bundle directory name and nothing else: it is joined onto the roots
+/// below and never used as a path, so it cannot climb out of them.
+pub fn delete_game(root: &Path, saves: &Path, key: &str) -> Result<(), String> {
+    if key.is_empty() || key.contains('/') || key.contains('\\') || key.contains("..") {
+        return Err(format!("not a game: {key}"));
+    }
+    let bundle = root.join("games").join(key);
+    if !bundle.join(format!("{key}.json")).is_file() {
+        return Err(format!("no game called '{key}'"));
+    }
+    std::fs::remove_dir_all(&bundle).map_err(|e| format!("{}: {e}", bundle.display()))?;
+    // The build dir and the saves are best-effort: with the bundle gone the game
+    // is gone from the library either way, and failing here would only leave the
+    // player looking at an error about something they cannot see.
+    std::fs::remove_dir_all(root.join("build").join(key)).ok();
+    std::fs::remove_dir_all(saves.join(key)).ok();
+    Ok(())
+}
+
 // ---- saves ------------------------------------------------------------------
 
 /// Where a player's saves live.
@@ -221,5 +254,59 @@ mod tests {
     #[test]
     fn iso8601_is_zero_padded() {
         assert_eq!(iso8601(1_709_164_800), "2024-02-29T00:00:00Z");
+    }
+
+    /// A sandbox with two games in it, each with a save.
+    fn two_games(tag: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("saisei_{tag}_{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let saves = root.join("saves");
+        for g in ["gone", "kept"] {
+            let bundle = root.join("games").join(g);
+            std::fs::create_dir_all(bundle.join("DATA")).unwrap();
+            std::fs::write(bundle.join(format!("{g}.json")), b"{}").unwrap();
+            std::fs::write(bundle.join("DATA/x.dat"), b"x").unwrap();
+            std::fs::create_dir_all(root.join("build").join(g).join("jit")).unwrap();
+            std::fs::create_dir_all(saves.join(g).join("20260101-000000")).unwrap();
+            std::fs::write(saves.join(g).join("20260101-000000/pre_last_key.bin"), b"m").unwrap();
+        }
+        (root, saves)
+    }
+
+    #[test]
+    fn delete_game_removes_the_bundle_its_build_dir_and_its_saves() {
+        let (root, saves) = two_games("del");
+
+        delete_game(&root, &saves, "gone").unwrap();
+        assert!(!root.join("games/gone").exists(), "the bundle is gone");
+        assert!(!root.join("build/gone").exists(), "and its build dir");
+        assert!(!saves.join("gone").exists(), "and its saves");
+
+        // And nothing of the other game was touched. This is the whole reason
+        // `saves` is a parameter: a version that reached for the real save store
+        // itself deleted a real game's saves the first time a test ran.
+        assert!(root.join("games/kept/kept.json").is_file());
+        assert!(root.join("build/kept").exists());
+        assert!(saves
+            .join("kept/20260101-000000/pre_last_key.bin")
+            .is_file());
+
+        // A second removal is an error, not a silent success — the game is not there.
+        assert!(delete_game(&root, &saves, "gone").is_err());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn delete_game_refuses_anything_that_is_not_a_bundle_name() {
+        let (root, saves) = two_games("del2");
+        // `key` is joined onto games/, build/ and the save store, so it must never
+        // be able to climb out of them.
+        for bad in ["", "..", "../../etc", "a/b", "..\\x", "../kept"] {
+            assert!(delete_game(&root, &saves, bad).is_err(), "accepted {bad:?}");
+        }
+        assert!(root.join("games/kept/kept.json").is_file());
+        assert!(saves.join("kept").exists());
+        std::fs::remove_dir_all(&root).ok();
     }
 }

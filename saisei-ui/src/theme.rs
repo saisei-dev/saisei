@@ -38,3 +38,7 @@ pub const SCRIM: Color = Color(0x0B, 0x07, 0x0B, 0x73);
 
 /// Corner radius for cards and buttons.
 pub const RADIUS: f32 = 10.0;
+
+/// Removal. Warm enough to belong to the same palette, red enough that nobody
+/// presses it by accident.
+pub const DANGER: Color = Color::rgb(0xD9, 0x45, 0x53);
