@@ -212,6 +212,7 @@ extern "C" {
     static isr_depth: u8;
     static mut stderr: *mut libc::FILE;
 
+    fn shim_stdout_logging_enabled() -> c_int;
     fn shim_kbd_state_capture(out: *mut ShimKbdState);
     fn shim_kbd_state_restore(inp: *const ShimKbdState);
     fn shim_active_binary() -> *const c_char;
@@ -629,13 +630,20 @@ pub extern "C" fn snapshot_write_to_bundle(dir: *const c_char) {
 
 extern "C" fn dump_exit_snapshot() {
     unsafe {
-        /* Markers via raw write() so they appear even if stdout is weird. */
-        const ENTER: &[u8] = b"[ATEXIT] snapshot dump_exit_snapshot enter\n";
-        let _ = libc::write(2, ENTER.as_ptr() as *const c_void, ENTER.len());
+        /* Markers via raw write() so they appear even if stdout is weird, but
+         * only under --verbose: they are developer diagnostics, and a player
+         * quitting a game should see nothing. */
+        let verbose = shim_stdout_logging_enabled() != 0;
+        if verbose {
+            const ENTER: &[u8] = b"[ATEXIT] snapshot dump_exit_snapshot enter\n";
+            let _ = libc::write(2, ENTER.as_ptr() as *const c_void, ENTER.len());
+        }
         if SNAP_PRESENT == 0 {
-            const SKIP: &[u8] =
-                b"[ATEXIT] snapshot: snap_present=0 (no key was consumed); skipping\n";
-            let _ = libc::write(2, SKIP.as_ptr() as *const c_void, SKIP.len());
+            if verbose {
+                const SKIP: &[u8] =
+                    b"[ATEXIT] snapshot: snap_present=0 (no key was consumed); skipping\n";
+                let _ = libc::write(2, SKIP.as_ptr() as *const c_void, SKIP.len());
+            }
             return;
         }
         let dir = c"last_exit_snapshot".as_ptr();
@@ -645,16 +653,18 @@ extern "C" fn dump_exit_snapshot() {
         shim_crash_bundle_write_state(dir);
         shim_crash_bundle_write_trace_tail(dir);
         shim_lifecycle_dump_to_dir(dir);
-        let mut tail = [0 as c_char; 160];
-        let n = libc::snprintf(
-            tail.as_mut_ptr(),
-            160,
-            c"[ATEXIT] snapshot wrote %s/ (snap from t=%llu us)\n".as_ptr(),
-            dir,
-            SNAP_CPU.elapsed_us as c_ulonglong,
-        );
-        if n > 0 {
-            let _ = libc::write(2, tail.as_ptr() as *const c_void, n as usize);
+        if verbose {
+            let mut tail = [0 as c_char; 160];
+            let n = libc::snprintf(
+                tail.as_mut_ptr(),
+                160,
+                c"[ATEXIT] snapshot wrote %s/ (snap from t=%llu us)\n".as_ptr(),
+                dir,
+                SNAP_CPU.elapsed_us as c_ulonglong,
+            );
+            if n > 0 {
+                let _ = libc::write(2, tail.as_ptr() as *const c_void, n as usize);
+            }
         }
     }
 }

@@ -1564,6 +1564,13 @@ pub unsafe extern "C" fn shim_set_stdout_logging_enabled(enabled: c_int) {
     shim_stdout_enabled = if enabled != 0 { 1 } else { 0 };
 }
 
+/// The `--verbose` gate, for diagnostics that write straight to stderr instead
+/// of going through `shim_log_stdout`.
+#[no_mangle]
+pub unsafe extern "C" fn shim_stdout_logging_enabled() -> c_int {
+    shim_stdout_enabled
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn shim_enable_stdout_logging() {
     shim_set_stdout_logging_enabled(1);
@@ -1644,8 +1651,16 @@ unsafe fn io_port_error(func: *const c_char, port: u16) {
 /// Exit-time execution stats: retired guest instructions vs host wall time.
 /// Under `--speedup N` (pacing mostly idle) host-MIPS approximates raw
 /// execution capability; at speedup 1 it just re-states real-time pacing.
+/// Developer diagnostics, so it is silent unless `--verbose` is on — a player
+/// quitting a game should see nothing. (The FIFO 0x1E report is an explicit
+/// console request and still prints either way.)
 extern "C" fn report_retired_at_exit() {
-    unsafe { shim_perf_report(cstr!("exit")) }
+    unsafe {
+        if shim_stdout_enabled == 0 {
+            return;
+        }
+        shim_perf_report(cstr!("exit"))
+    }
 }
 
 #[cfg(feature = "force_exit_after_10s")]
