@@ -564,6 +564,42 @@ fn extra_instructions__pushf_popf() {
         src.contains("r.set_sp((r.sp().wrapping_add(2)) & 0xFFFF);"),
         "{src}"
     );
+    // POPF can raise IF, so it must arm interrupt recognition for the next block
+    // boundary — without this the recognition point is left to wherever the
+    // budget expires, which a guest loop can capture in an IF=0 window forever.
+    assert!(src.contains("irq_arm();"), "{src}");
+}
+
+// STI raises IF: it must arm recognition (and still shadow the one instruction
+// that follows it).
+#[test]
+fn extra_instructions__sti_arms_interrupt_recognition() {
+    let func = json!({
+        "start": 0x0000,
+        "instructions": [
+            {"address": 0x0000, "mnemonic": "cli", "op_str": "", "bytes": "FA"},
+            {"address": 0x0001, "mnemonic": "sti", "op_str": "", "bytes": "FB"},
+            {"address": 0x0002, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
+        ],
+    });
+    let src = render_rs(&func, &[], "");
+    assert!(src.contains("set_IF(0);"), "{src}");
+    assert!(src.contains("set_IF(1);"), "{src}");
+    assert!(src.contains("set_interrupt_shadow(1);"), "{src}");
+    assert!(src.contains("irq_arm();"), "{src}");
+    // CLI only shuts the gate — nothing to recognize.
+    let cli_only = render_rs(
+        &json!({
+            "start": 0x0000,
+            "instructions": [
+                {"address": 0x0000, "mnemonic": "cli", "op_str": "", "bytes": "FA"},
+                {"address": 0x0001, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
+            ],
+        }),
+        &[],
+        "",
+    );
+    assert!(!cli_only.contains("irq_arm();"), "{cli_only}");
 }
 
 #[test]

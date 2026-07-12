@@ -1601,6 +1601,9 @@ impl RRenderer {
             "    set_DF(((flags >> 10) & 1) as u8);".into(),
             "    set_OF(((flags >> 11) & 1) as u8);".into(),
             "    set_sp((sp().wrapping_add(2)) & 0xFFFF);".into(),
+            // POPF can raise IF, and unlike STI it creates no shadow: a waiting
+            // interrupt is recognizable at the very next boundary. Arm it.
+            "    irq_arm();".into(),
             "}".into(),
         ])
     }
@@ -2154,7 +2157,13 @@ impl RRenderer {
             "cmc" => self.simple(&["set_CF(CF() ^ 1);"]),
             "stc" => self.simple(&["set_CF(1);"]),
             "cli" => self.simple(&["set_IF(0);"]),
-            "sti" => self.simple(&["set_IF(1);", "set_interrupt_shadow(1);"]),
+            // STI raises IF, so a waiting interrupt becomes recognizable at the
+            // next instruction boundary — arm the safepoint (irq_arm) or the
+            // recognition point is left to wherever the budget happens to
+            // expire, which a `cli`..`sti` loop can capture in its IF=0 window
+            // forever. The shadow still suppresses the boundary immediately
+            // after STI itself.
+            "sti" => self.simple(&["set_IF(1);", "set_interrupt_shadow(1);", "irq_arm();"]),
             "cwde" => self.simple(&["set_ax(((al() as i8) as i16) as u16);"]),
             "cdq" => self.simple(&["set_dx(if (ax() & 0x8000) != 0 { 0xFFFF } else { 0 });"]),
             "iret" => self.simple(&["iret_();"]),

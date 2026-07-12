@@ -435,6 +435,56 @@ fn test_pit_free_runs_during_isr_but_defers_delivery() {
 }
 
 // ---------------------------------------------------------------------------
+// 52b. test_irq_recheck_arms_the_next_block_boundary
+//      (Zeliard long-INT-61h freeze guard — the other half of test 52)
+// ---------------------------------------------------------------------------
+// Test 52 pins that delivery is DEFERRED while the gate is shut. That deferral
+// is only safe if the deferred IRQ is recognized the moment the gate REOPENS.
+// Delivery is only attempted where the instruction budget expires, and
+// safe_point_impl REFILLS the budget — so any region where the gate is shut can
+// CAPTURE the expiry (a handler longer than one quantum; a `cli`..`sti` window),
+// after which every safepoint sees the gate shut and the tick starves forever.
+// Every gate-opening transition must therefore retire the budget so the next
+// block head is a safepoint. And it must FOLD first: the unspent remainder is
+// not executed time and must not be billed to the virtual clock.
+#[test]
+fn test_irq_recheck_arms_the_next_block_boundary() {
+    let _g = shim_common::guard();
+    let lib = ShimLib::load();
+    unsafe {
+        let irq_recheck: unsafe extern "C" fn() = lib.func("shim_irq_recheck");
+        let budget = lib.global_ptr::<i64>("jit_instr_budget");
+        let last_refill = lib.global_ptr::<i64>("jit_budget_last_refill");
+        let vnow = lib.global_ptr::<u64>("virtual_now_accum_ns");
+        let ns_per_instr = lib.read_global::<u64>("jit_ns_per_instr");
+
+        // A tick latched: retire the budget so the next block head takes the
+        // slow path and delivers, instead of waiting out a full fresh quantum.
+        *lib.global_ptr::<u8>("irq0_pending") = 1;
+        *budget = 900;
+        *last_refill = 1024;
+        let vnow_before = *vnow;
+        irq_recheck();
+        assert_eq!(*budget, 0, "a pending IRQ must retire the budget");
+        assert_eq!(*last_refill, 0, "the fold point must follow the budget");
+        // Exactly the 124 units actually consumed (1024 -> 900) are billed — the
+        // 900 unspent units are NOT.
+        assert_eq!(
+            *vnow - vnow_before,
+            124 * ns_per_instr,
+            "only consumed budget may advance the virtual clock"
+        );
+
+        // Nothing pending: no reason to force a safepoint.
+        *lib.global_ptr::<u8>("irq0_pending") = 0;
+        *budget = 700;
+        *last_refill = 700;
+        irq_recheck();
+        assert_eq!(*budget, 700, "no pending IRQ must not disturb the budget");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 53. test_safe_point_accumulates_fractional_pit_cycles
 // ---------------------------------------------------------------------------
 #[test]

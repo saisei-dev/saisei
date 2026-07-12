@@ -68,6 +68,12 @@ extern "C" {
     static mut stack_write_ring_pos: u32;
     static mut isr_depth: u8;
     static mut lcall_depth: u8;
+    // Interrupt-recognition arming (see irq_arm below): the two latches that say
+    // "an interrupt is waiting to be taken". Read inline so the common case (no
+    // interrupt pending) costs a load and a not-taken branch.
+    static mut irq0_pending: u8;
+    static mut irq_pending_count: u32;
+    fn shim_irq_recheck();
     // Virtual-clock state (runtime/src/timer.rs) for the inline forensic
     // timestamp; mirrors shim_virtual_now_ns exactly.
     static vclock_state: i32;
@@ -187,6 +193,29 @@ fn stack_ring_record(kind: u8, seg: u16, off: u16, value: u16) {
 #[inline(always)]
 pub fn set_interrupt_shadow(v: u8) {
     unsafe { interrupt_shadow = v; }
+}
+
+/// Arm interrupt recognition: emitted after every instruction that can turn IF
+/// from 0 to 1 (STI, POPF). The CPU takes a waiting interrupt at the first
+/// instruction boundary where the gate is open; our only recognition point is a
+/// safepoint, and a safepoint only happens where the instruction budget expires.
+/// Those are different boundaries, and the difference is not benign: the budget
+/// expiry can be *captured* inside a region where the gate is shut (a long ISR,
+/// a `cli`..`sti` window), because safe_point_impl refills the budget there, so
+/// the next expiry lands in the same shut region again — and the interrupt then
+/// starves forever. Arming here forces the next block head to be a safepoint, so
+/// recognition lands on the boundary the CPU would have used.
+///
+/// The runtime side does the same at every OTHER transition that can open the
+/// gate (see shim_irq_recheck); together those cover the gate's inputs, so no
+/// guest control-flow shape can hide the recognition point.
+#[inline(always)]
+pub fn irq_arm() {
+    unsafe {
+        if irq0_pending != 0 || irq_pending_count != 0 {
+            shim_irq_recheck();
+        }
+    }
 }
 
 /// Per-basic-block safepoint poll: debit the block's summed per-class

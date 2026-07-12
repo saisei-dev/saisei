@@ -702,25 +702,60 @@ unsafe extern "C" fn crash_signal_handler(signum: c_int) {
     libc::raise(signum);
 }
 
+/// Sink for the freeze sampler: stderr (so a tap shows up live in the terminal)
+/// AND an appended `freeze.log` in the game's run dir, next to lifecycle.log —
+/// a terminal scrollback is not an artifact, and a wedged run is exactly when
+/// the sample must survive. Both calls are async-signal-safe.
+unsafe fn freeze_diag_write(buf: *const c_char, len: usize) {
+    static mut log_fd: c_int = -2;
+    let err_fd = libc::fileno(stderr);
+    libc::write(err_fd, buf as *const c_void, len);
+    libc::fsync(err_fd);
+    if log_fd == -2 {
+        log_fd = libc::open(
+            cstr!("freeze.log"),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND | libc::O_CLOEXEC,
+            0o644 as c_int,
+        );
+    }
+    if log_fd >= 0 {
+        libc::write(log_fd, buf as *const c_void, len);
+        libc::fsync(log_fd);
+    }
+}
+
 /// Repeatable, NON-fatal freeze sampler (SIGUSR1). Unlike the crash handler,
 /// this returns and lets the guest keep running, so `kill -USR1 <pid>` can be
 /// tapped several times against a wedged game to trace a spin loop. It reports
 /// the live cs:ip, the last I/O port touched + the access counter (a spin on a
 /// status port pins the port while the counter races between taps), and the
 /// depth/flag state that distinguishes a spin from a blocked wait.
+///
+/// `retired`/`sp_visits` are the honest "is the guest running at all" signal:
+/// cs:ip lives in a chunk-local `Regs` and only reaches the global cpu struct at
+/// a spill (safepoint / FFI), so a frozen `ip` between taps can mean either a
+/// wedged dispatcher or merely a spin whose safepoint keeps landing on the same
+/// block. Retired instructions cannot lie: +0 across taps means no guest code
+/// executed, which is OUR bug, not a guest spin.
 unsafe extern "C" fn freeze_diag_handler(_signum: c_int) {
     static mut last_counter: u64 = 0;
     static mut last_ip_linear: u32 = 0;
+    static mut last_retired: u64 = 0;
+    static mut last_sp_visits: u64 = 0;
     let ip_lin = ((cs() as u32) << 4) + ip() as u32;
     let delta = io_access_counter.wrapping_sub(last_counter);
     let ip_moved = ip_lin != last_ip_linear;
+    let retired_delta = jit_total_retired.wrapping_sub(last_retired);
+    let sp_delta = perf_sp_visits.wrapping_sub(last_sp_visits);
     last_counter = io_access_counter;
     last_ip_linear = ip_lin;
-    let mut buf = [0u8; 512];
+    last_retired = jit_total_retired;
+    last_sp_visits = perf_sp_visits;
+    let mut buf = [0u8; 640];
     let n = libc::snprintf(
         buf.as_mut_ptr() as *mut c_char,
         buf.len(),
-        cstr!("[FREEZE-DIAG] cs:ip=%04X:%04X lin=0x%05X  last_io=%s 0x%04X  io_count=%llu (+%llu since last tap)  ip_moved=%d  isr=%u disp=%u crit=%u lcall=%u IF=%d  ss:sp=%04X:%04X ds=%04X es=%04X ax=%04X bx=%04X\n"),
+        cstr!("[FREEZE-DIAG] cs:ip=%04X:%04X lin=0x%05X  last_io=%s 0x%04X  io_count=%llu (+%llu since last tap)  retired=+%llu sp_visits=+%llu  ip_moved=%d  isr=%u disp=%u crit=%u lcall=%u IF=%d  ss:sp=%04X:%04X ds=%04X es=%04X ax=%04X bx=%04X\n"),
         cs() as c_uint,
         ip() as c_uint,
         ip_lin as c_uint,
@@ -728,6 +763,8 @@ unsafe extern "C" fn freeze_diag_handler(_signum: c_int) {
         last_io_port as c_uint,
         io_access_counter as c_ulonglong,
         delta as c_ulonglong,
+        retired_delta as c_ulonglong,
+        sp_delta as c_ulonglong,
         ip_moved as c_int,
         isr_depth as c_uint,
         dispatch_depth as c_uint,
@@ -742,14 +779,12 @@ unsafe extern "C" fn freeze_diag_handler(_signum: c_int) {
         bx() as c_uint,
     );
     if n > 0 {
-        let err_fd = libc::fileno(stderr);
         let len = if (n as usize) < buf.len() {
             n as usize
         } else {
             buf.len()
         };
-        libc::write(err_fd, buf.as_ptr() as *const c_void, len);
-        libc::fsync(err_fd);
+        freeze_diag_write(buf.as_ptr() as *const c_char, len);
     }
     // Second line: the timer/clock/interrupt state that decides whether an
     // interrupt-driven wait can ever complete. A loop polling an ISR-set flag
@@ -768,11 +803,11 @@ unsafe extern "C" fn freeze_diag_handler(_signum: c_int) {
     let ff1a = *seg_off(ds(), 0xFF1A);
     let ff1d = *seg_off(ds(), 0xFF1D);
     let ff1e = *seg_off(ds(), 0xFF1E);
-    let mut b2 = [0u8; 512];
+    let mut b2 = [0u8; 768];
     let n2 = libc::snprintf(
         b2.as_mut_ptr() as *mut c_char,
         b2.len(),
-        cstr!("[FREEZE-DIAG]   vclock=%d vnow=%llu (+%llu)  irq0_pending=%u last_int=0x%02X  pit0.reload=%u bios_tick=%u  INT61->%04X:%04X INT08->%04X:%04X  RCB[FF1A]=%02X [FF1D]=%02X [FF1E]=%02X\n"),
+        cstr!("[FREEZE-DIAG]   vclock=%d vnow=%llu (+%llu)  irq0_pending=%u last_int=0x%02X  pit0.reload=%u bios_tick=%u  INT61->%04X:%04X INT08->%04X:%04X  irq0: delivered=%llu blocked[shadow=%llu isr=%llu IF=%llu crit=%llu other=%llu]  RCB[FF1A]=%02X [FF1D]=%02X [FF1E]=%02X\n"),
         vclock_state as c_int,
         vnow as c_ulonglong,
         vnow_delta as c_ulonglong,
@@ -782,17 +817,21 @@ unsafe extern "C" fn freeze_diag_handler(_signum: c_int) {
         bios_tick as c_uint,
         v61_seg as c_uint, v61_off as c_uint,
         v08_seg as c_uint, v08_off as c_uint,
+        perf_irq0_delivered as c_ulonglong,
+        perf_irq0_blk_shadow as c_ulonglong,
+        perf_irq0_blk_isr as c_ulonglong,
+        perf_irq0_blk_if as c_ulonglong,
+        perf_irq0_blk_crit as c_ulonglong,
+        perf_irq0_blk_other as c_ulonglong,
         ff1a as c_uint, ff1d as c_uint, ff1e as c_uint,
     );
     if n2 > 0 {
-        let err_fd = libc::fileno(stderr);
         let len = if (n2 as usize) < b2.len() {
             n2 as usize
         } else {
             b2.len()
         };
-        libc::write(err_fd, b2.as_ptr() as *const c_void, len);
-        libc::fsync(err_fd);
+        freeze_diag_write(b2.as_ptr() as *const c_char, len);
     }
 }
 
@@ -1865,7 +1904,8 @@ pub static mut irq_pending: [u8; 256] = [0; 256];
 /// interrupt-delivery tail scanned all 256 slots on EVERY emulated instruction;
 /// this lets it skip the scan when nothing is scheduled (the overwhelmingly
 /// common case). Maintained in lockstep with `irq_pending` everywhere it changes.
-static mut irq_pending_count: u32 = 0;
+#[no_mangle]
+pub static mut irq_pending_count: u32 = 0;
 #[no_mangle]
 pub static mut last_host_time_ns: u64 = 0;
 static mut isr_expected_sp: [u16; 256] = [0; 256];
@@ -2192,6 +2232,8 @@ pub unsafe extern "C" fn critical_section_exit(
         critical_owner_file = ptr::null();
         critical_owner_func = ptr::null();
         critical_owner_line = 0;
+        // Leaving the outermost critical section opens the delivery gate.
+        shim_irq_recheck();
     }
 }
 
@@ -2201,6 +2243,9 @@ pub unsafe extern "C" fn shim_dos_input_wait_begin(saved_crit: *mut u8, saved_if
     *saved_if = IF();
     critical_depth = 0;
     set_IF(1);
+    // Dropping the critical section and forcing IF=1 opens the delivery gate —
+    // the point of a DOS input wait is that interrupts keep flowing through it.
+    shim_irq_recheck();
 }
 
 #[no_mangle]
@@ -2446,6 +2491,8 @@ pub unsafe extern "C" fn shim_invoke_far_call(
         }
     }
     isr_depth -= 1;
+    // The far callback returning drops isr_depth, which opens the delivery gate.
+    shim_irq_recheck();
     set_cs(s_cs);
     set_ip(s_ip);
     set_ss(s_ss);
@@ -2655,6 +2702,46 @@ unsafe fn invoke_isr(
         set_ds(saved_ds);
         set_es(saved_es);
     }
+
+    shim_irq_recheck();
+}
+
+/// Arm interrupt recognition at the next basic-block boundary.
+///
+/// THE INVARIANT: a waiting interrupt is taken at the first instruction boundary
+/// where the delivery gate is open. The gate has exactly four inputs —
+///
+///     deliver ⟺ pending ∧ IF ∧ ¬shadow ∧ isr_depth==0 ∧ critical_depth==0
+///
+/// — but our only recognition point is a safepoint, and a safepoint happens
+/// where the instruction BUDGET expires. Those are different boundaries, and the
+/// difference is not benign, because `safe_point_impl` REFILLS the budget: if
+/// the expiry lands in a region where the gate is shut, the fresh quantum is
+/// spent there too, and the next expiry lands in the same kind of region again.
+/// The recognition point gets *captured* by any guest shape that correlates with
+/// a gate input, and the interrupt then starves FOREVER. Zeliard hit it via the
+/// ISR (a ~237Hz PIT and an INT 61h service longer than one quantum: every
+/// safepoint saw isr_depth>0, so INT 08 never ran again); a `cli`..`sti` loop
+/// captures it identically via IF, and the shadow branch below via ¬shadow.
+///
+/// So this is called at EVERY transition that can open the gate — the closed set
+/// of them, which is what makes the bug class gone rather than this one game
+/// fixed:
+///   • IF 0→1     — `sti`, `popf` (emitted inline: rt::irq_arm), `iret`
+///   • isr_depth→0 — an ISR or far-callback returning
+///   • critical_depth→0 — a runtime critical section ending
+///   • ¬shadow    — the shadow being consumed at a safepoint
+/// Retiring the budget makes the next block head a safepoint, so recognition
+/// lands on the boundary the CPU would have used. Folding through
+/// `shim_time_sync` first is what keeps it honest: the UNSPENT remainder is not
+/// executed time and must not be billed to the virtual clock.
+#[no_mangle]
+pub unsafe extern "C" fn shim_irq_recheck() {
+    if (irq0_pending != 0 || irq_pending_count > 0) && jit_instr_budget > 0 {
+        shim_time_sync();
+        jit_instr_budget = 0;
+        jit_budget_last_refill = 0;
+    }
 }
 
 #[no_mangle]
@@ -2744,6 +2831,17 @@ static mut pacing_virtual_anchor_ns: u64 = 0;
 static mut last_stdin_poll_host_ns: u64 = 0;
 // perf counters (dumped by FIFO opcode 0x1E and the exit report)
 static mut perf_sp_visits: u64 = 0;
+// Why a latched IRQ0 did not get delivered at a safepoint. A stuck `irq0_pending`
+// means the guest's timer handler never runs, which stalls anything the guest
+// clocks off it; these partition the veto exhaustively (shadow / in-ISR / IF=0 /
+// critical section / another interrupt ahead of it) so the culprit is read off a
+// freeze sample instead of guessed at.
+static mut perf_irq0_delivered: u64 = 0;
+static mut perf_irq0_blk_shadow: u64 = 0;
+static mut perf_irq0_blk_isr: u64 = 0;
+static mut perf_irq0_blk_if: u64 = 0;
+static mut perf_irq0_blk_crit: u64 = 0;
+static mut perf_irq0_blk_other: u64 = 0;
 static mut perf_sync_calls: u64 = 0;
 static mut perf_pacing_sleeps: u64 = 0;
 static mut perf_pacing_slept_ns: u64 = 0;
@@ -2970,7 +3068,17 @@ pub unsafe extern "C" fn safe_point_impl(_file: *const c_char, func: *const c_ch
     }
 
     if interrupt_shadow != 0 {
+        // The shadow suppresses recognition for ONE instruction — not for a
+        // whole fresh quantum. Consuming it here and returning on a refilled
+        // budget means the next recognition point is up to a quantum away, and a
+        // guest that STIs more often than that (a `cli`..`sti` loop) re-arms the
+        // shadow before every safepoint and starves the interrupt forever. Arm
+        // the next block head instead.
         interrupt_shadow = 0;
+        if irq0_pending != 0 {
+            perf_irq0_blk_shadow += 1;
+        }
+        shim_irq_recheck();
         return;
     }
 
@@ -3259,6 +3367,19 @@ pub unsafe extern "C" fn safe_point_impl(_file: *const c_char, func: *const c_ch
             }
         }
     }
+    if irq0_pending != 0 {
+        // Exhaustive partition of the veto, in the same order the gate below
+        // tests it — exactly one bucket is charged per skipped safepoint.
+        if isr_depth != 0 {
+            perf_irq0_blk_isr += 1;
+        } else if IF() == 0 {
+            perf_irq0_blk_if += 1;
+        } else if critical_depth != 0 {
+            perf_irq0_blk_crit += 1;
+        } else if pending_int != 0xFF {
+            perf_irq0_blk_other += 1;
+        }
+    }
     if pending_int == 0xFF
         && irq0_pending != 0
         && IF() != 0
@@ -3267,6 +3388,7 @@ pub unsafe extern "C" fn safe_point_impl(_file: *const c_char, func: *const c_ch
     {
         pending_int = 0x08;
         irq0_pending = 0;
+        perf_irq0_delivered += 1;
         pending_release_tick();
     }
     if IF() != 0 && isr_depth == 0 && critical_depth == 0 && pending_int != 0xFF {
@@ -9443,7 +9565,6 @@ pub unsafe extern "C" fn iret_impl(file: *const c_char, func: *const c_char, lin
     set_IF(((flags >> 9) & 1) as u8);
     set_DF(((flags >> 10) & 1) as u8);
     set_OF(((flags >> 11) & 1) as u8);
-    let _ = old_if;
     // IRET does NOT create an interrupt shadow. Only STI, MOV SS and POP SS
     // inhibit interrupt recognition for the following instruction on x86; after
     // an IRET that re-enables IF, a pending maskable interrupt is recognized
@@ -9458,6 +9579,11 @@ pub unsafe extern "C" fn iret_impl(file: *const c_char, func: *const c_char, lin
     // instruction, consumed the shadow, and the one after delivered the IRQ.)
     set_cs(seg);
     set_ip(new_ip);
+    // IRET can raise IF (0->1 from the popped flags), which opens the delivery
+    // gate — so the next block boundary must be a recognition point.
+    if old_if == 0 && IF() != 0 {
+        shim_irq_recheck();
+    }
 }
 
 #[no_mangle]
