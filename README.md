@@ -14,7 +14,7 @@ Packed, overlay-swapped, and self-modifying games all just work, because Saisei 
 
 ## Start playing
 
-Two things to install — SDL2, for the window, and Rust. Then build:
+Two things to install — SDL2, for the window, and Rust. Then build once, and run it:
 
 ```bash
 # Debian/Ubuntu:  sudo apt install build-essential libsdl2-dev
@@ -22,20 +22,28 @@ Two things to install — SDL2, for the window, and Rust. Then build:
 # Rust:           https://rustup.rs
 
 cargo build --release                      # fetches the pinned toolchain itself
-export PATH="$PWD/target/release:$PATH"    # or just run target/release/saisei
+export PATH="$PWD/target/release:$PATH"    # or run ./target/release/saisei directly
+
+saisei                                     # your library
 ```
 
-Then just run it:
+### Your library
 
-```bash
-saisei
-```
+<img src="docs/img/library.png" alt="The Saisei library: a grid of game covers" width="100%">
 
-That opens your library. To put a game in it, grab one from an abandonware archive like [My Abandonware](https://www.myabandonware.com/) and **drop the zip on the window** — or paste the link into *Add game*. Saisei unpacks it, asks which executable starts the game if there's more than one, and it's in your library from then on. Pick it and it plays, compiling each part of the game to native code the moment control reaches it. No config files, no flags to weigh.
+**To add a game, drop its zip on the window** — or paste a link into *Add game*. Grab one from an abandonware archive like [My Abandonware](https://www.myabandonware.com/); Saisei unpacks it, asks which executable starts the game if there's more than one, and it's yours from then on. No config files, no flags to weigh.
 
-While you're playing, **F12** brings up the menu over the paused game: save where you are, jump back into an earlier save, switch to another game, or just close it and carry on. Saves keep a picture of the moment you made them, so you can tell one from another.
+Pick a game and it plays, compiling each part of it to native code the moment control reaches it. Games you've played wear the last moment you saw them as their cover.
 
-<sub>(F12 rather than a more obvious chord because GNOME and KDE grab most of those for themselves, and a shortcut the desktop eats is a feature that doesn't exist.)</sub>
+### While you're playing
+
+<img src="docs/img/overlay.png" alt="The in-game menu, over a paused game" width="100%">
+
+**Press F12** and the game stops dead behind a menu. Save where you are, drop back into an earlier save, start over, switch to another game, or just close it and carry on exactly where you were. Every save keeps a picture of the moment you made it, so you can tell one from another at a glance.
+
+The game really is stopped — not slowed, not skipping — and it can't tell that any time passed, so nothing lurches when you come back.
+
+<sub>(F12 rather than something more obvious because GNOME and KDE grab most chords for themselves, and a shortcut the desktop eats is a feature that doesn't exist.)</sub>
 
 ### Doing more than playing
 
