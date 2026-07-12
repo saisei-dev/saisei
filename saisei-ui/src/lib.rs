@@ -221,14 +221,31 @@ impl Ui {
     }
 
     fn key_library(&mut self, k: Key) -> Action {
-        // The "+ Add game" tile sits after the games, and is selectable.
-        let n = self.games.len() + 1;
+        // "Add game" is a button in the header, above the grid, and it keeps the
+        // index just past the last game. So Up out of the top row reaches it and
+        // Down comes back down — which is where it actually is on screen.
+        let n = self.games.len();
+        let add = n;
         let cols = self.cols.max(1);
         match k {
             Key::Left => self.game = self.game.saturating_sub(1),
-            Key::Right => self.game = (self.game + 1).min(n - 1),
-            Key::Up => self.game = self.game.saturating_sub(cols),
-            Key::Down => self.game = (self.game + cols).min(n - 1),
+            Key::Right => self.game = (self.game + 1).min(add),
+            Key::Up => {
+                if self.game != add {
+                    self.game = if self.game < cols {
+                        add
+                    } else {
+                        self.game - cols
+                    };
+                }
+            }
+            Key::Down => {
+                self.game = if self.game == add {
+                    0
+                } else {
+                    (self.game + cols).min(n.saturating_sub(1))
+                };
+            }
             Key::Enter => {
                 if self.game >= self.games.len() {
                     self.screen = Screen::AddGame;
@@ -623,39 +640,84 @@ mod tests {
         assert_eq!(u.screen, Screen::AddGame);
     }
 
+    fn painted(u: &Ui, h: Hit) -> bool {
+        u.hot.iter().any(|(_, x)| *x == h)
+    }
+
+    #[test]
+    fn add_game_is_on_screen_however_many_games_there_are() {
+        // It used to be the last tile of the grid, so the more games you had the
+        // further down it slid — and past a screenful it was off the bottom, which
+        // made the one way to add a game the one thing you could not see. It lives
+        // in the header now, so no amount of scrolling can take it away.
+        for count in [0usize, 3, 24] {
+            let games: Vec<(&str, usize)> = (0..count).map(|_| ("Game", 0)).collect();
+            let mut u = ui(&games);
+            let mut cv = Canvas::new(1280, 800);
+            u.paint(&mut cv, false);
+            assert!(painted(&u, Hit::Add), "Add missing with {count} games");
+        }
+    }
+
     #[test]
     fn a_library_taller_than_the_window_scrolls_to_keep_the_cursor_in_view() {
-        // Enough games that the grid cannot fit, and "Add game" — the last tile —
-        // is below the fold. It must still be reachable, or there is no way left
-        // to add a game at all.
         let games: Vec<(&str, usize)> = (0..24).map(|_| ("Game", 0)).collect();
         let mut u = ui(&games);
         let mut cv = Canvas::new(1280, 800);
         u.paint(&mut cv, false);
-
-        let painted = |u: &Ui, h: Hit| u.hot.iter().any(|(_, x)| *x == h);
         assert!(painted(&u, Hit::Game(0)), "the first row is on screen");
-        assert!(!painted(&u, Hit::Add), "Add starts below the fold");
 
-        // Walk to the very end.
+        // Walk to the last game.
         for _ in 0..30 {
             u.key(Key::Down);
         }
-        assert_eq!(u.game, 24, "the cursor lands on the Add tile");
         u.paint(&mut cv, false);
-        assert!(painted(&u, Hit::Add), "Add scrolled into view");
+        assert!(
+            painted(&u, Hit::Game(23)),
+            "the last row scrolled into view"
+        );
         assert!(
             !painted(&u, Hit::Game(0)),
             "the first row scrolled off the top"
         );
+        assert!(
+            painted(&u, Hit::Add),
+            "the header button never scrolls away"
+        );
 
-        // ...and back to the top.
-        for _ in 0..30 {
+        // ...and back up to the top row (one Up per row above us).
+        let rows = 24usize.div_ceil(u.cols);
+        for _ in 0..rows - 1 {
             u.key(Key::Up);
         }
         u.paint(&mut cv, false);
         assert_eq!(u.scroll, 0);
         assert!(painted(&u, Hit::Game(0)));
+
+        // One more Up leaves the grid for the button — and must not drag the grid
+        // back down to wherever the last game was.
+        u.key(Key::Up);
+        assert_eq!(u.game, 24);
+        u.paint(&mut cv, false);
+        assert_eq!(u.scroll, 0, "the Add button is not in any row");
+    }
+
+    #[test]
+    fn up_from_the_top_row_reaches_add_game_and_down_comes_back() {
+        // The button sits above the grid, so that is where the cursor should find
+        // it — and Down must come back into the grid rather than trapping you.
+        let mut u = ui(&[("A", 0), ("B", 0), ("C", 0)]);
+        let mut cv = Canvas::new(1280, 800);
+        u.paint(&mut cv, false); // establishes the column count
+
+        u.key(Key::Up);
+        assert_eq!(u.game, 3, "Up out of the grid lands on Add game");
+        assert_eq!(u.key(Key::Enter), Action::None);
+        assert_eq!(u.screen, Screen::AddGame);
+
+        u.screen = Screen::Library;
+        u.key(Key::Down);
+        assert_eq!(u.game, 0, "Down comes back into the grid");
     }
 
     #[test]

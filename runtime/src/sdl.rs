@@ -1121,6 +1121,12 @@ pub extern "C" fn virtual_display_present(
                 *dst.add((x * 3 + 2) as usize) = vga6_to_8(b6);
             }
         }
+        // Re-assert the guest's logical space. A menu that was up turned it off
+        // (see `saisei_ui_begin`), and the game's frame must never be drawn in
+        // window pixels — it would stretch out of its aspect and lose its
+        // letterboxing.
+        SDL_RenderSetLogicalSize(RENDERER, TEXTURE_W, TEXTURE_H);
+
         // RGB_BUFFER now holds exactly what the window is about to show, mode
         // already resolved. A save's thumbnail is taken from here.
         LAST_FRAME_W = w;
@@ -1373,6 +1379,28 @@ unsafe fn ensure_ui_texture(w: c_int, h: c_int) -> bool {
     true
 }
 
+/// Hand the window to a menu.
+///
+/// This turns the renderer's *logical size* off, and that is not a drawing detail
+/// — it is what makes the mouse work. A renderer with a logical size set does not
+/// only scale what you draw: SDL also rewrites the coordinates of every mouse
+/// event into that logical space. While a game is running the logical size is the
+/// guest's 320x200, so an overlay drawn in window pixels would be hit-testing
+/// against pointer positions expressed in *guest* pixels, letterboxed — and every
+/// click would land somewhere else, or nowhere. (Which is exactly what happened:
+/// the mouse worked in the library, where no game texture exists and no logical
+/// size is ever set, and did nothing at all in the in-game overlay.)
+///
+/// `virtual_display_repaint` puts it back when the menu closes.
+#[no_mangle]
+pub extern "C" fn saisei_ui_begin() {
+    unsafe {
+        if !RENDERER.is_null() {
+            SDL_RenderSetLogicalSize(RENDERER, 0, 0);
+        }
+    }
+}
+
 /// Put a painted UI frame on screen.
 ///
 /// With `over_game`, the game's last frame is drawn underneath first — the guest
@@ -1385,10 +1413,10 @@ pub extern "C" fn saisei_ui_present(rgba: *const u8, w: c_int, h: c_int, over_ga
         if RENDERER.is_null() || rgba.is_null() {
             return;
         }
-        // The UI is laid out in window pixels, so it must not be squeezed into
-        // the guest's logical space. Turn logical scaling off for the duration
-        // and put it back before the game's next present, which relies on it for
-        // its aspect and letterboxing.
+        // The UI is laid out in window pixels, so it must not be squeezed into the
+        // guest's logical space. It is left off on the way out, too — see
+        // `saisei_ui_begin`: mouse events are rewritten into whatever logical space
+        // is active when they are pumped, and the menu is still up.
         SDL_RenderSetLogicalSize(RENDERER, 0, 0);
         SDL_SetRenderDrawColor(RENDERER, 0, 0, 0, 255);
         SDL_RenderClear(RENDERER);
@@ -1404,10 +1432,6 @@ pub extern "C" fn saisei_ui_present(rgba: *const u8, w: c_int, h: c_int, over_ga
             SDL_RenderCopy(RENDERER, UI_TEXTURE, core::ptr::null(), core::ptr::null());
         }
         SDL_RenderPresent(RENDERER);
-
-        if !TEXTURE.is_null() {
-            SDL_RenderSetLogicalSize(RENDERER, TEXTURE_W, TEXTURE_H);
-        }
     }
 }
 

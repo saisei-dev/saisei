@@ -81,6 +81,43 @@ fn paint_library(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
         t::TEXT_DIM,
     );
 
+    // Add game: a real button, in the header, always on screen.
+    //
+    // It used to be the last tile of the grid, which meant that the more games you
+    // had the further it slid down — and past a screenful it was off the bottom
+    // entirely, so the one way to add a game was the one thing you couldn't see.
+    // Up here it is never scrolled away and never competes with the games.
+    let add_sel = ui.game == ui.games.len();
+    let label = "+  Add game";
+    let bw = ui.fonts.width(label, Weight::Bold, 15.0 * s) + 34.0 * s;
+    let btn = Rect::new(r.x + r.w - bw, r.y + 2.0 * s, bw, 42.0 * s);
+    cv.rounded(
+        btn,
+        21.0 * s,
+        if add_sel { t::ACCENT } else { t::SURFACE_HI },
+    );
+    cv.stroke(
+        btn,
+        21.0 * s,
+        1.0,
+        if add_sel { t::ACCENT } else { t::BORDER },
+    );
+    ui.fonts.draw_centered(
+        cv,
+        label,
+        btn.x,
+        btn.w,
+        btn.y + 11.0 * s,
+        Weight::Bold,
+        15.0 * s,
+        if add_sel {
+            Color::rgb(0x1A, 0x0C, 0x14)
+        } else {
+            t::TEXT
+        },
+    );
+    ui.push_hot(btn, Hit::Add);
+
     let top = r.y + 84.0 * s;
     let gap = 22.0 * s;
     let card_w = 250.0 * s;
@@ -90,19 +127,44 @@ fn paint_library(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
     let cols = (((r.w + gap) / (card_w + gap)).floor() as usize).max(1);
     ui.cols = cols;
 
-    let n = ui.games.len() + 1; // + the "Add game" tile
+    let n = ui.games.len();
+    if n == 0 {
+        ui.fonts.draw_top(
+            cv,
+            "Nothing here yet.",
+            r.x,
+            top + 20.0 * s,
+            Weight::Bold,
+            20.0 * s,
+            t::TEXT_DIM,
+        );
+        ui.fonts.draw_top(
+            cv,
+            "Drop a game's zip on this window, or choose Add game.",
+            r.x,
+            top + 52.0 * s,
+            Weight::Regular,
+            15.0 * s,
+            t::TEXT_OFF,
+        );
+        hint(ui, cv, r, s, "Enter add a game    Esc quit");
+        return;
+    }
     let rows = n.div_ceil(cols);
 
-    // Scroll by whole rows, keeping the cursor on screen. Without this the grid
-    // simply stops at the bottom edge — and since "Add game" is the *last* tile,
-    // a library with enough games in it would hide the only way to add another.
+    // Scroll by whole rows, keeping the cursor on screen.
     let avail = (r.y + r.h - 30.0 * s) - top; // 30: the hint line at the foot
     let per_screen = (((avail + gap) / (card_h + gap)).floor() as usize).clamp(1, rows);
-    let sel_row = ui.game / cols;
-    if sel_row < ui.scroll {
-        ui.scroll = sel_row;
-    } else if sel_row >= ui.scroll + per_screen {
-        ui.scroll = sel_row + 1 - per_screen;
+    // Only follow the cursor while it is in the grid. On the Add button it is not
+    // in any row, and dragging the grid to wherever the last game happens to be
+    // would scroll the library for no reason the player can see.
+    if ui.game < n {
+        let sel_row = ui.game / cols;
+        if sel_row < ui.scroll {
+            ui.scroll = sel_row;
+        } else if sel_row >= ui.scroll + per_screen {
+            ui.scroll = sel_row + 1 - per_screen;
+        }
     }
     ui.scroll = ui.scroll.min(rows.saturating_sub(per_screen));
 
@@ -114,14 +176,8 @@ fn paint_library(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
         let x = r.x + col as f32 * (card_w + gap);
         let y = top + (row - ui.scroll) as f32 * (card_h + gap);
         let card = Rect::new(x, y, card_w, card_h);
-        let sel = ui.game == i;
-        if i < ui.games.len() {
-            paint_card(ui, cv, card, i, sel, s, cover_h);
-            ui.push_hot(card, Hit::Game(i));
-        } else {
-            paint_add_tile(ui, cv, card, sel, s);
-            ui.push_hot(card, Hit::Add);
-        }
+        paint_card(ui, cv, card, i, ui.game == i, s, cover_h);
+        ui.push_hot(card, Hit::Game(i));
     }
 
     if rows > per_screen {
@@ -131,7 +187,7 @@ fn paint_library(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
             cv,
             &of,
             r.x + r.w - w,
-            r.y + 8.0 * s,
+            r.y + 54.0 * s,
             Weight::Regular,
             12.5 * s,
             t::TEXT_OFF,
@@ -218,38 +274,6 @@ fn paint_card(ui: &mut Ui, cv: &mut Canvas, card: Rect, i: usize, sel: bool, s: 
     if sel {
         cv.stroke(card, t::RADIUS, 2.0, t::ACCENT);
     }
-}
-
-fn paint_add_tile(ui: &mut Ui, cv: &mut Canvas, card: Rect, sel: bool, s: f32) {
-    cv.rounded(card, t::RADIUS, t::SURFACE.alpha(140));
-    cv.stroke(
-        card,
-        t::RADIUS,
-        1.0,
-        if sel { t::ACCENT } else { t::BORDER },
-    );
-    let c = if sel { t::ACCENT } else { t::TEXT_DIM };
-    let px = 40.0 * s;
-    let w = ui.fonts.width("+", Weight::Regular, px);
-    ui.fonts.draw_top(
-        cv,
-        "+",
-        card.x + (card.w - w) / 2.0,
-        card.y + card.h / 2.0 - 44.0 * s,
-        Weight::Regular,
-        px,
-        c,
-    );
-    ui.fonts.draw_centered(
-        cv,
-        "Add game",
-        card.x,
-        card.w,
-        card.y + card.h / 2.0 + 8.0 * s,
-        Weight::Bold,
-        15.0 * s,
-        c,
-    );
 }
 
 // ---- a game's page (and the overlay) ----------------------------------------

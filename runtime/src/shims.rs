@@ -3264,7 +3264,9 @@ pub extern "C" fn saisei_request_overlay() {
 
 unsafe fn maybe_enter_overlay(now_ns: u64) {
     use crate::save_manager::save_manager_can_save_now;
-    use crate::sdl::{saisei_ui_release, virtual_display_release_keys, virtual_display_repaint};
+    use crate::sdl::{
+        saisei_ui_begin, saisei_ui_release, virtual_display_release_keys, virtual_display_repaint,
+    };
 
     let savable = save_manager_can_save_now() != 0;
     if !savable && now_ns.saturating_sub(OVERLAY_ARMED_AT_NS) < OVERLAY_SAVEPOINT_WAIT_NS {
@@ -3280,6 +3282,10 @@ unsafe fn maybe_enter_overlay(now_ns: u64) {
     // player was holding, or it will still be held when we resume — and F12 itself
     // must never reach the game.
     virtual_display_release_keys();
+    // Hand the window to the menu *before* it sees a single event: SDL rewrites
+    // mouse coordinates into the renderer's logical space, and the guest's is not
+    // the one the menu is laid out in.
+    saisei_ui_begin();
     vclock_halt();
     overlay(savable);
     vclock_resume();
