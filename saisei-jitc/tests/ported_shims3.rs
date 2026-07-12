@@ -398,8 +398,14 @@ fn test_iret_does_not_set_interrupt_shadow() {
 // clock whenever a guest spent its time in interrupt handlers — Alley Cat's
 // `sub ah,ah; int 1Ah` tick-poll delay (a software interrupt every iteration)
 // kept the per-block budget depleting inside the handler, so the tick never
-// advanced and the delay never ended. So: the tick advances here, irq0 latches
-// as pending, but IRQ0 DELIVERY is still deferred until isr_depth returns to 0.
+// advanced and the delay never ended. So: the tick advances, and irq0 latches.
+//
+// What DEFERS the delivery is the hardware's own rule, not `isr_depth`: a
+// handler is entered with IF=0, so nothing is recognized until it STIs or
+// IRETs. (`isr_depth` used to gate this. It was the wrong proxy in both
+// directions — it also blocked delivery inside SOFTWARE interrupts, which put
+// nothing in service on a real 8259, and that is what starved Zeliard's timer
+// inside its INT 61h service. See the PIC tests below.)
 #[test]
 fn test_pit_free_runs_during_isr_but_defers_delivery() {
     let _g = shim_common::guard();
@@ -411,7 +417,9 @@ fn test_pit_free_runs_during_isr_but_defers_delivery() {
         let cpu = lib.cpu();
 
         set_timer_isr(0x1332, 0x0000);
-        (*cpu).flags.IF = 1;
+        // Inside a handler, before it re-enables interrupts: IF=0 is what holds
+        // the tick off.
+        (*cpu).flags.IF = 0;
         *lib.global_ptr::<u8>("isr_depth") = 1;
         let start_tick = read_u32(&lib, 0x46C);
 
@@ -428,7 +436,7 @@ fn test_pit_free_runs_during_isr_but_defers_delivery() {
             start_tick,
             read_u32(&lib, 0x46C)
         );
-        // Tick is pending but NOT delivered (delivery deferred while in the ISR).
+        // Tick is latched but NOT delivered — IF=0.
         assert_eq!(lib.read_global::<u8>("irq0_pending"), 1);
         assert_eq!(lib.read_global::<u8>("isr_depth"), 1);
     }
@@ -481,6 +489,123 @@ fn test_irq_recheck_arms_the_next_block_boundary() {
         *last_refill = 700;
         irq_recheck();
         assert_eq!(*budget, 700, "no pending IRQ must not disturb the budget");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 52c. 8259A PIC: mask register, in-service register, EOI
+// ---------------------------------------------------------------------------
+// None of this used to exist: `isr_depth` stood in for the in-service register,
+// the mask register was not modelled at all (a game that masked the timer still
+// got INT 08 from us), and EOI was a no-op.
+
+#[test]
+fn test_pic_mask_register_round_trips_and_blocks_delivery() {
+    let _g = shim_common::guard();
+    let lib = ShimLib::load();
+    unsafe {
+        let inb: unsafe extern "C" fn(u16) -> u8 = lib.func("inb");
+        let outb: unsafe extern "C" fn(u16, u8) = lib.func("outb");
+        let safe_point_impl: unsafe extern "C" fn(*const c_char, *const c_char, c_int) =
+            lib.func("safe_point_impl");
+        let cpu = lib.cpu();
+
+        // OCW1 round-trips: a guest reads back the mask it wrote.
+        outb(0x21, 0xB9);
+        assert_eq!(inb(0x21), 0xB9, "IMR must read back");
+
+        // IRQ0 masked (bit 0 set): a latched tick must NOT reach the CPU, even
+        // with IF=1 and nothing in service. We used to deliver it anyway.
+        (*cpu).flags.IF = 1;
+        *lib.global_ptr::<u8>("isr_depth") = 0;
+        *lib.global_ptr::<u8>("irq0_pending") = 1;
+        *lib.global_ptr::<i64>("jit_instr_budget") = 0;
+        safe_point_impl(cstr(EXT), cstr(SAFE_POINT), 0);
+        assert_eq!(
+            lib.read_global::<u8>("irq0_pending"),
+            1,
+            "a MASKED IRQ0 must stay latched, not be delivered"
+        );
+    }
+}
+
+#[test]
+fn test_pic_in_service_blocks_its_own_line_until_eoi() {
+    let _g = shim_common::guard();
+    let lib = ShimLib::load();
+    unsafe {
+        let outb: unsafe extern "C" fn(u16, u8) = lib.func("outb");
+        let inb: unsafe extern "C" fn(u16) -> u8 = lib.func("inb");
+        let safe_point_impl: unsafe extern "C" fn(*const c_char, *const c_char, c_int) =
+            lib.func("safe_point_impl");
+        let cpu = lib.cpu();
+
+        outb(0x21, 0xB8); // IRQ0 unmasked
+        (*cpu).flags.IF = 1;
+        *lib.global_ptr::<u8>("isr_depth") = 0;
+        *lib.global_ptr::<u8>("irq0_pending") = 1;
+        // IRQ0 already in service (its handler has not EOI'd yet): the line
+        // cannot re-enter itself. This is what `isr_depth` was standing in for,
+        // and unlike isr_depth it does not also block on SOFTWARE interrupts.
+        *lib.global_ptr::<u8>("pic_isr") = 0x01;
+        *lib.global_ptr::<i64>("jit_instr_budget") = 0;
+        safe_point_impl(cstr(EXT), cstr(SAFE_POINT), 0);
+        assert_eq!(
+            lib.read_global::<u8>("irq0_pending"),
+            1,
+            "IRQ0 must not be re-delivered while it is still in service"
+        );
+
+        // OCW3: read back the in-service register.
+        outb(0x20, 0x0B);
+        assert_eq!(inb(0x20), 0x01, "ISR read-back must show IRQ0 in service");
+
+        // Non-specific EOI clears the highest-priority line in service.
+        outb(0x20, 0x20);
+        assert_eq!(
+            lib.read_global::<u8>("pic_isr"),
+            0,
+            "EOI must clear in-service"
+        );
+    }
+}
+
+#[test]
+fn test_pic_icw_sequence_is_not_mistaken_for_a_mask_write() {
+    let _g = shim_common::guard();
+    let lib = ShimLib::load();
+    unsafe {
+        let outb: unsafe extern "C" fn(u16, u8) = lib.func("outb");
+        let inb: unsafe extern "C" fn(u16) -> u8 = lib.func("inb");
+
+        outb(0x21, 0xB8);
+        // ICW1 (bit4) starts an init sequence: the bytes that follow on 0x21 are
+        // ICW2 (vector base) / ICW3 / ICW4 — NOT the mask. Reading them as a mask
+        // would silently mask off live IRQ lines.
+        outb(0x20, 0x11); // ICW1: cascade, ICW4 to follow
+        outb(0x21, 0x50); // ICW2: vector base
+        outb(0x21, 0x04); // ICW3
+        outb(0x21, 0x01); // ICW4
+        assert_eq!(
+            inb(0x21),
+            0xB8,
+            "ICW bytes must not land in the mask register"
+        );
+        assert_eq!(
+            lib.read_global::<u8>("pic_vector_base"),
+            0x50,
+            "ICW2 sets the vector base: IRQ n becomes INT (base + n)"
+        );
+
+        // Back to normal: 0x21 is the mask again.
+        outb(0x21, 0xFE);
+        assert_eq!(inb(0x21), 0xFE);
+        // Restore the BIOS base so later tests in this process see a stock PIC.
+        outb(0x20, 0x11);
+        outb(0x21, 0x08);
+        outb(0x21, 0x04);
+        outb(0x21, 0x01);
+        outb(0x21, 0xB8);
     }
 }
 

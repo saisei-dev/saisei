@@ -807,7 +807,7 @@ unsafe extern "C" fn freeze_diag_handler(_signum: c_int) {
     let n2 = libc::snprintf(
         b2.as_mut_ptr() as *mut c_char,
         b2.len(),
-        cstr!("[FREEZE-DIAG]   vclock=%d vnow=%llu (+%llu)  irq0_pending=%u last_int=0x%02X  pit0.reload=%u bios_tick=%u  INT61->%04X:%04X INT08->%04X:%04X  irq0: delivered=%llu blocked[shadow=%llu isr=%llu IF=%llu crit=%llu other=%llu]  RCB[FF1A]=%02X [FF1D]=%02X [FF1E]=%02X\n"),
+        cstr!("[FREEZE-DIAG]   vclock=%d vnow=%llu (+%llu)  irq0_pending=%u last_int=0x%02X  pit0.reload=%u bios_tick=%u  INT61->%04X:%04X INT08->%04X:%04X  pic[imr=%02X isr=%02X base=%02X]  irq0: delivered=%llu blocked[shadow=%llu pic=%llu IF=%llu crit=%llu other=%llu]  RCB[FF1A]=%02X [FF1D]=%02X [FF1E]=%02X\n"),
         vclock_state as c_int,
         vnow as c_ulonglong,
         vnow_delta as c_ulonglong,
@@ -817,9 +817,12 @@ unsafe extern "C" fn freeze_diag_handler(_signum: c_int) {
         bios_tick as c_uint,
         v61_seg as c_uint, v61_off as c_uint,
         v08_seg as c_uint, v08_off as c_uint,
+        pic_imr as c_uint,
+        pic_isr as c_uint,
+        pic_vector_base as c_uint,
         perf_irq0_delivered as c_ulonglong,
         perf_irq0_blk_shadow as c_ulonglong,
-        perf_irq0_blk_isr as c_ulonglong,
+        perf_irq0_blk_pic as c_ulonglong,
         perf_irq0_blk_if as c_ulonglong,
         perf_irq0_blk_crit as c_ulonglong,
         perf_irq0_blk_other as c_ulonglong,
@@ -1908,6 +1911,110 @@ pub static mut irq_pending: [u8; 256] = [0; 256];
 pub static mut irq_pending_count: u32 = 0;
 #[no_mangle]
 pub static mut last_host_time_ns: u64 = 0;
+
+// ---------------------------------------------------------------------------
+// 8259A PIC (master). Ports 0x20 (command) / 0x21 (IMR).
+//
+// This is the register that decides whether a raised IRQ ever reaches the CPU,
+// and until now we modelled NONE of it: `isr_depth` stood in for the in-service
+// register, the mask register did not exist at all (a game that masked the timer
+// still got INT 08 from us), and EOI was a no-op. `isr_depth` is a bad proxy in
+// both directions — it counts SOFTWARE interrupts (INT 21h/61h put nothing in
+// service on a real 8259), and it misses the thing the hardware actually does:
+// hold a level in service until the handler acknowledges it.
+//
+// `irq0_pending` / `irq_pending[]` are the request latch (IRR); these are the
+// mask and in-service registers.
+//
+// Deliberately standalone statics, NOT fields of the snapshot structs: those are
+// #[repr(C)] FROZEN and serialized byte-for-byte, so growing them would
+// invalidate every existing save (same call as the PIT ch2 state).
+/// Interrupt mask: 1 = that IRQ line is masked off. Power-on default is the
+/// value the PC BIOS leaves behind — IRQ0 (timer), IRQ1 (keyboard), IRQ2
+/// (cascade) and IRQ6 (floppy) enabled, everything else masked.
+#[no_mangle]
+pub static mut pic_imr: u8 = 0xB8;
+/// In-service: bit n set from the INTA cycle that delivers IRQ n until the
+/// handler EOIs. This is what stops a handler being re-entered by its own line,
+/// and what blocks lower-priority lines while a higher one is being serviced.
+#[no_mangle]
+pub static mut pic_isr: u8 = 0;
+/// OCW3 read select: a subsequent IN 0x20 returns the ISR (1) or the IRR (0).
+static mut pic_read_isr: u8 = 0;
+/// IRQ n is delivered as INT (base + n). The BIOS sets base = 0x08; a guest may
+/// re-issue ICW1/ICW2 to move it, so don't hardcode the mapping.
+#[no_mangle]
+pub static mut pic_vector_base: u8 = 0x08;
+/// Position in an ICW1..ICW4 initialization sequence (0 = not initializing).
+/// Without this, the ICW2/3/4 bytes that follow ICW1 on port 0x21 would be
+/// misread as mask writes.
+static mut pic_icw_step: u8 = 0;
+static mut pic_icw_needs_icw4: u8 = 0;
+static mut pic_icw_single: u8 = 0;
+/// Slave 8259 (ports 0xA0/0xA1). No device we emulate sits on IRQ8-15, so this
+/// is state-only: it exists so a guest that reads back what it wrote sees its
+/// own value instead of an open-bus guess.
+static mut pic2_imr: u8 = 0xFF;
+static mut pic2_isr: u8 = 0;
+static mut pic2_read_isr: u8 = 0;
+
+/// The master-PIC line an INT vector belongs to, or None if it is not one.
+unsafe fn pic_irq_of_int(int_no: u8) -> Option<u8> {
+    let base = pic_vector_base;
+    if int_no >= base && int_no < base.wrapping_add(8) {
+        Some(int_no - base)
+    } else {
+        None
+    }
+}
+
+/// 8259 priority: IRQ0 is highest. A request is held off while any line of
+/// EQUAL or HIGHER priority is still in service — equal included, which is what
+/// keeps a handler from being re-entered by its own line before it EOIs.
+unsafe fn pic_can_deliver(irq: u8) -> bool {
+    if pic_imr & (1u8 << irq) != 0 {
+        return false;
+    }
+    let equal_or_higher = (((1u16 << (irq + 1)) - 1) & 0xFF) as u8;
+    pic_isr & equal_or_higher == 0
+}
+
+/// The INTA cycle: the delivered line goes in service until its handler EOIs.
+unsafe fn pic_ack(int_no: u8) {
+    if let Some(irq) = pic_irq_of_int(int_no) {
+        pic_isr |= 1u8 << irq;
+    }
+}
+
+/// The master's request latch, assembled from the pending flags for the lines we
+/// actually drive (IRQ0 timer, and whatever has been marked pending).
+unsafe fn pic_irr() -> u8 {
+    let mut irr = 0u8;
+    if irq0_pending != 0 {
+        irr |= 1;
+    }
+    if irq_pending_count > 0 {
+        for irq in 0..8u8 {
+            if irq_pending[(pic_vector_base.wrapping_add(irq)) as usize] != 0 {
+                irr |= 1u8 << irq;
+            }
+        }
+    }
+    irr
+}
+
+/// EOI (OCW2). Non-specific clears the highest-priority line in service;
+/// specific clears the named one. Clearing a level can unblock a lower-priority
+/// request, so this OPENS the delivery gate — arm a recognition point.
+unsafe fn pic_eoi(value: u8) {
+    if value & 0x40 != 0 {
+        pic_isr &= !(1u8 << (value & 0x07));
+    } else if pic_isr != 0 {
+        pic_isr &= pic_isr - 1; // clear lowest set bit == highest priority
+    }
+    shim_irq_recheck();
+}
+
 static mut isr_expected_sp: [u16; 256] = [0; 256];
 #[no_mangle]
 pub static mut lcall_depth: u8 = 0;
@@ -2526,6 +2633,31 @@ unsafe fn invoke_isr(
     line: c_int,
 ) {
     jit_instr_budget -= 30; // int + iret ≈ 59+38 cycles on a 386
+                            // Interrupts nest (that is the point of IF and the PIC's priority
+                            // levels), and each level costs a frame of native recursion through
+                            // resolve_and_run_chunk. `isr_expected_sp` is 256 deep and isr_depth is
+                            // a u8, so runaway nesting would wrap the counter and corrupt the stack
+                            // bookkeeping silently. A real machine would fault; fail loudly instead
+                            // of limping. Legitimate depth is small — the 8259 holds a line in
+                            // service until EOI, so a handler cannot be re-entered by its own line.
+    if isr_depth >= 200 {
+        let mut msg = [0u8; 256];
+        libc::snprintf(
+            msg.as_mut_ptr() as *mut c_char,
+            msg.len(),
+            cstr!("[BUG] interrupt nesting runaway: isr_depth=%u delivering int 0x%02X (a handler is not returning, or an IRQ is being re-delivered without an EOI)\n"),
+            isr_depth as c_uint,
+            int_no as c_uint,
+        );
+        shim_log_crash(cstr!("%s"), msg.as_ptr() as *const c_char);
+        save_bug_bundle(
+            cstr!("isr_nesting_runaway"),
+            ((cs() as u32) << 4) + ip() as u32,
+            msg.as_ptr() as *const c_char,
+        );
+        shim_flush_all_streams();
+        libc::exit(1);
+    }
     let saved_ss = ss();
     let saved_sp = sp();
     let mut saved_stack_word0: u16 = 0;
@@ -2838,7 +2970,7 @@ static mut perf_sp_visits: u64 = 0;
 // freeze sample instead of guessed at.
 static mut perf_irq0_delivered: u64 = 0;
 static mut perf_irq0_blk_shadow: u64 = 0;
-static mut perf_irq0_blk_isr: u64 = 0;
+static mut perf_irq0_blk_pic: u64 = 0;
 static mut perf_irq0_blk_if: u64 = 0;
 static mut perf_irq0_blk_crit: u64 = 0;
 static mut perf_irq0_blk_other: u64 = 0;
@@ -3351,62 +3483,76 @@ pub unsafe extern "C" fn safe_point_impl(_file: *const c_char, func: *const c_ch
         }
     }
 
+    // Pick the highest-priority request the 8259 would actually let through.
+    // The timer is IRQ0 — the HIGHEST priority line — so it is considered first;
+    // the old scan skipped 0x08 and preferred anything else, which inverted the
+    // priority of the timer against the keyboard.
+    let timer_int = pic_vector_base;
     let mut pending_int: u8 = 0xFF;
     let mut source: *const c_char = cstr!("<timer>");
+    if irq0_pending != 0 && pic_can_deliver(0) {
+        pending_int = timer_int;
+    }
     // Skip the 256-slot scan entirely when nothing is scheduled (Fix 1): this
     // ran on every emulated instruction and was the dominant per-instruction cost.
-    if irq_pending_count > 0 {
+    if pending_int == 0xFF && irq_pending_count > 0 {
         for i in 0..256 {
-            if i == 0x08 {
+            if i == timer_int as usize || irq_pending[i] == 0 {
                 continue;
             }
-            if irq_pending[i] != 0 {
-                pending_int = i as u8;
-                source = cstr!("<interrupt>");
-                break;
+            // A hardware line only reaches the CPU if the PIC lets it: not
+            // masked, and no equal-or-higher line still in service. Vectors that
+            // are not PIC lines at all are software-scheduled and pass straight
+            // through.
+            if let Some(irq) = pic_irq_of_int(i as u8) {
+                if !pic_can_deliver(irq) {
+                    continue;
+                }
             }
+            pending_int = i as u8;
+            source = cstr!("<interrupt>");
+            break;
         }
     }
+    // Delivery gate. NOTE there is no `isr_depth` term: being inside a handler
+    // is not what the hardware gates on — a SOFTWARE interrupt (INT 21h/61h)
+    // puts nothing in service on the 8259, and a hardware handler is protected
+    // from its own line by IF=0 on entry plus its in-service bit until it EOIs.
+    // Nested interrupts are legal and routine, and `isr_depth` blocking them was
+    // what starved Zeliard's timer inside its INT 61h service.
+    let gate_open = IF() != 0 && critical_depth == 0;
     if irq0_pending != 0 {
-        // Exhaustive partition of the veto, in the same order the gate below
-        // tests it — exactly one bucket is charged per skipped safepoint.
-        if isr_depth != 0 {
-            perf_irq0_blk_isr += 1;
-        } else if IF() == 0 {
+        // Exhaustive partition of the veto — exactly one bucket per skipped
+        // safepoint, so a freeze sample names the culprit instead of guessing.
+        if IF() == 0 {
             perf_irq0_blk_if += 1;
         } else if critical_depth != 0 {
             perf_irq0_blk_crit += 1;
-        } else if pending_int != 0xFF {
+        } else if !pic_can_deliver(0) {
+            perf_irq0_blk_pic += 1;
+        } else if pending_int != timer_int {
             perf_irq0_blk_other += 1;
         }
     }
-    if pending_int == 0xFF
-        && irq0_pending != 0
-        && IF() != 0
-        && isr_depth == 0
-        && critical_depth == 0
-    {
-        pending_int = 0x08;
-        irq0_pending = 0;
-        perf_irq0_delivered += 1;
-        pending_release_tick();
-    }
-    if IF() != 0 && isr_depth == 0 && critical_depth == 0 && pending_int != 0xFF {
-        if pending_int != 0x08 {
-            if irq_pending[pending_int as usize] != 0 {
-                irq_pending_count = irq_pending_count.saturating_sub(1);
-            }
-            irq_pending[pending_int as usize] = 0;
-        }
-        let preserve_regs = 1;
-        if pending_int == 0x08 {
+    if gate_open && pending_int != 0xFF {
+        // The INTA cycle: drop the request latch and put the line in service.
+        if pending_int == timer_int {
+            irq0_pending = 0;
+            perf_irq0_delivered += 1;
+            pending_release_tick();
             bios_timer_tick_preincremented = 1;
             if bios_timer_tick_backlog > 0 {
                 bios_timer_tick_backlog -= 1;
             }
         } else {
+            if irq_pending[pending_int as usize] != 0 {
+                irq_pending_count = irq_pending_count.saturating_sub(1);
+            }
+            irq_pending[pending_int as usize] = 0;
             bios_timer_tick_preincremented = 0;
         }
+        pic_ack(pending_int);
+        let preserve_regs = 1;
         invoke_isr(
             pending_int,
             preserve_regs,
@@ -7910,6 +8056,24 @@ pub unsafe extern "C" fn inb(port: u16) -> u8 {
         pit_channel2.expect_high = 0;
         return ((count >> 8) & 0xFF) as u8;
     }
+    if port == 0x20 {
+        // 8259A master: OCW3 selects whether this reads back the in-service or
+        // the request register.
+        return if pic_read_isr != 0 {
+            pic_isr
+        } else {
+            pic_irr()
+        };
+    }
+    if port == 0x21 {
+        return pic_imr;
+    }
+    if port == 0xA0 {
+        return if pic2_read_isr != 0 { pic2_isr } else { 0 };
+    }
+    if port == 0xA1 {
+        return pic2_imr;
+    }
     if port == 0x92 {
         return port92;
     }
@@ -8032,14 +8196,80 @@ pub unsafe extern "C" fn outb(port: u16, value: u8) {
             dma_ff = 0;
         }
         0x20 => {
-            // 8259A PIC command port. EOI (0x20) clears the IN-SERVICE bit of
-            // the acknowledged interrupt; it does NOT discard pending requests
-            // (IRR). Our model has no ISR tracking — delivery itself already
-            // clears the pending flag (the INTA cycle) — so EOI is a no-op.
-            // The old shortcut `irq0_pending = 0` here silently destroyed any
-            // timer tick that became pending while a handler ran (or whenever
-            // a driver wrote defensive EOIs from its main loop — DM's IBMIO
-            // does this every poll), starving INT8 and freezing game clocks.
+            // 8259A master command port. An EOI clears the IN-SERVICE bit of the
+            // acknowledged line; it does NOT discard pending requests (IRR). The
+            // old shortcut `irq0_pending = 0` here silently destroyed any timer
+            // tick that became pending while a handler ran (or whenever a driver
+            // wrote defensive EOIs from its main loop — DM's IBMIO does this
+            // every poll), starving INT8 and freezing game clocks.
+            if value & 0x10 != 0 {
+                // ICW1: begin initialization. The bytes that follow on 0x21 are
+                // ICW2 (vector base), then ICW3 if cascaded, then ICW4 if asked
+                // for — NOT mask writes.
+                pic_icw_needs_icw4 = value & 0x01;
+                pic_icw_single = (value >> 1) & 0x01;
+                pic_icw_step = 1;
+                pic_isr = 0;
+                pic_read_isr = 0;
+            } else if value & 0x08 != 0 {
+                // OCW3: bit1 selects the read register for the next IN 0x20.
+                if value & 0x02 != 0 {
+                    pic_read_isr = value & 0x01;
+                }
+            } else if value & 0x20 != 0 {
+                // OCW2 with the EOI bit.
+                pic_eoi(value);
+            }
+        }
+        0x21 => {
+            if pic_icw_step != 0 {
+                // Initialization sequence in progress (see ICW1 above).
+                match pic_icw_step {
+                    1 => {
+                        // ICW2: the vector base. IRQ n becomes INT (base + n).
+                        pic_vector_base = value & 0xF8;
+                        pic_icw_step = if pic_icw_single != 0 {
+                            if pic_icw_needs_icw4 != 0 {
+                                3
+                            } else {
+                                0
+                            }
+                        } else {
+                            2
+                        };
+                    }
+                    2 => {
+                        // ICW3: cascade wiring — nothing for us to model.
+                        pic_icw_step = if pic_icw_needs_icw4 != 0 { 3 } else { 0 };
+                    }
+                    _ => {
+                        // ICW4: 8086 mode / EOI mode — nothing for us to model.
+                        pic_icw_step = 0;
+                    }
+                }
+            } else {
+                // OCW1: the interrupt mask. Unmasking a line can let a latched
+                // request through, which OPENS the delivery gate.
+                pic_imr = value;
+                shim_irq_recheck();
+            }
+        }
+        0xA0 => {
+            // Slave command port. No emulated device sits on IRQ8-15, so only
+            // the state a guest can read back is kept.
+            if value & 0x10 != 0 {
+                pic2_isr = 0;
+                pic2_read_isr = 0;
+            } else if value & 0x08 != 0 {
+                if value & 0x02 != 0 {
+                    pic2_read_isr = value & 0x01;
+                }
+            } else if value & 0x20 != 0 && pic2_isr != 0 {
+                pic2_isr &= pic2_isr - 1;
+            }
+        }
+        0xA1 => {
+            pic2_imr = value;
         }
         0x201 => {}
         0x43 => {
@@ -8339,6 +8569,10 @@ unsafe extern "C" fn int08h_impl(
         bios_timer_increment();
     }
     invoke_isr(0x1C, 1, 1, 1, ip(), cstr!("<int08>"), func, line);
+    // The real BIOS timer handler ends with `mov al,20h; out 20h,al`. Now that
+    // the in-service register is modelled, skipping the EOI would leave IRQ0 in
+    // service forever and no timer tick would ever be delivered again.
+    pic_eoi(0x20);
     iret_impl(file, func, line);
 }
 
@@ -8350,6 +8584,8 @@ unsafe extern "C" fn int09h_impl(
 ) {
     shim_log(cstr!("int09h_impl"), file, func, line, ptr::null());
     kbd_bios_deposit_from_isr();
+    // As with INT 08: the real BIOS keyboard handler EOIs before its IRET.
+    pic_eoi(0x20);
     iret_impl(file, func, line);
 }
 
