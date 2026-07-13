@@ -2954,8 +2954,19 @@ pub extern "C" fn dos_exec_impl(
     }
     let _ = child_block;
 
+    // While the child runs it *is* the current program: DOS switches the current
+    // PSP (what AH=51h/62h report) and points the DTA at the child's own PSP:80,
+    // which is where its command tail lives and where its FindFirst results go.
+    // Leaving both on the parent hands the child the parent's identity — it would
+    // read the parent's command tail and scribble its directory searches into the
+    // parent's PSP.
+    let (parent_psp, parent_dta) = unsafe { (dos_current_psp, dta_ptr) };
     unsafe {
+        dos_current_psp = child_psp;
+        dta_ptr = seg_off(child_psp, 0x80) as *mut c_void;
         shim_exec_run_child(new_cs, new_ip, new_ss, new_sp, child_psp);
+        dos_current_psp = parent_psp;
+        dta_ptr = parent_dta;
     }
     // DOS frees every block the child owned when it terminates, not just the one
     // it was loaded into.
