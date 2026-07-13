@@ -87,6 +87,15 @@ pub static DEVICE_BLOCKS: &[DeviceBlock] = &[
         capture: dos::state_capture,
         restore: dos::state_restore,
     },
+    // The guest's open files. Its own block and not part of "DOSS", so that a
+    // save written before this existed still restores the rest of DOS — a missing
+    // tag costs that one thing and says so, which is the whole reason this
+    // container is tagged.
+    DeviceBlock {
+        tag: *b"DOSF",
+        capture: dos::files_capture,
+        restore: dos::files_restore,
+    },
     DeviceBlock {
         tag: *b"SN76",
         capture: audio::sn76489::state_capture,

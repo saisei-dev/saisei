@@ -23,7 +23,7 @@
 //!   them. Bytes matching is not the bar; the audio matching is.
 
 use super::*;
-use crate::cpu::{bx, cx, dx, es, set_ax, set_bx, set_cx, set_dx, set_es};
+use crate::cpu::{ax, bx, cx, dx, es, set_ax, set_bx, set_cx, set_dx, set_es};
 use crate::mouse::mouse_int33_impl;
 use crate::shims::{inb, outb};
 use std::sync::{Mutex, MutexGuard};
@@ -388,5 +388,86 @@ fn opl2_sounds_the_same_after_a_restore() {
             "the reference render is silent, so this test would pass on a synth \
              that was never programmed at all"
         );
+    }
+}
+
+/// A file the guest is holding open must still be open, and still be *where it
+/// was*, after a restore.
+///
+/// This is rule 1 again, and the thing it was hiding behind is that a DOS handle
+/// does not look like a device register. But it is one: the guest holds the handle
+/// number, and reads, writes and seeks through it. Everything behind it — the
+/// `FILE*`, the path, the seek position — is host state, and a restore is a fresh
+/// process. So the guest came back holding a handle onto nothing.
+///
+/// It survives *not noticing*, too, which is what made it so nasty in play: the
+/// data it had already read is in guest RAM and comes back with it, so the game
+/// looks fine until the moment it next reaches for the disk. For Dungeon Master
+/// that is the stairs — descend a level, the read fails, and the game reports a
+/// system error and terminates. Load a save, walk down, and the game quits.
+#[test]
+fn an_open_file_survives_a_power_cycle() {
+    let _claim = claim_machine();
+    unsafe {
+        // The guest's cwd *is* its drive — every DOS path is resolved against it,
+        // and `dos_strip_drive_prefix` turns "C:\\LEVELS.DAT" into a plain relative
+        // one. So the test stands where a guest stands, and opens the file by the
+        // name a guest would use.
+        let dir = std::env::temp_dir().join(format!("saisei_dosf_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("LEVELS.DAT"), b"0123456789ABCDEF").unwrap();
+        let prev_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        // The guest opens its data file and reads the first half — a game
+        // streaming a level off a handle it intends to keep.
+        set_ax(0x3D00); // AH=3Dh open, AL=0 read
+        let rc =
+            crate::dos::dos_open_file_impl(c"LEVELS.DAT".as_ptr(), c"t".as_ptr(), c"t".as_ptr(), 0);
+        assert_eq!(rc, 0, "the guest could not open its own data file");
+        let h = ax();
+
+        let mut buf = [0u8; 8];
+        crate::dos::dos_read_file_impl(
+            h,
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            8,
+            c"t".as_ptr(),
+            c"t".as_ptr(),
+            0,
+        );
+        assert_eq!(
+            &buf, b"01234567",
+            "the first read did not come off the file"
+        );
+
+        // Save, then die. A restore is a fresh process: the handle table it comes
+        // back to is the one a program gets at start-up, which is an empty one.
+        let saved = capture();
+        crate::dos::forget_open_files_for_test();
+
+        assert!(restore(&saved), "devices::restore refused its own capture");
+
+        // The guest walks down the stairs: it reads on, through the same handle it
+        // has been holding all along. It must get the NEXT eight bytes — the file
+        // reopened *and* positioned where the guest left it. A handle silently
+        // rewound to 0 would hand back "01234567" here, which is its own kind of
+        // wrong: the game would read level 1's data for level 2 and never know.
+        let mut buf2 = [0u8; 8];
+        crate::dos::dos_read_file_impl(
+            h,
+            buf2.as_mut_ptr() as *mut core::ffi::c_void,
+            8,
+            c"t".as_ptr(),
+            c"t".as_ptr(),
+            0,
+        );
+        assert_eq!(
+            &buf2, b"89ABCDEF",
+            "the guest's open file did not survive the restore at its own offset"
+        );
+
+        std::env::set_current_dir(&prev_cwd).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

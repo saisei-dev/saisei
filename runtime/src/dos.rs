@@ -144,6 +144,35 @@ static mut dos_current_drive: u8 = 0; // 0 = A:
 static mut dos_last_alloc_seg: u16 = 0;
 static mut dos_child_return_code: u16 = 0;
 
+/// How each handle was opened: 0 = read-only, 1 = writable. The `FILE*` knows,
+/// but will not say, and a restore has to open the file the same way the guest
+/// did — see `files_capture`.
+static mut handle_modes: [u8; MAX_DOS_HANDLES] = [0; MAX_DOS_HANDLES];
+
+const HANDLE_MODE_READ: u8 = 0;
+const HANDLE_MODE_WRITE: u8 = 1;
+
+fn hmset(i: usize, mode: u8) {
+    unsafe {
+        if i < MAX_DOS_HANDLES {
+            core::ptr::addr_of_mut!(handle_modes)
+                .cast::<u8>()
+                .add(i)
+                .write(mode);
+        }
+    }
+}
+
+fn hmget(i: usize) -> u8 {
+    unsafe {
+        if i < MAX_DOS_HANDLES {
+            core::ptr::addr_of!(handle_modes).cast::<u8>().add(i).read()
+        } else {
+            HANDLE_MODE_READ
+        }
+    }
+}
+
 // ---- snapshot block (see devices.rs) ---------------------------------------
 //
 // DOS is a device too, as far as a save is concerned: these are the values INT
@@ -161,6 +190,153 @@ struct DosSnap {
     last_alloc_seg: u16,
     child_return_code: u16,
     dta_linear: u32,
+}
+
+// ---- the guest's open files (snapshot block "DOSF") -------------------------
+//
+// A DOS handle is guest state: the game holds the number, and reads, writes and
+// seeks through it. Everything *behind* it is host state — a `FILE*`, a strdup'd
+// path, and a seek offset that belongs to the C library. A restore is a fresh
+// process, so all of that comes back NULL while guest RAM comes back still
+// holding the handle numbers. The guest does not notice until it next touches the
+// disk; for a game that streams its levels off a file it keeps open, that is the
+// moment you walk down the stairs. The read fails, and the game does what any
+// program does when its data file has vanished from under it: it reports the
+// error and terminates. (Dungeon Master: "SYSTEM ERROR", then INT 21h AH=4Ch.)
+//
+// So the table is captured exactly as a device's registers are — what the guest
+// can see (the handle number) plus what it takes to make the host side mean that
+// again: the path, how it was opened, and where the file was positioned.
+//
+// Not a fixed POD, so not `pod_capture`: the paths are variable-length.
+//
+//   count:u32
+//   [ handle:u16  mode:u8  pad:u8  offset:i64  path_len:u16  path:[u8; path_len] ] * count
+//
+// The standard handles are left out: a fresh process brings its own stdin and
+// stdout, and they are not the guest's to restore.
+
+pub(crate) unsafe fn files_capture(out: &mut Vec<u8>) {
+    let mut body: Vec<u8> = Vec::new();
+    let mut count: u32 = 0;
+
+    for i in 0..MAX_DOS_HANDLES {
+        let fp = hget(i);
+        if fp.is_null() || is_standard_handle(i as u16) != 0 {
+            continue;
+        }
+        let path = hpget(i);
+        if path.is_null() {
+            continue;
+        }
+        // Where the guest left the file. A handle whose position we cannot read is
+        // one we could not put back faithfully, and a file silently rewound to 0
+        // is worse than one that is honestly missing.
+        let off = libc::ftell(fp);
+        if off < 0 {
+            continue;
+        }
+        let bytes = core::ffi::CStr::from_ptr(path).to_bytes();
+        if bytes.is_empty() || bytes.len() > u16::MAX as usize {
+            continue;
+        }
+
+        body.extend_from_slice(&(i as u16).to_le_bytes());
+        body.push(hmget(i));
+        body.push(0);
+        body.extend_from_slice(&(off as i64).to_le_bytes());
+        body.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+        body.extend_from_slice(bytes);
+        count += 1;
+    }
+
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&body);
+}
+
+pub(crate) unsafe fn files_restore(b: &[u8]) -> bool {
+    if b.len() < 4 {
+        return false;
+    }
+    let count = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    let mut p = 4usize;
+
+    for _ in 0..count {
+        if p + 14 > b.len() {
+            return false;
+        }
+        let h = u16::from_le_bytes([b[p], b[p + 1]]) as usize;
+        let mode = b[p + 2];
+        let off = i64::from_le_bytes([
+            b[p + 4],
+            b[p + 5],
+            b[p + 6],
+            b[p + 7],
+            b[p + 8],
+            b[p + 9],
+            b[p + 10],
+            b[p + 11],
+        ]);
+        let len = u16::from_le_bytes([b[p + 12], b[p + 13]]) as usize;
+        p += 14;
+        if p + len > b.len() {
+            return false;
+        }
+        let path = &b[p..p + len];
+        p += len;
+
+        if h >= MAX_DOS_HANDLES || is_standard_handle(h as u16) != 0 {
+            continue;
+        }
+        let Ok(cpath) = std::ffi::CString::new(path) else {
+            continue;
+        };
+
+        // Never a truncating mode, whatever the guest opened it with. A handle the
+        // guest got from AH=3Ch was opened "wb+" — reopening it that way here would
+        // erase the very file the save exists to preserve.
+        let fmode = if mode == HANDLE_MODE_READ {
+            c"rb".as_ptr()
+        } else {
+            c"r+b".as_ptr()
+        };
+        let fp = fopen_case_insensitive(cpath.as_ptr(), fmode);
+        if fp.is_null() {
+            shim_log_stdout(
+                c"restore: could not reopen DOS handle %d on %s\n".as_ptr(),
+                h as c_int,
+                cpath.as_ptr(),
+            );
+            continue;
+        }
+        libc::fseek(fp, off as libc::c_long, libc::SEEK_SET);
+
+        if !hget(h).is_null() {
+            libc::fclose(hget(h));
+        }
+        hset(h, fp);
+        hpset(h, libc::strdup(cpath.as_ptr()));
+        hoset(h, true);
+        hmset(h, mode);
+    }
+    true
+}
+
+/// Throw the open-file table away, as the fresh process a restore runs in does.
+///
+/// Deliberately leaks the `FILE*` and the path rather than closing them: a process
+/// that has died did not close its files either, and a test that tidied up first
+/// would be testing something gentler than the thing that actually happens.
+#[cfg(test)]
+pub(crate) unsafe fn forget_open_files_for_test() {
+    for i in 0..MAX_DOS_HANDLES {
+        if is_standard_handle(i as u16) == 0 {
+            hset(i, core::ptr::null_mut());
+            hpset(i, core::ptr::null_mut());
+            hoset(i, false);
+            hmset(i, HANDLE_MODE_READ);
+        }
+    }
 }
 
 pub(crate) unsafe fn state_capture(out: &mut Vec<u8>) {
@@ -1108,6 +1284,16 @@ pub extern "C" fn dos_open_file_impl(
         if hget(i).is_null() {
             let fp = unsafe { fopen_case_insensitive(open_path, fopen_mode) };
             hset(i, fp);
+            // Remembered for the snapshot: a restore has to reopen the file the
+            // same way the guest did, and the FILE* will not tell us.
+            hmset(
+                i,
+                if dos_access_mode == 0 {
+                    HANDLE_MODE_READ
+                } else {
+                    HANDLE_MODE_WRITE
+                },
+            );
             if !fp.is_null() {
                 hpset(i, unsafe { libc::strdup(open_path) });
                 hoset(i, true);
@@ -2323,6 +2509,7 @@ pub extern "C" fn dos_create_file_impl(
             let fp =
                 unsafe { fopen_case_insensitive(buf.as_ptr() as *const c_char, c"wb+".as_ptr()) };
             hset(h, fp);
+            hmset(h, HANDLE_MODE_WRITE);
             if fp.is_null() {
                 unsafe {
                     shim_log_stdout(
