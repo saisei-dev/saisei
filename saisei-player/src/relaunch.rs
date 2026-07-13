@@ -63,5 +63,8 @@ pub fn exec_player(args: &[String]) -> ! {
         "saisei: could not restart ({})",
         std::io::Error::last_os_error()
     );
-    std::process::exit(1);
+    // `_exit`, not `exit`: one caller is an exit handler (a one-off program on its
+    // way out, going back to the library), and calling `exit` again from inside
+    // one is undefined. Everything worth flushing was flushed above.
+    unsafe { libc::_exit(1) }
 }

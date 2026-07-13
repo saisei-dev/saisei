@@ -25,6 +25,8 @@ usage: saisei                       open the game library
 
 play options:
   --program <name>         pick a program in a multi-executable bundle
+  --exe <FILE.EXE>         run another program off the game's disk (its setup),
+                           once, instead of the game
   --restore-from <save>    resume from a save
   --speedup <n>            emulation speed multiplier (default 1)
 
@@ -82,6 +84,13 @@ fn main() {
                     it.next()
                         .cloned()
                         .unwrap_or_else(|| fail("--program needs a name")),
+                );
+            }
+            "--exe" => {
+                spec.exe = Some(
+                    it.next()
+                        .cloned()
+                        .unwrap_or_else(|| fail("--exe needs a file name")),
                 );
             }
             _ if is_runtime_flag(a) => spec.runtime_args.push(a.clone()),

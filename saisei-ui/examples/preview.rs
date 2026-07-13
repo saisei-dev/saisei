@@ -15,16 +15,18 @@ fn save(cv: &Canvas, name: &str) {
 }
 
 fn main() {
+    // The programs are the other executables a real bundle stages beside the game:
+    // Prince of Persia ships its SETUP.EXE, Dungeon Master its INSTALL and STATS.
     let games: Vec<GameView> = [
-        ("Zeliard", 3),
-        ("Dungeon Master", 1),
-        ("Alley Cat", 0),
-        ("Prince Of Persia", 0),
-        ("Kings Bounty", 0),
-        ("Mechwarrior", 0),
+        ("Zeliard", 3, &["INSTALL.EXE", "MTINIT.COM"][..]),
+        ("Dungeon Master", 1, &["INSTALL.EXE", "STATS.EXE"][..]),
+        ("Alley Cat", 0, &[][..]),
+        ("Prince Of Persia", 0, &["SETUP.EXE"][..]),
+        ("Kings Bounty", 0, &["KB!.COM"][..]),
+        ("Mechwarrior", 0, &[][..]),
     ]
     .iter()
-    .map(|(t, n)| GameView {
+    .map(|(t, n, progs)| GameView {
         key: t.to_lowercase(),
         title: t.to_string(),
         saves: (0..*n)
@@ -33,6 +35,7 @@ fn main() {
                 thumb: None,
             })
             .collect(),
+        programs: progs.iter().map(|s| s.to_string()).collect(),
     })
     .collect();
     let dir = std::env::args().nth(1).unwrap();
@@ -58,6 +61,20 @@ fn main() {
     let mut cv = Canvas::new(1280, 800);
     u.paint(&mut cv, false);
     save(&cv, &format!("{dir}/ui_delete.png"));
+    u.key(Key::Escape);
+
+    // The "…" on a card, and the programs behind it. Zeliard is the cursor's game
+    // and it has an installer, so both rows are on offer.
+    u.open_menu(0);
+    let mut cv = Canvas::new(1280, 800);
+    u.paint(&mut cv, false);
+    save(&cv, &format!("{dir}/ui_menu.png"));
+
+    u.key(Key::Enter); // Run a file
+    let mut cv = Canvas::new(1280, 800);
+    u.paint(&mut cv, false);
+    save(&cv, &format!("{dir}/ui_run_file.png"));
+    u.key(Key::Escape);
     u.key(Key::Escape);
 
     u.screen = Screen::AddGame;

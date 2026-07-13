@@ -18,10 +18,19 @@ use saisei_runtime::shims::{
 /// What to run, and how. `runtime_args` are the flags `saisei_main` itself
 /// parses (`--headless`, `--speedup`, `--restore-from`, the dev/drive flags);
 /// `program` selects one of a multi-executable bundle's programs.
+///
+/// `exe` runs a different program off the same game's disk, once — its setup, its
+/// installer. It is not a program in the `programs[]` sense and does not become
+/// the game's default: it names a file the bundle stages, and it is the image
+/// this one launch loads instead of the game's. Everything else about the machine
+/// — the drive, the PSP, the protected slots — is the game's, because it is the
+/// same machine, and a setup that wrote its config to some *other* disk would be
+/// no use to the game that has to read it back.
 #[derive(Clone, Default)]
 pub struct LaunchSpec {
     pub game: String,
     pub program: Option<String>,
+    pub exe: Option<String>,
     pub runtime_args: Vec<String>,
 }
 
@@ -42,6 +51,10 @@ impl LaunchSpec {
         if let Some(p) = &self.program {
             v.push("--program".into());
             v.push(p.clone());
+        }
+        if let Some(f) = &self.exe {
+            v.push("--exe".into());
+            v.push(f.clone());
         }
         v.extend(self.runtime_args.iter().cloned());
         v
@@ -127,7 +140,31 @@ fn stage(root: &Path, def: &GameDef) -> PathBuf {
 /// The runtime exits the process itself on a DOS terminate, a crash, or a window
 /// close, so in practice this rarely returns.
 pub fn run(root: &Path, spec: &LaunchSpec) -> i32 {
-    let def = saisei::load_game_definition(root, &spec.game, spec.program.as_deref());
+    let mut def = saisei::load_game_definition(root, &spec.game, spec.program.as_deref());
+
+    // A one-off run of another program on this game's disk. Only a file the
+    // bundle actually stages can be named: the drive is built from `runtime[]`,
+    // so anything else is a path the guest could not open anyway — and this is
+    // the one place a launch takes a filename rather than a game name.
+    if let Some(want) = &spec.exe {
+        let found = saisei::bundle_executables(root, &def)
+            .into_iter()
+            .find(|e| e.eq_ignore_ascii_case(want))
+            .unwrap_or_else(|| {
+                eprintln!("saisei: {} has no program called '{want}'", def.name);
+                std::process::exit(1);
+            });
+        // argv[0] and the crash bundles should name what is actually running.
+        def.program_key = saisei::sanitize_identifier(
+            Path::new(&found)
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .as_ref(),
+        );
+        def.program_path = found;
+    }
+
     stage(root, &def);
     install_game_config(&def);
 

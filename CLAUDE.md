@@ -98,6 +98,25 @@ cargo test -p saisei-jitc --test ported_disasm disassemble_retf__retf  # one tes
 
 **Function patches (`runtime/src/shims.rs`):** a `GamePatch` replaces or augments a game function identified by `(binary basename, file_off)` — the stable identity the dispatcher resolves addresses to, so one patch applies across cs-aliases. Patches register at startup or from separately-delivered `.so` bundles (`patch_load_bundle`, `--patch-bundle`); a patch fn returns `PATCH_HANDLED`/`PATCH_DECLINED` and can call `patch_call_original`/`patch_call_function`/`patch_ret_near`.
 
+**Staging the guest's disk (`copy_runtime`, `saisei/src/lib.rs`):** `build/<game>/`
+is the guest's C: drive; the bundle under `games/<game>/` is what it is *seeded*
+from. Those are two different things, and the difference only shows once a game
+writes to its own disk — which is the entire point of a setup program. POP's
+SETUP.CFG and Zeliard's resource.cfg ship *in* the bundle and are rewritten *by*
+the guest, so re-copying every bundle file over the drive on each launch (which is
+what this used to do) silently undid every setting the player had just chosen.
+Never re-copying is wrong too — a corrected bundle file would then never reach the
+drive. So staging **writes down what it staged** (`build/<game>_stage.json`: dest →
+size+mtime, kept beside the drive, not on it, so a DOS `FindFirst` never sees a
+file we invented): a drive file still exactly as we left it is ours to refresh; one
+that differs is the guest's and is left alone. The record must always hold *what we
+put there*, never what is there now — record the guest's own file as if we had
+staged it and the next launch finds a "match", calls it ours, and copies the bundle
+straight over the writes it just preserved. No record at all = a drive that
+predates the record: seed it as before, and adopt it. Consequence, and it is the
+DOS one: the disk is the disk, so a data file a game corrupts is not repaired by
+relaunching — remove `build/<game>/` to reseed.
+
 **Per-game config (`games/<name>/<name>.json`):** `name`, `program_path` (the MZ image to load), optional `programs` (multi-executable bundles, each with its own `program_path`/`psp_seg`), `psp_seg`/`init_cs` (machine params), `protected_slots` (runtime memory-protection ranges), and `runtime` (files copied into `build/<game>/` at run). Both consumers read it through `saisei::game_config_values` — `generate_game_config` bakes those values into a frozen per-game binary, and the player installs them at run time — so the two cannot drift. The per-binary `<binary>.json` sidecars and the `aliases`/`callgraph`/`regions`/`vars`/`enums` files are reverse-engineering annotations (function names, comments, discovered entries) — not part of the JIT run path. Diagnosis artifacts land in `build/<game>/` (`lifecycle.log`, `watchw.log`) and `crashes/`.
 
 **Player (`saisei-player/` = the `saisei` binary, `saisei-ui/` = its interface):**
@@ -135,6 +154,27 @@ runtime owns the SDL surface it paints onto (`saisei_ui_*` in `runtime/src/sdl.r
   0xA000 with no planar branch and yields garbage for an EGA game. They are a
   different thing from the runtime's `saves/slot_N` rewind ring, which is
   untouched.
+- **A game's card has a "…" menu**: Run a file, and Remove game. **Run a file**
+  boots one of the *other* programs on the game's disk — its setup, its installer
+  — once, on the same drive, instead of the game (`--exe FILE.EXE`,
+  `LaunchSpec.exe`; the game's `programs[]`/`--program` is a different thing and
+  is untouched). Three things make it actually work, and each was independently
+  enough to make it useless: the drive must **keep what the setup wrote** (see
+  staging, below) or the game reads back the shipped default; the **splash must be
+  off** (`virtual_display_set_splash(false)`) because the pre-game hold only ends
+  on the first *graphics* frame and a setup is text-mode start to finish, so the
+  window would stay blank forever; and the program must **come back to the
+  library** when it terminates (a `libc::atexit` hook that re-execs, armed only for
+  a windowed one-off and only on a *clean* DOS terminate — `machine_halted` — so a
+  crash stays a crash). The overlay does not offer **Save** during one: a snapshot
+  there would be a picture of SETUP.EXE filed under the game's name.
+  Only `.EXE` MZ images are offered, which is DOS's own rule for what is runnable —
+  it is what keeps DM's EGA/VGA/ANIM *overlays* (real MZ images, loaded by DM into
+  its own memory, dead on a fresh PSP) off the list. `.COM` is off it too, and that
+  one is a real gap: `load_executable` is **MZ-only** — it reads the size, entry
+  cs:ip and relocations out of an MZ header — while a `.COM` is headerless (DOS
+  lays it at PSP:0100, cs=ds=es=ss=PSP, ip=0100). Teaching the loader that protocol
+  is what would put Kings Bounty's `KB!.COM` back on the list.
 
 ## Working principles (non-obvious, enforced)
 

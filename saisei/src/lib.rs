@@ -107,18 +107,27 @@ fn programs(data: &Value) -> Vec<Value> {
     vec![Value::Object(m)]
 }
 
-pub fn load_game_definition(root: &Path, name: &str, program: Option<&str>) -> GameDef {
+/// A bundle's definition, or why it could not be read.
+///
+/// The dying twin below is what every *launch* wants: a game that will not load
+/// is the end of the run, and saying so once and clearly beats threading an error
+/// through a command that has nothing else to do. But the library paints every
+/// game on the shelf, every frame, and one unreadable bundle must not take the
+/// whole player down with it — so it asks this one instead.
+pub fn try_load_game_definition(
+    root: &Path,
+    name: &str,
+    program: Option<&str>,
+) -> Result<GameDef, String> {
     let config_path = root.join("games").join(name).join(format!("{name}.json"));
     if !config_path.exists() {
-        die(&format!(
+        return Err(format!(
             "Unknown game '{name}'. Expected config at {}",
             config_path.display()
         ));
     }
-    let data: Value = serde_json::from_slice(
-        &std::fs::read(&config_path).unwrap_or_else(|e| die(&format!("read config: {e}"))),
-    )
-    .unwrap_or_else(|e| die(&format!("parse config: {e}")));
+    let raw = std::fs::read(&config_path).map_err(|e| format!("read config: {e}"))?;
+    let data: Value = serde_json::from_slice(&raw).map_err(|e| format!("parse config: {e}"))?;
 
     let progs = programs(&data);
     let want = program
@@ -139,16 +148,16 @@ pub fn load_game_definition(root: &Path, name: &str, program: Option<&str>) -> G
     let prog = progs
         .iter()
         .find(|p| p.get("name").and_then(Value::as_str) == Some(want.as_str()))
-        .unwrap_or_else(|| {
+        .ok_or_else(|| {
             let names: Vec<&str> = progs
                 .iter()
                 .filter_map(|p| p.get("name").and_then(Value::as_str))
                 .collect();
-            die(&format!(
+            format!(
                 "Game '{name}' has no program '{want}'. Available: {}",
                 names.join(", ")
-            ));
-        });
+            )
+        })?;
 
     let mut runtime = Vec::new();
     for item in data
@@ -160,12 +169,7 @@ pub fn load_game_definition(root: &Path, name: &str, program: Option<&str>) -> G
         let source = item
             .get("source")
             .and_then(Value::as_str)
-            .unwrap_or_else(|| {
-                die(&format!(
-                    "Invalid runtime entry in {}",
-                    config_path.display()
-                ));
-            });
+            .ok_or_else(|| format!("Invalid runtime entry in {}", config_path.display()))?;
         let dest = item
             .get("dest")
             .and_then(Value::as_str)
@@ -183,11 +187,7 @@ pub fn load_game_definition(root: &Path, name: &str, program: Option<&str>) -> G
     let program_path = prog
         .get("program_path")
         .and_then(Value::as_str)
-        .unwrap_or_else(|| {
-            die(&format!(
-                "Program '{want}' in '{name}' missing program_path"
-            ))
-        })
+        .ok_or_else(|| format!("Program '{want}' in '{name}' missing program_path"))?
         .to_string();
     let game_name = data
         .get("name")
@@ -201,7 +201,7 @@ pub fn load_game_definition(root: &Path, name: &str, program: Option<&str>) -> G
                 .into_owned()
         });
 
-    GameDef {
+    Ok(GameDef {
         key: sanitize_identifier(&game_name),
         name: game_name,
         config_path,
@@ -209,7 +209,12 @@ pub fn load_game_definition(root: &Path, name: &str, program: Option<&str>) -> G
         program_path,
         program_key: sanitize_identifier(&want),
         program: want,
-    }
+    })
+}
+
+/// The bundle's definition. A game that will not load ends the run, here and now.
+pub fn load_game_definition(root: &Path, name: &str, program: Option<&str>) -> GameDef {
+    try_load_game_definition(root, name, program).unwrap_or_else(|e| die(&e))
 }
 
 // ---------- per-game GameConfig generation ----------
@@ -439,9 +444,168 @@ fn compile_game(root: &Path, game: &GameDef, config_source: &Path, features: &[S
     binary_path
 }
 
+/// A program you could have *run*, at a DOS prompt, off this disk.
+///
+/// Two conditions, and neither is a guess about the file's contents.
+///
+/// It must be named `.EXE`. That is DOS's own rule for what is runnable — COMMAND
+/// interprets a bare name as `.COM`, `.EXE` or `.BAT` and nothing else — and it is
+/// what separates a program from an *overlay*. Dungeon Master's EGA, VGA, ANIM and
+/// SWOOSH are all perfectly good MZ images, and every one of them is loaded *by*
+/// DM into its own memory; run one on a fresh PSP and it has no parent to have set
+/// it up, and it dies. You could not have typed `EGA` at a DOS prompt either.
+///
+/// And it must really be MZ. `load_executable` reads the image size, the entry
+/// cs:ip and the relocations straight out of an MZ header, so anything else is not
+/// a thing it can boot. That is also why `.COM` is missing here, though DOS would
+/// happily run one: a `.COM` is *headerless* — DOS lays it down at PSP:0100 with
+/// cs=ds=es=ss=PSP and ip=0100 — and the loader implements none of that protocol.
+/// Handed one, it takes four code bytes for a header and jumps nowhere. Offering a
+/// file that can only hang is worse than not offering it. (See docs: teaching the
+/// loader `.COM` is the way to put Kings Bounty's KB!.COM back on this list.)
+fn is_runnable_program(p: &Path) -> bool {
+    let is_exe = p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe"));
+    if !is_exe {
+        return false;
+    }
+    let mut b = [0u8; 2];
+    std::fs::File::open(p)
+        .and_then(|mut f| {
+            use std::io::Read;
+            f.read_exact(&mut b)
+        })
+        .is_ok()
+        // DOS accepts both orderings; so does every loader worth the name.
+        && (&b == b"MZ" || &b == b"ZM")
+}
+
+/// The other programs on a bundle's disk: its setup, its installer, its
+/// configurator — everything the machine can be booted on except the game itself.
+///
+/// Taken from `runtime[]`, which is what the drive is actually staged from, so
+/// this can only ever offer a file the guest will really find when it looks. The
+/// game's own program is left out: there is already a Play button for that.
+pub fn bundle_executables(root: &Path, game: &GameDef) -> Vec<String> {
+    let mut out: Vec<String> = game
+        .runtime
+        .iter()
+        .filter(|(_, dest)| !dest.eq_ignore_ascii_case(&game.program_path))
+        .filter(|(source, _)| is_runnable_program(&root.join(source)))
+        .map(|(_, dest)| dest.clone())
+        .collect();
+    out.sort_by_key(|d| d.to_lowercase());
+    out
+}
+
+// ---------- staging the guest's drive ----------
+
+/// `build/<game>/` is the guest's disk, and the bundle under `games/<game>/` is
+/// where it is seeded from. Those are two different things, and the difference
+/// only shows once a game writes to its own disk — which is the whole point of a
+/// setup program. SETUP.CFG and RESOURCE.CFG ship *in* the bundle and are
+/// rewritten *by* the guest, so re-copying the bundle over the drive on every
+/// launch would quietly undo every choice the player just made in the setup.
+///
+/// Never re-copying is wrong too: a corrected or replaced bundle file would then
+/// never reach the drive again. So we write down what we staged, and a file that
+/// no longer matches what we staged is one the guest has written — and it is the
+/// guest's. Anything still as we left it is still ours to refresh.
+///
+/// The record lives *beside* the drive (`build/<game>_stage.json`), not in it: a
+/// DOS program enumerating its own directory must not find a file we invented,
+/// least of all one with a name no 8.3 filesystem could hold.
+fn stage_record_path(root: &Path, key: &str) -> PathBuf {
+    root.join("build").join(format!("{key}_stage.json"))
+}
+
+/// A file as we last staged it. Size *and* mtime: a config a setup rewrites in
+/// place is very often exactly the size it was.
+fn stamp(p: &Path) -> Option<(u64, i64, u32)> {
+    let md = std::fs::metadata(p).ok()?;
+    let t = md.modified().ok()?;
+    // Signed, so a file dated before 1970 (a DOS-era timestamp preserved by an
+    // unzip) still round-trips rather than saturating to the epoch.
+    let (secs, nanos) = match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => (d.as_secs() as i64, d.subsec_nanos()),
+        Err(e) => {
+            let d = e.duration();
+            (-(d.as_secs() as i64), d.subsec_nanos())
+        }
+    };
+    Some((md.len(), secs, nanos))
+}
+
+fn read_stage_record(path: &Path) -> Option<Value> {
+    let data = std::fs::read(path).ok()?;
+    let v: Value = serde_json::from_slice(&data).ok()?;
+    v.is_object().then_some(v)
+}
+
+/// Copy `src` onto the drive unless the guest has made the destination its own.
+///
+/// `rec` is what we staged last time; `next` is what we are staging now. The
+/// record always holds *what we put there* — never what is there now. Recording
+/// the guest's own file as if we had staged it would hand it straight back to us
+/// on the next launch: we would find a match, call it ours, and copy the bundle
+/// over the writes we just went to the trouble of preserving.
+fn stage_file(
+    src: &Path,
+    dst: &Path,
+    key: &str,
+    rec: Option<&Value>,
+    next: &mut serde_json::Map<String, Value>,
+) {
+    let entry = rec.and_then(|r| r.get(key));
+    let staged = entry.and_then(|v| {
+        let a = v.as_array()?;
+        Some((
+            a.first()?.as_u64()?,
+            a.get(1)?.as_i64()?,
+            a.get(2)?.as_u64()? as u32,
+        ))
+    });
+
+    let ours = match (staged, stamp(dst)) {
+        // Still exactly the file we left there — ours to refresh.
+        (Some(was), Some(now)) => was == now,
+        // We staged it and it is gone. Put it back.
+        (Some(_), None) => true,
+        // Not in the record. With no record at all, this drive predates the
+        // record or is brand new: stage it, as we always did, and adopt it. With
+        // a record that simply does not mention this file, something other than
+        // us made it — leave it alone.
+        (None, Some(_)) => rec.is_none(),
+        (None, None) => true,
+    };
+
+    if !ours {
+        // Keep the original stamp, so this file goes on being the guest's.
+        if let Some(old) = entry.cloned() {
+            next.insert(key.to_string(), old);
+        }
+        return;
+    }
+
+    if let Some(p) = dst.parent() {
+        std::fs::create_dir_all(p).ok();
+    }
+    std::fs::copy(src, dst).ok();
+    if let Some((len, secs, nanos)) = stamp(dst) {
+        next.insert(
+            key.to_string(),
+            Value::Array(vec![len.into(), secs.into(), nanos.into()]),
+        );
+    }
+}
+
 pub fn copy_runtime(root: &Path, game: &GameDef) -> PathBuf {
     let output_dir = root.join("build").join(&game.key);
     std::fs::create_dir_all(&output_dir).ok();
+
+    let rec_path = stage_record_path(root, &game.key);
+    let rec = read_stage_record(&rec_path);
+    let mut next = serde_json::Map::new();
+
     for (source, dest) in &game.runtime {
         let src_path = root.join(source);
         if !src_path.exists() {
@@ -449,27 +613,36 @@ pub fn copy_runtime(root: &Path, game: &GameDef) -> PathBuf {
         }
         let dest_path = output_dir.join(dest);
         if src_path.is_dir() {
-            copy_dir(&src_path, &dest_path);
+            stage_dir(&src_path, &dest_path, dest, rec.as_ref(), &mut next);
         } else {
-            if let Some(p) = dest_path.parent() {
-                std::fs::create_dir_all(p).ok();
-            }
-            std::fs::copy(&src_path, &dest_path).ok();
+            stage_file(&src_path, &dest_path, dest, rec.as_ref(), &mut next);
         }
     }
+
+    std::fs::write(&rec_path, Value::Object(next).to_string()).ok();
     output_dir
 }
 
-fn copy_dir(src: &Path, dst: &Path) {
+/// A runtime entry can be a whole directory (DM's ANIM, EGA, …). Same rule, file
+/// by file, keyed by the path relative to the drive.
+fn stage_dir(
+    src: &Path,
+    dst: &Path,
+    key: &str,
+    rec: Option<&Value>,
+    next: &mut serde_json::Map<String, Value>,
+) {
     std::fs::create_dir_all(dst).ok();
     if let Ok(rd) = std::fs::read_dir(src) {
         for e in rd.flatten() {
             let from = e.path();
-            let to = dst.join(e.file_name());
+            let name = e.file_name();
+            let to = dst.join(&name);
+            let sub = format!("{key}/{}", name.to_string_lossy());
             if from.is_dir() {
-                copy_dir(&from, &to);
+                stage_dir(&from, &to, &sub, rec, next);
             } else {
-                std::fs::copy(&from, &to).ok();
+                stage_file(&from, &to, &sub, rec, next);
             }
         }
     }

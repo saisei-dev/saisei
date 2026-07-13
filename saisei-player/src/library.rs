@@ -34,6 +34,19 @@ pub fn games(root: &Path) -> Vec<Game> {
     out
 }
 
+/// The other programs on a game's disk — its setup, its installer. Usually none.
+///
+/// Read through the same `GameDef` the launcher runs from, so the list can only
+/// ever name a file the game's drive is actually staged with. A bundle whose
+/// config will not load has no programs rather than taking the library down with
+/// it: this runs for every game on the shelf, every time the library is painted.
+pub fn programs(root: &Path, key: &str) -> Vec<String> {
+    match saisei::try_load_game_definition(root, key, None) {
+        Ok(def) => saisei::bundle_executables(root, &def),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// Remove a game: its bundle, its build directory, and its saves.
 ///
 /// All three, because all three are the game — a bundle left behind would come
@@ -63,6 +76,10 @@ pub fn delete_game(root: &Path, saves: &Path, key: &str) -> Result<(), String> {
     // is gone from the library either way, and failing here would only leave the
     // player looking at an error about something they cannot see.
     std::fs::remove_dir_all(root.join("build").join(key)).ok();
+    // The record of what was staged onto that drive goes with the drive. Leaving
+    // it would hand a stale one to whatever is added under this name next, and
+    // every file in the new bundle would look like something a guest had written.
+    std::fs::remove_file(root.join("build").join(format!("{key}_stage.json"))).ok();
     std::fs::remove_dir_all(saves.join(key)).ok();
     Ok(())
 }

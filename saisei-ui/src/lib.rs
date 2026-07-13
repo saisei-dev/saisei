@@ -66,6 +66,12 @@ pub enum Action {
     /// Remove a game, and everything of it: the bundle and the saves. Only ever
     /// raised from a confirmation the player answered.
     DeleteGame(usize),
+    /// Run one of the other programs on a game's disk — its setup, its installer
+    /// — once, instead of the game. `exe` indexes that game's `programs`.
+    RunFile {
+        game: usize,
+        exe: usize,
+    },
 }
 
 pub struct SaveView {
@@ -77,6 +83,10 @@ pub struct GameView {
     pub key: String,
     pub title: String,
     pub saves: Vec<SaveView>,
+    /// The other programs on this game's disk, as the guest would see them
+    /// ("SETUP.EXE"): its setup, its installer. Not the game itself — Play is
+    /// already the button for that. Usually empty.
+    pub programs: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -111,8 +121,13 @@ pub struct AddState {
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Hit {
     Game(usize),
-    /// The trash button on a game's card.
-    Trash(usize),
+    /// The "…" button on a game's card, which opens everything you can do to a
+    /// game that is not playing it.
+    Menu(usize),
+    /// A row of the card menu.
+    MenuItem(usize),
+    /// A program in the "Run a file" list.
+    Program(usize),
     Add,
     Action(usize),
     Save(usize),
@@ -151,6 +166,14 @@ pub struct Ui {
     /// dangerous answer should never be the one a stray Enter gives.
     delete_yes: bool,
 
+    /// The game whose "…" menu is open, if one is.
+    pub menu: Option<usize>,
+    menu_idx: usize,
+    /// The game whose program list is open — "Run a file", one level in from the
+    /// menu. Both are modal, and only one is ever up.
+    pub picking: Option<usize>,
+    pick_idx: usize,
+
     /// Master volume, 0..1. The host seeds this from the settings file (per game,
     /// falling back to the default) and writes it back when it changes.
     pub volume: f32,
@@ -183,6 +206,10 @@ impl Ui {
             message: None,
             deleting: None,
             delete_yes: false,
+            menu: None,
+            menu_idx: 0,
+            picking: None,
+            pick_idx: 0,
             volume: 0.6,
             dragging_volume: false,
             hot: Vec::new(),
@@ -244,10 +271,31 @@ impl Ui {
 
     // ---- input ------------------------------------------------------------
 
+    /// What the "…" menu offers for the game at `game`.
+    ///
+    /// "Run a file" is *absent*, not disabled, on a bundle that holds nothing else
+    /// to run — which is most of them. A menu row that can never do anything is
+    /// worse than a menu that is honest about being short.
+    pub fn menu_items(&self, game: usize) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        if self.games.get(game).is_some_and(|g| !g.programs.is_empty()) {
+            v.push("Run a file");
+        }
+        v.push("Remove game");
+        v
+    }
+
     pub fn key(&mut self, k: Key) -> Action {
         self.message = None;
-        // A confirmation is modal on purpose: while it is up, nothing behind it
-        // can be reached, by key or by click.
+        // These are modal on purpose: while one is up, nothing behind it can be
+        // reached, by key or by click. Innermost first — the program list opens
+        // from the menu, and closing it must land back on the menu, not the grid.
+        if self.picking.is_some() {
+            return self.key_pick(k);
+        }
+        if self.menu.is_some() {
+            return self.key_menu(k);
+        }
         if self.deleting.is_some() {
             return self.key_confirm(k);
         }
@@ -293,6 +341,77 @@ impl Ui {
             self.deleting = Some(game);
             self.delete_yes = false;
         }
+    }
+
+    /// Open the "…" menu on the game at `game`.
+    pub fn open_menu(&mut self, game: usize) {
+        if game < self.games.len() {
+            self.game = game;
+            self.menu = Some(game);
+            self.menu_idx = 0;
+        }
+    }
+
+    fn key_menu(&mut self, k: Key) -> Action {
+        let Some(game) = self.menu else {
+            return Action::None;
+        };
+        let n = self.menu_items(game).len();
+        match k {
+            Key::Up => self.menu_idx = self.menu_idx.saturating_sub(1),
+            Key::Down => self.menu_idx = (self.menu_idx + 1).min(n.saturating_sub(1)),
+            Key::Escape | Key::Overlay => self.menu = None,
+            Key::Enter => return self.activate_menu(self.menu_idx),
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// Take a menu row. Nothing here *does* anything on its own: both rows open
+    /// the question the row is really asking.
+    fn activate_menu(&mut self, i: usize) -> Action {
+        let Some(game) = self.menu else {
+            return Action::None;
+        };
+        match self.menu_items(game).get(i).copied() {
+            Some("Run a file") => {
+                self.menu = None;
+                self.picking = Some(game);
+                self.pick_idx = 0;
+            }
+            Some("Remove game") => {
+                self.menu = None;
+                self.offer_delete(game);
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    fn key_pick(&mut self, k: Key) -> Action {
+        let Some(game) = self.picking else {
+            return Action::None;
+        };
+        let n = self.games.get(game).map(|g| g.programs.len()).unwrap_or(0);
+        match k {
+            Key::Up => self.pick_idx = self.pick_idx.saturating_sub(1),
+            Key::Down => self.pick_idx = (self.pick_idx + 1).min(n.saturating_sub(1)),
+            // Back to the menu it was opened from, not out to the grid.
+            Key::Escape => {
+                self.picking = None;
+                self.open_menu(game);
+            }
+            Key::Overlay => self.picking = None,
+            Key::Enter if self.pick_idx < n => {
+                self.picking = None;
+                return Action::RunFile {
+                    game,
+                    exe: self.pick_idx,
+                };
+            }
+            _ => {}
+        }
+        Action::None
     }
 
     fn key_library(&mut self, k: Key) -> Action {
@@ -527,10 +646,12 @@ impl Ui {
                         self.dragging_volume = true;
                         self.set_volume(value_along(track, x))
                     }
-                    Hit::Trash(i) => {
-                        self.offer_delete(i);
+                    Hit::Menu(i) => {
+                        self.open_menu(i);
                         Action::None
                     }
+                    Hit::MenuItem(i) => self.activate_menu(i),
+                    Hit::Program(_) => self.key(Key::Enter),
                     Hit::ConfirmYes => {
                         self.delete_yes = true;
                         self.key(Key::Enter)
@@ -581,9 +702,11 @@ impl Ui {
             // must not steal the selection from the actions behind it.
             Hit::Volume(_) => {}
             Hit::Exe(i) => self.add.exe_idx = i,
-            // Hovering the trash must not arm it — only pressing it opens the
-            // question.
-            Hit::Trash(i) => self.game = i,
+            // Hovering the "…" must not open it — only pressing it does. Hovering a
+            // card is not asking for its menu.
+            Hit::Menu(i) => self.game = i,
+            Hit::MenuItem(i) => self.menu_idx = i,
+            Hit::Program(i) => self.pick_idx = i,
             Hit::ConfirmYes => self.delete_yes = true,
             Hit::ConfirmNo => self.delete_yes = false,
             Hit::Paste => {}
@@ -644,6 +767,7 @@ mod tests {
                             thumb: None,
                         })
                         .collect(),
+                    programs: Vec::new(),
                 })
                 .collect(),
         )
@@ -906,22 +1030,38 @@ mod tests {
         );
     }
 
+    /// Click whatever `h` was painted at. Panics if it was not painted at all,
+    /// which is the point: a button nobody drew is a button nobody can press.
+    fn click_hit(u: &mut Ui, h: Hit) -> Action {
+        let (r, _) = *u
+            .hot
+            .iter()
+            .find(|(_, x)| *x == h)
+            .unwrap_or_else(|| panic!("{h:?} was never painted"));
+        u.click(r.x + r.w / 2.0, r.y + r.h / 2.0)
+    }
+
     #[test]
     fn removing_a_game_takes_an_answer_and_defaults_to_not() {
         let mut u = ui(&[("Zeliard", 2), ("Pop", 0)]);
         let mut cv = Canvas::new(1280, 800);
         u.paint(&mut cv, false);
 
-        // The trash is on the card the cursor is on, and only that one.
-        assert!(painted(&u, Hit::Trash(0)));
-        assert!(
-            !painted(&u, Hit::Trash(1)),
-            "only the selected card has one"
-        );
+        // The "…" is on the card the cursor is on, and only that one.
+        assert!(painted(&u, Hit::Menu(0)));
+        assert!(!painted(&u, Hit::Menu(1)), "only the selected card has one");
 
-        // Pressing it asks, and asks nothing of the filesystem.
-        let (r, _) = *u.hot.iter().find(|(_, h)| *h == Hit::Trash(0)).unwrap();
-        assert_eq!(u.click(r.x + r.w / 2.0, r.y + r.h / 2.0), Action::None);
+        // It opens a menu, and does nothing else.
+        assert_eq!(click_hit(&mut u, Hit::Menu(0)), Action::None);
+        assert_eq!(u.menu, Some(0));
+        assert_eq!(u.deleting, None);
+
+        // Remove is the only thing on offer for a game with nothing else to run,
+        // and taking it asks rather than deletes.
+        assert_eq!(u.menu_items(0), ["Remove game"]);
+        u.paint(&mut cv, false);
+        assert_eq!(click_hit(&mut u, Hit::MenuItem(0)), Action::None);
+        assert_eq!(u.menu, None, "the menu closes behind the question");
         assert_eq!(u.deleting, Some(0));
 
         // Enter straight away must NOT delete: the focus starts on Cancel, so the
@@ -929,7 +1069,8 @@ mod tests {
         assert_eq!(u.key(Key::Enter), Action::None);
         assert_eq!(u.deleting, None, "the question is answered either way");
 
-        // Escape cancels too.
+        // Escape cancels too. Delete still opens the question straight from the
+        // grid — the menu is another way in, not the only one.
         u.key(Key::Delete);
         assert_eq!(u.deleting, Some(0));
         assert_eq!(u.key(Key::Escape), Action::None);
@@ -940,6 +1081,90 @@ mod tests {
         u.key(Key::Right); // Cancel -> Remove
         assert_eq!(u.key(Key::Enter), Action::DeleteGame(0));
         assert_eq!(u.deleting, None);
+    }
+
+    #[test]
+    fn a_bundles_other_programs_can_be_run_one_off() {
+        let mut u = ui(&[("Prince", 0)]);
+        u.games[0].programs = vec!["SETUP.EXE".into(), "MIDI.EXE".into()];
+        let mut cv = Canvas::new(1280, 800);
+        u.paint(&mut cv, false);
+
+        // A bundle with something else on its disk offers to run it.
+        assert_eq!(u.menu_items(0), ["Run a file", "Remove game"]);
+        click_hit(&mut u, Hit::Menu(0));
+        u.paint(&mut cv, false);
+        assert_eq!(click_hit(&mut u, Hit::MenuItem(0)), Action::None);
+        assert_eq!(u.picking, Some(0), "the program list, not a launch");
+
+        // Every program is on offer, and taking one runs THAT one.
+        u.paint(&mut cv, false);
+        assert!(painted(&u, Hit::Program(0)) && painted(&u, Hit::Program(1)));
+        assert_eq!(
+            click_hit(&mut u, Hit::Program(1)),
+            Action::RunFile { game: 0, exe: 1 }
+        );
+        assert_eq!(u.picking, None);
+
+        // The same by keyboard.
+        u.open_menu(0);
+        u.key(Key::Enter); // "Run a file"
+        assert_eq!(u.picking, Some(0));
+        u.key(Key::Down);
+        assert_eq!(u.key(Key::Enter), Action::RunFile { game: 0, exe: 1 });
+
+        // Escape goes back to the menu it came from, rather than dumping you out
+        // on the grid a level further than you asked to go.
+        u.open_menu(0);
+        u.key(Key::Enter);
+        assert_eq!(u.key(Key::Escape), Action::None);
+        assert_eq!((u.picking, u.menu), (None, Some(0)), "back to the menu");
+    }
+
+    #[test]
+    fn a_game_with_nothing_else_on_its_disk_is_not_offered_a_file_to_run() {
+        // Most bundles are one executable. A "Run a file" row that could only ever
+        // open an empty list is worse than a short menu.
+        let mut u = ui(&[("Alley Cat", 0)]);
+        assert_eq!(u.menu_items(0), ["Remove game"]);
+        u.open_menu(0);
+        assert_eq!(u.key(Key::Enter), Action::None);
+        assert_eq!(u.deleting, Some(0), "the only row is Remove");
+        assert_eq!(u.picking, None);
+    }
+
+    #[test]
+    fn the_card_menu_is_modal() {
+        // Same rule as the delete question: while it is up, the library behind it
+        // is not clickable. Both sheets clear the hit rects the grid pushed.
+        let mut u = ui(&[("Zeliard", 0), ("Pop", 0)]);
+        u.games[0].programs = vec!["INSTALL.EXE".into()];
+        let mut cv = Canvas::new(1280, 800);
+        u.paint(&mut cv, false);
+        let (card, _) = *u.hot.iter().find(|(_, h)| *h == Hit::Game(1)).unwrap();
+
+        for sheet in ["menu", "programs"] {
+            u.menu = None;
+            u.picking = None;
+            match sheet {
+                "menu" => u.open_menu(0),
+                _ => u.picking = Some(0),
+            }
+            u.paint(&mut cv, false);
+            assert!(
+                !painted(&u, Hit::Game(1)),
+                "{sheet}: the library stopped taking clicks"
+            );
+            assert_eq!(
+                u.click(card.x + card.w / 2.0, card.y + card.h / 2.0),
+                Action::None
+            );
+            assert_eq!(
+                u.screen,
+                Screen::Library,
+                "{sheet}: nothing opened behind it"
+            );
+        }
     }
 
     #[test]

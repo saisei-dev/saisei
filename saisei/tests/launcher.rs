@@ -219,3 +219,112 @@ fn class_map_has_known_kinds() {
     assert!(class_map_has("unhandled_pc"));
     assert_eq!(CLASS_MAP.len(), 9);
 }
+
+/// A bundle laid out like a real one: a game, a setup, a config the setup rewrites.
+fn game_bundle(root: &Path, key: &str) {
+    let dir = root.join("games").join(key);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("GAME.EXE"), b"MZ\x90\x00\x03\x00").unwrap();
+    std::fs::write(dir.join("SETUP.EXE"), b"MZ\x90\x00\x03\x00").unwrap();
+    std::fs::write(dir.join("SETUP.CFG"), b"sound=none").unwrap();
+    std::fs::write(dir.join("DATA.DAT"), b"\x00\x01\x02").unwrap();
+    std::fs::write(
+        dir.join(format!("{key}.json")),
+        format!(
+            r#"{{"name":"{key}","program_path":"GAME.EXE","runtime":[
+                {{"source":"games/{key}/GAME.EXE","dest":"GAME.EXE"}},
+                {{"source":"games/{key}/SETUP.EXE","dest":"SETUP.EXE"}},
+                {{"source":"games/{key}/SETUP.CFG","dest":"SETUP.CFG"}},
+                {{"source":"games/{key}/DATA.DAT","dest":"DATA.DAT"}}]}}"#
+        ),
+    )
+    .unwrap();
+}
+
+/// The whole point of being able to run a setup: what it writes has to still be
+/// there the next time the game boots.
+///
+/// `build/<game>/` is the guest's disk, and a setup writes its answers onto it —
+/// into SETUP.CFG, a file that also *ships in the bundle*. Staging used to copy
+/// every bundle file over the drive on every launch, so the game read back the
+/// shipped default and the player's choice was silently gone. Now a file the guest
+/// has written is the guest's, and only a file still exactly as we staged it gets
+/// refreshed from the bundle.
+#[test]
+fn a_setup_s_writes_survive_the_next_launch_and_the_bundle_still_refreshes() {
+    let root = temp_parent("stage_provenance");
+    game_bundle(&root, "game");
+    let def = saisei::load_game_definition(&root, "game", None);
+
+    // First launch: the drive is seeded from the bundle.
+    let drive = saisei::copy_runtime(&root, &def);
+    assert_eq!(
+        std::fs::read(drive.join("SETUP.CFG")).unwrap(),
+        b"sound=none"
+    );
+
+    // The setup runs and writes the player's choice onto the drive.
+    std::fs::write(drive.join("SETUP.CFG"), b"sound=adlib").unwrap();
+
+    // Next launch: the choice is still there, and is still there the launch after
+    // that — the second one is the one that catches a staging record which
+    // "adopts" the guest's file and hands it back to us to clobber.
+    for launch in 1..=2 {
+        saisei::copy_runtime(&root, &def);
+        assert_eq!(
+            std::fs::read(drive.join("SETUP.CFG")).unwrap(),
+            b"sound=adlib",
+            "launch {launch} reverted the setup's config"
+        );
+    }
+
+    // A file the guest never touched is still ours: fix it in the bundle and the
+    // fix reaches the drive. (Seed-once staging would have frozen this forever.)
+    std::fs::write(root.join("games/game/DATA.DAT"), b"\x09\x09\x09").unwrap();
+    saisei::copy_runtime(&root, &def);
+    assert_eq!(
+        std::fs::read(drive.join("DATA.DAT")).unwrap(),
+        b"\x09\x09\x09",
+        "a bundle file the guest never wrote must still refresh"
+    );
+    // ...and doing so did not disturb the guest's.
+    assert_eq!(
+        std::fs::read(drive.join("SETUP.CFG")).unwrap(),
+        b"sound=adlib"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The list the "Run a file" menu is built from: everything the machine can be
+/// booted on, except the game, which already has a Play button.
+///
+/// A `.COM` is deliberately NOT on it. `load_executable` reads the image size, the
+/// entry cs:ip and the relocations out of an MZ header; a `.COM` has no header, so
+/// it would take four code bytes for one and jump somewhere meaningless — which is
+/// exactly what it did. Offering a file that can only hang is worse than not
+/// offering it, so the list is what the loader can actually load.
+#[test]
+fn a_bundle_offers_the_programs_the_loader_can_actually_boot() {
+    let root = temp_parent("bundle_exes");
+    game_bundle(&root, "game");
+
+    // A .COM helper, on the disk and in runtime[] exactly as a real one is.
+    let dir = root.join("games/game");
+    std::fs::write(dir.join("EXISTS.COM"), b"\xb4\x09\xcd\x21\xc3").unwrap();
+    let cfg = dir.join("game.json");
+    let text = std::fs::read_to_string(&cfg).unwrap().replace(
+        r#"{"source":"games/game/DATA.DAT","dest":"DATA.DAT"}"#,
+        r#"{"source":"games/game/DATA.DAT","dest":"DATA.DAT"},
+           {"source":"games/game/EXISTS.COM","dest":"EXISTS.COM"}"#,
+    );
+    std::fs::write(&cfg, text).unwrap();
+
+    let def = saisei::load_game_definition(&root, "game", None);
+    assert_eq!(
+        saisei::bundle_executables(&root, &def),
+        ["SETUP.EXE"],
+        "the game itself and the unbootable .COM are both left off"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}

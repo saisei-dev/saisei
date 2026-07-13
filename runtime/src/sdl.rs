@@ -439,6 +439,23 @@ pub extern "C" fn virtual_display_set_splash_logo(enabled: bool) {
     unsafe { SPLASH_LOGO = enabled };
 }
 
+/// Whether there is a pre-game phase to hold the window through at all.
+///
+/// Off for a *one-off program* — a setup, an installer. The hold is what keeps a
+/// game's boot console off the screen until it paints its first real frame, and it
+/// ends on that frame. But a setup is a text-mode program from its first
+/// instruction to its last: it never presents a graphics frame, so the hold would
+/// never end, and you would sit looking at a splash where the setup's own screen
+/// should be. When the text screen *is* the program you asked for, there is
+/// nothing to hold it back for.
+static mut SPLASH_ENABLED: bool = true;
+
+/// Hold the window through a pre-game phase, or don't. See `SPLASH_ENABLED`.
+#[no_mangle]
+pub extern "C" fn virtual_display_set_splash(enabled: bool) {
+    unsafe { SPLASH_ENABLED = enabled };
+}
+
 fn splash_min_ms() -> u32 {
     // With no logo there is nothing to hold *for*; the hold that remains is
     // however long the game takes to put up its first frame.
@@ -472,7 +489,7 @@ fn build_splash_rgb(w: usize, h: usize) -> Vec<u8> {
 /// through the game's text-mode console/setup screens (e.g. Dungeon Master's
 /// drive prompt) instead of flashing the text buffer.
 pub(crate) fn splash_is_up() -> bool {
-    unsafe { DISPLAY_READY && !GAME_HAS_PRESENTED }
+    unsafe { DISPLAY_READY && !GAME_HAS_PRESENTED && SPLASH_ENABLED }
 }
 
 /// (Re)draw the splash at full brightness. No-op unless the display is up.
@@ -641,8 +658,10 @@ fn recreate_texture(w: c_int, h: c_int) {
         DISPLAY_READY = true;
         // A fresh texture is blank; keep the logo up (through the game's mode-init
         // window resizes) until it has been run out. The splash keeps its own
-        // texture, re-fitted to the new geometry on the next draw.
-        if !GAME_HAS_PRESENTED {
+        // texture, re-fitted to the new geometry on the next draw. (`splash_is_up`,
+        // not `!GAME_HAS_PRESENTED`: with no pre-game phase there is no splash to
+        // put back, and painting one would blank the first frame of a setup.)
+        if splash_is_up() {
             draw_splash_at(255);
         }
     }

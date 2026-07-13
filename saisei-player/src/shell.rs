@@ -39,6 +39,37 @@ fn logo() -> Image {
 /// the first one's copy had already freed.
 static RUNNING: OnceLock<(PathBuf, String)> = OnceLock::new();
 
+/// True when what is running is a one-off program off the game's disk — its
+/// setup, its installer — rather than the game.
+///
+/// Two things need to know. A snapshot taken here would be a picture of SETUP.EXE
+/// filed under the game's name, and Continue would later restore *into the setup*;
+/// so the overlay does not offer to save. And when the program terminates we go
+/// back to the library rather than closing the window, because a setup is
+/// something you run *and come back from*.
+static ONE_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn one_off() -> bool {
+    ONE_OFF.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The one-off program has finished. Come back to the library it was started from.
+///
+/// The runtime ends the process itself the instant the guest asks DOS to
+/// terminate — `libc::exit`, from inside the shim — so there is no place in the
+/// player's own code that runs after a program is over. An exit handler is that
+/// place.
+///
+/// Only on a *clean* terminate. A crash has to stay a crash: its bundle, its
+/// message on stderr, and a window that stopped — not one that silently blinks
+/// back to a menu as though nothing had happened.
+extern "C" fn back_to_library() {
+    if unsafe { saisei_runtime::shims::machine_halted } == 0 {
+        return;
+    }
+    crate::relaunch::exec_player(&[]);
+}
+
 // ---- painting ---------------------------------------------------------------
 
 /// Holds the pixel buffer across frames — reallocating a window-sized RGBA buffer
@@ -160,7 +191,8 @@ fn pump(ui: &mut Ui) -> (Action, bool) {
 
 // ---- the library ------------------------------------------------------------
 
-/// Every game, with its saves, as the interface wants them.
+/// Every game, with its saves and whatever else is on its disk, as the interface
+/// wants them.
 fn games_view(root: &Path) -> Vec<GameView> {
     library::games(root)
         .into_iter()
@@ -172,10 +204,12 @@ fn games_view(root: &Path) -> Vec<GameView> {
                     thumb: s.thumb.as_deref().and_then(Image::load_png),
                 })
                 .collect();
+            let programs = library::programs(root, &g.key);
             GameView {
                 key: g.key,
                 title: g.display,
                 saves,
+                programs,
             }
         })
         .collect()
@@ -272,6 +306,7 @@ pub fn run(root: &Path) -> ! {
                 crate::add::pick_exe(root, &mut ui, i);
                 ui.games = games_view(root);
             }
+            Action::RunFile { game, exe } => run_file(root, &ui, game, exe),
             // Nothing to resume into: the library is all there is.
             Action::Resume | Action::Save | Action::ToLibrary | Action::None => {}
         }
@@ -305,8 +340,26 @@ pub fn play(root: &Path, spec: &LaunchSpec, show_logo: bool) -> ! {
     // showed it seconds ago, or we are re-execing out of a menu, showing it again
     // is a stutter, not a flourish. What remains of the splash either way is the
     // hold that covers the JIT's first compiles and a game's text-mode setup.
-    rt::virtual_display_set_splash_logo(show_logo);
+    //
+    // A one-off program gets neither. The hold ends on a game's first *graphics*
+    // frame — and a setup is a text-mode program from its first instruction to its
+    // last, so it never presents one and the hold would never end. What you would
+    // see is a black window where the setup's own screen should be, forever. The
+    // hold exists to keep a game's boot console out of sight; here the console IS
+    // the program you asked to run.
+    let one_off = spec.exe.is_some();
+    rt::virtual_display_set_splash_logo(show_logo && !one_off);
+    rt::virtual_display_set_splash(!one_off);
     RUNNING.set((root.to_path_buf(), spec.game.clone())).ok();
+
+    // A one-off program is something you come back from — but only when there is
+    // somewhere to come back to. A scripted run has no library and no window, and
+    // must not grow one on its way out.
+    let windowed = !spec.runtime_args.iter().any(|a| a == "--headless");
+    if one_off && windowed {
+        ONE_OFF.store(true, std::sync::atomic::Ordering::Relaxed);
+        unsafe { libc::atexit(back_to_library) };
+    }
     unsafe { saisei_runtime::shims::saisei_set_overlay_entry(Some(overlay_entry)) };
     // This game's remembered volume, before it has had a chance to make a sound.
     unsafe {
@@ -329,6 +382,25 @@ fn launch(root: &Path, ui: &Ui, game: usize, restore: Option<usize>) -> ! {
     play(root, &spec, false)
 }
 
+/// Run one of the other programs on a game's disk — a setup, an installer —
+/// instead of the game, once.
+///
+/// It boots the same machine on the same drive, which is the entire point: a
+/// setup writes its answers into the game's own working directory, and the game
+/// reads them back from there on the next launch. Anywhere else and it would be
+/// configuring nothing.
+fn run_file(root: &Path, ui: &Ui, game: usize, exe: usize) -> ! {
+    let Some(g) = ui.games.get(game) else {
+        std::process::exit(0);
+    };
+    let Some(name) = g.programs.get(exe) else {
+        std::process::exit(0);
+    };
+    let mut spec = LaunchSpec::new(&g.key);
+    spec.exe = Some(name.clone());
+    play(root, &spec, false)
+}
+
 // ---- the overlay ------------------------------------------------------------
 
 /// The runtime calls this with the machine frozen at a resting point. Everything
@@ -342,7 +414,10 @@ unsafe extern "C" fn overlay_entry(can_save: bool) {
     let Some(idx) = ui.games.iter().position(|g| &g.key == key) else {
         return;
     };
-    ui.open_overlay(idx, can_save);
+    // Never a save of a setup filed under the game's name. Everything else the
+    // overlay does still works here — not least Library, which is the way out of a
+    // setup you opened by mistake.
+    ui.open_overlay(idx, can_save && !one_off());
     // Show the slider where this game actually is, not where a fresh Ui guessed.
     ui.volume = crate::settings::volume_for(key);
 
@@ -391,11 +466,16 @@ unsafe extern "C" fn overlay_entry(can_save: bool) {
                 crate::relaunch::exec_player(&args);
             }
             Action::Quit => std::process::exit(0),
+            // Library-only, all of them: the overlay never paints the grid those
+            // are raised from. (Adding a game, removing one, or running a setup
+            // while a game is mid-frame is not a thing to make reachable — leaving
+            // for the library first is.)
             Action::AddPath(_)
             | Action::AddUrl(_)
             | Action::PickExe(_)
             | Action::Paste
             | Action::DeleteGame(_)
+            | Action::RunFile { .. }
             | Action::None => {}
         }
         if touched || dirty || p.resize_to_window() {

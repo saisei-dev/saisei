@@ -38,13 +38,21 @@ pub fn paint(ui: &mut Ui, cv: &mut Canvas, over_game: bool) {
 
     let full = Rect::new(pad, pad, cv.w as f32 - 2.0 * pad, cv.h as f32 - 2.0 * pad);
 
-    if ui.deleting.is_some() {
+    // The three things that open over the library. Each is modal: everything
+    // behind it stops being clickable, not just stops being drawn. The library's
+    // hit rects are pushed as it paints, so they are dropped again after — or a
+    // click meant for the sheet could fall through onto a card.
+    if ui.deleting.is_some() || ui.menu.is_some() || ui.picking.is_some() {
         paint_library(ui, cv, full, s);
-        // Modal: everything behind the question stops being clickable, not just
-        // stops being drawn. Hit rects for the library were pushed above; drop
-        // them, or a click meant for the dialog could fall through onto a card.
         ui.hot.clear();
-        paint_confirm_delete(ui, cv, cv_rect(cv), s);
+        let screen = cv_rect(cv);
+        if ui.deleting.is_some() {
+            paint_confirm_delete(ui, cv, screen, s);
+        } else if ui.menu.is_some() {
+            paint_card_menu(ui, cv, screen, s);
+        } else {
+            paint_pick_program(ui, cv, screen, s);
+        }
         return;
     }
 
@@ -203,32 +211,166 @@ fn paint_confirm_delete(ui: &mut Ui, cv: &mut Canvas, screen: Rect, s: f32) {
     );
 }
 
-/// A trash can, drawn from rectangles — there is no icon font here, and one glyph
-/// is not worth becoming a reason to add one.
-fn trash_icon(cv: &mut Canvas, r: Rect, c: Color, bg: Color) {
-    let w = r.w;
-    let h = r.h;
-    let lid_h = (h * 0.12).max(1.0);
-    // Handle.
-    cv.rounded(
-        Rect::new(r.x + w * 0.34, r.y, w * 0.32, lid_h * 1.4),
-        1.0,
-        c,
+// ---- the card menu, and the programs on a game's disk -----------------------
+
+/// A centred sheet: a title, a list of rows, a hint. The "…" menu and the list of
+/// programs are both this, and there is no reason for them to be two layouts.
+/// Returns the row rects, in order, for the caller to hang its hits on.
+#[allow(clippy::too_many_arguments)]
+fn sheet(
+    ui: &mut Ui,
+    cv: &mut Canvas,
+    screen: Rect,
+    s: f32,
+    title: &str,
+    subtitle: Option<&str>,
+    rows: &[String],
+    sel: usize,
+    hint: &str,
+) -> Vec<Rect> {
+    cv.fill(screen, t::SCRIM);
+
+    let rh = 46.0 * s;
+    let top = if subtitle.is_some() {
+        96.0 * s
+    } else {
+        70.0 * s
+    };
+    let w = (480.0 * s).min(screen.w - 40.0 * s);
+    let h = top + rows.len() as f32 * rh + 54.0 * s;
+    let d = Rect::new((screen.w - w) / 2.0, (screen.h - h) / 2.0, w, h);
+    shadow(cv, d, t::RADIUS * 1.6, 20.0 * s);
+    cv.rounded(d, t::RADIUS * 1.6, t::SURFACE);
+    cv.stroke(d, t::RADIUS * 1.6, 1.0, t::BORDER);
+
+    let x = d.x + 24.0 * s;
+    let inner = d.w - 48.0 * s;
+
+    let title = ui.fonts.elide(title, Weight::Bold, 20.0 * s, inner);
+    ui.fonts.draw_top(
+        cv,
+        &title,
+        x,
+        d.y + 24.0 * s,
+        Weight::Bold,
+        20.0 * s,
+        t::TEXT,
     );
-    // Lid.
-    cv.rounded(Rect::new(r.x, r.y + lid_h * 1.6, w, lid_h), 1.0, c);
-    // Body.
-    let body = Rect::new(r.x + w * 0.12, r.y + lid_h * 3.0, w * 0.76, h - lid_h * 3.2);
-    cv.rounded(body, 2.0, c);
-    // Two slots, punched back out in the card's colour beneath.
-    let slot_w = (w * 0.07).max(1.0);
-    for k in 0..2 {
-        let sx = body.x + body.w * (0.32 + 0.36 * k as f32) - slot_w / 2.0;
-        cv.rounded(
-            Rect::new(sx, body.y + body.h * 0.2, slot_w, body.h * 0.55),
-            0.5,
-            bg,
+    if let Some(sub) = subtitle {
+        let sub = ui.fonts.elide(sub, Weight::Regular, 13.5 * s, inner);
+        ui.fonts.draw_top(
+            cv,
+            &sub,
+            x,
+            d.y + 58.0 * s,
+            Weight::Regular,
+            13.5 * s,
+            t::TEXT_DIM,
         );
+    }
+
+    let mut out = Vec::with_capacity(rows.len());
+    for (i, label) in rows.iter().enumerate() {
+        let r = Rect::new(
+            d.x + 12.0 * s,
+            d.y + top + i as f32 * rh,
+            d.w - 24.0 * s,
+            rh - 6.0 * s,
+        );
+        let on = i == sel;
+        if on {
+            cv.rounded(r, 8.0, t::SURFACE_HI);
+            cv.stroke(r, 8.0, 1.0, t::ACCENT);
+        }
+        let label = ui
+            .fonts
+            .elide(label, Weight::Regular, 15.0 * s, r.w - 26.0 * s);
+        ui.fonts.draw_top(
+            cv,
+            &label,
+            r.x + 13.0 * s,
+            r.y + 11.0 * s,
+            Weight::Regular,
+            15.0 * s,
+            if on { t::TEXT } else { t::TEXT_DIM },
+        );
+        out.push(r);
+    }
+
+    ui.fonts.draw_top(
+        cv,
+        hint,
+        x,
+        d.y + d.h - 32.0 * s,
+        Weight::Regular,
+        13.0 * s,
+        t::TEXT_OFF,
+    );
+    out
+}
+
+/// Everything you can do to a game that is not playing it.
+fn paint_card_menu(ui: &mut Ui, cv: &mut Canvas, screen: Rect, s: f32) {
+    let Some(i) = ui.menu else { return };
+    let Some(g) = ui.games.get(i) else { return };
+    let title = g.title.clone();
+    let rows: Vec<String> = ui.menu_items(i).into_iter().map(str::to_string).collect();
+    let sel = ui.menu_idx.min(rows.len().saturating_sub(1));
+
+    let hits = sheet(
+        ui,
+        cv,
+        screen,
+        s,
+        &title,
+        None,
+        &rows,
+        sel,
+        "Enter choose    Esc close",
+    );
+    for (i, r) in hits.into_iter().enumerate() {
+        ui.push_hot(r, Hit::MenuItem(i));
+    }
+}
+
+/// The other programs on the game's disk — its setup, its installer.
+///
+/// It says what running one does and does not do, because that is the whole
+/// question a player has here: this boots the machine on that program instead of
+/// the game, on the game's own disk, so what the setup writes is what the game
+/// will read. It does not become what the game runs.
+fn paint_pick_program(ui: &mut Ui, cv: &mut Canvas, screen: Rect, s: f32) {
+    let Some(i) = ui.picking else { return };
+    let Some(g) = ui.games.get(i) else { return };
+    let sub = format!("{} — runs once, on the game's own disk.", g.title);
+    let rows = g.programs.clone();
+    let sel = ui.pick_idx.min(rows.len().saturating_sub(1));
+
+    let hits = sheet(
+        ui,
+        cv,
+        screen,
+        s,
+        "Run a file",
+        Some(&sub),
+        &rows,
+        sel,
+        "Enter run    Esc back",
+    );
+    for (i, r) in hits.into_iter().enumerate() {
+        ui.push_hot(r, Hit::Program(i));
+    }
+}
+
+/// Three dots — the button that means "and the rest". Drawn, like the trash, from
+/// rectangles: there is no icon font here, and two glyphs are not worth becoming a
+/// reason to add one.
+fn dots_icon(cv: &mut Canvas, r: Rect, c: Color) {
+    let d = (r.w * 0.16).max(1.5);
+    let y = r.y + r.h / 2.0 - d / 2.0;
+    for k in 0..3 {
+        let x = r.x + r.w * (0.5 + 0.31 * (k as f32 - 1.0)) - d / 2.0;
+        cv.rounded(Rect::new(x, y, d, d), d / 2.0, c);
     }
 }
 
@@ -465,23 +607,21 @@ fn paint_card(ui: &mut Ui, cv: &mut Canvas, card: Rect, i: usize, sel: bool, s: 
     if sel {
         cv.stroke(card, t::RADIUS, 2.0, t::ACCENT);
 
-        // The trash, on the card the cursor is on — and only that one, so a
-        // library of covers is not also a row of little buttons to misclick.
-        // Hovering a card selects it, so with a mouse this is "on hover"; with the
-        // keyboard it follows the selection, which is where Delete would act
-        // anyway.
+        // The "…", on the card the cursor is on — and only that one, so a library
+        // of covers is not also a row of little buttons to misclick. Hovering a
+        // card selects it, so with a mouse this is "on hover"; with the keyboard it
+        // follows the selection, which is where Delete would act anyway.
+        //
+        // One button, not two. It used to be a trash can, and adding a second icon
+        // beside it would have been exactly the row of little buttons that comment
+        // was written to prevent — so removing a game moved *into* the menu, where
+        // running a file also lives. Delete still opens the same question directly.
         let d = 30.0 * s;
         let btn = Rect::new(card.x + card.w - d - 8.0 * s, card.y + 8.0 * s, d, d);
         cv.rounded(btn, d / 2.0, t::BG.alpha(235));
         cv.stroke(btn, d / 2.0, 1.0, t::BORDER);
-        let g = d * 0.26;
-        trash_icon(
-            cv,
-            Rect::new(btn.x + g, btn.y + g * 0.95, d - 2.0 * g, d - 2.0 * g),
-            t::TEXT,
-            t::BG,
-        );
-        ui.push_hot(btn, Hit::Trash(i));
+        dots_icon(cv, btn, t::TEXT);
+        ui.push_hot(btn, Hit::Menu(i));
     }
 }
 
@@ -948,6 +1088,7 @@ mod volume_tests {
                 key: "zeliard_dos_en".into(),
                 title: "Zeliard".into(),
                 saves: vec![],
+                programs: vec![],
             }],
         );
         ui.open_overlay(0, true);
