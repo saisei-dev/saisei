@@ -975,6 +975,9 @@ impl RRenderer {
                 "    set_cx(0);".into(),
                 "}".into(),
             ]),
+            // F3 in front of a string *compare* is REPE — same encoding, same
+            // semantics; only the spelling differs from one decoder to the next.
+            "cmpsb" | "cmpsw" | "scasb" | "scasw" => self.handle_repe(insn, base),
             other => uns(format!("rep {other}")),
         }
     }
@@ -1690,13 +1693,25 @@ impl RRenderer {
         }
     }
 
-    /// repe/repz cmpsb/cmpsw/scasb — repeat while equal (ZF=1).
-    fn handle_repe(&mut self, insn: &Insn, base: &str) -> R<Vec<String>> {
+    /// repe/repz (ZF=1) and repne/repnz (ZF=0) over the string compares
+    /// cmpsb/cmpsw/scasb/scasw. One loop serves both: each iteration compares,
+    /// advances di (and si, for cmps), and counts down cx; the prefixes differ
+    /// only in which ZF ends the run, so `break_when_equal` is the whole of it.
+    /// cx=0 on entry executes no iteration and leaves the flags untouched.
+    fn handle_rep_cmp(
+        &mut self,
+        insn: &Insn,
+        base: &str,
+        break_when_equal: bool,
+    ) -> R<Vec<String>> {
         let seg = self.string_source_segment(insn);
         let (w, rd, shift, sign): (i64, &str, u32, u32) = match base {
             "cmpsb" | "scasb" => (1, "memb", 7, 0x80),
-            "cmpsw" => (2, "memw", 15, 0x8000),
-            other => return uns(format!("repe {other}")),
+            "cmpsw" | "scasw" => (2, "memw", 15, 0x8000),
+            other => {
+                let prefix = if break_when_equal { "repne" } else { "repe" };
+                return uns(format!("{prefix} {other}"));
+            }
         };
         let rt = if w == 1 { "u8" } else { "u16" };
         // left value: cmps reads [seg:si]; scas uses al/ax.
@@ -1723,7 +1738,14 @@ impl RRenderer {
         }
         l.push("        set_di(((di() as i32 + delta) & 0xFFFF) as u16);".into());
         l.push("        i += 1;".into());
-        l.push("        if lv != rv { break; }".into());
+        l.push(
+            if break_when_equal {
+                "        if lv == rv { break; }" // ZF->1 ends repne
+            } else {
+                "        if lv != rv { break; }" // ZF->0 ends repe
+            }
+            .into(),
+        );
         l.push("    }".into());
         l.push(format!(
             "    JIT_BUDGET((i as u32).wrapping_mul({})); // rep iterations debit virtual time",
@@ -1745,11 +1767,18 @@ impl RRenderer {
         Ok(l)
     }
 
-    /// repne/repnz scasb — repeat while not equal (scan for al).
-    fn handle_repne(&mut self, _insn: &Insn, base: &str) -> R<Vec<String>> {
+    /// repe/repz cmpsb/cmpsw/scasb/scasw — repeat while equal (ZF=1).
+    fn handle_repe(&mut self, insn: &Insn, base: &str) -> R<Vec<String>> {
+        self.handle_rep_cmp(insn, base, false)
+    }
+
+    /// repne/repnz cmpsb/cmpsw/scasb/scasw — repeat while not equal (ZF=0).
+    fn handle_repne(&mut self, insn: &Insn, base: &str) -> R<Vec<String>> {
         if base != "scasb" {
-            return uns(format!("repne {base}"));
+            return self.handle_rep_cmp(insn, base, true);
         }
+        // scasb scans for al — the memchr/strlen idiom, kept on the native block
+        // helper rather than the generic per-byte loop.
         Ok(vec![
             "{".into(),
             "    let delta: i32 = if DF() != 0 { -1 } else { 1 };".into(),

@@ -126,6 +126,9 @@ extern "C" {
     );
     fn bios_get_cursor(page: u8);
     fn bios_read_char_attr() -> u16;
+    fn bios_write_pixel(color: u8, x: u16, y: u16);
+    fn bios_read_pixel(x: u16, y: u16);
+    fn is_cga_graphics_mode(mode: u8) -> c_int;
     fn bios_write_char_attr(glyph: u8, page: u8, attr: u8, count: u16);
     fn bios_write_char_only(glyph: u8, page: u8, count: u16);
     fn bios_scroll_window(
@@ -1908,6 +1911,12 @@ const BIOS_TIMER_TICK_ISR_OFF: u16 = (BIOS_TIMER_TICK_ISR_LINEAR & 0xF) as u16;
 const MOUSE_ISR_LINEAR: u32 = 0x000F0A00;
 const MOUSE_ISR_SEG: u16 = (MOUSE_ISR_LINEAR >> 4) as u16;
 const MOUSE_ISR_OFF: u16 = (MOUSE_ISR_LINEAR & 0xF) as u16;
+const BIOS_DISK_ISR_LINEAR: u32 = 0x000F0B00;
+const BIOS_DISK_ISR_SEG: u16 = (BIOS_DISK_ISR_LINEAR >> 4) as u16;
+const BIOS_DISK_ISR_OFF: u16 = (BIOS_DISK_ISR_LINEAR & 0xF) as u16;
+const DOS_ABS_READ_ISR_LINEAR: u32 = 0x000F0C00;
+const DOS_ABS_READ_ISR_SEG: u16 = (DOS_ABS_READ_ISR_LINEAR >> 4) as u16;
+const DOS_ABS_READ_ISR_OFF: u16 = (DOS_ABS_READ_ISR_LINEAR & 0xF) as u16;
 const BIOS_EQUIPMENT_WORD: u16 = 0x0063;
 
 unsafe extern "C" fn default_isr_impl(
@@ -7871,6 +7880,10 @@ pub unsafe extern "C" fn shim_boot_machine() {
     memw_raw_write(0, 0x10 * 4 + 2, BIOS_VIDEO_ISR_SEG);
     memw_raw_write(0, 0x11 * 4, BIOS_EQUIPMENT_ISR_OFF);
     memw_raw_write(0, 0x11 * 4 + 2, BIOS_EQUIPMENT_ISR_SEG);
+    memw_raw_write(0, 0x13 * 4, BIOS_DISK_ISR_OFF);
+    memw_raw_write(0, 0x13 * 4 + 2, BIOS_DISK_ISR_SEG);
+    memw_raw_write(0, 0x25 * 4, DOS_ABS_READ_ISR_OFF);
+    memw_raw_write(0, 0x25 * 4 + 2, DOS_ABS_READ_ISR_SEG);
     memw_raw_write(0, 0x16 * 4, BIOS_KBD_ISR_OFF);
     memw_raw_write(0, 0x16 * 4 + 2, BIOS_KBD_ISR_SEG);
     memw_raw_write(0, 0x20 * 4, DOS_TERM_ISR_OFF);
@@ -8905,6 +8918,98 @@ unsafe extern "C" fn int11h_impl(
     iret_impl(file, func, line);
 }
 
+/// INT 25h — DOS absolute disk read (AL=drive, CX=sectors, DX=first logical
+/// sector, DS:BX=buffer).
+///
+/// Nothing sector-addressable sits behind the guest's drive: `build/<game>/` is a
+/// host directory that DOS serves file by file, and a directory has no sector 0.
+/// So the read cannot be performed, and DOS's own way of saying so is an error
+/// return — CF set, AX = the failure. Synthesizing a boot sector to satisfy the
+/// caller would be fabricating data the guest cannot tell from a real disk's, and
+/// the guest is entitled to believe it. If a game ever *needs* what is in those
+/// sectors, the answer is a real FAT view over the drive, not a better-looking
+/// lie here.
+///
+/// The return path is INT 25h's alone: it ends in a RETF, leaving the FLAGS word
+/// the INT pushed on the stack for the caller to pop. So the result goes in the
+/// *live* flags — an IRET here would pop the guest's flags word and hand back
+/// carry-clear from before the call, i.e. report success.
+unsafe extern "C" fn int25h_impl(
+    _expected_retip: u16,
+    file: *const c_char,
+    func: *const c_char,
+    line: c_int,
+) {
+    shim_log(cstr!("int25h_impl"), file, func, line, ptr::null());
+    // AH=80h: nothing answered at the sector level. AL=0Ch: general failure, the
+    // DOS error for a device that cannot perform the request. Both halves say the
+    // same thing in their own vocabulary.
+    set_ax(0x800C);
+    set_CF(1);
+    retf_impl(file, func, line);
+}
+
+/// The BIOS reports a disk result two ways at once: AH holds the status, CF is
+/// set iff it is non-zero, and the byte is left in the BDA at 0040:0041 for a
+/// later AH=01h to read back. All three come from the one status value.
+unsafe fn bios_disk_status(status: u8) {
+    *seg_off(0x40, 0x41) = status;
+    set_ah(status);
+    set_iret_carry((status != 0) as c_int);
+}
+
+/// INT 13h — BIOS disk services.
+///
+/// The guest's drives are served by DOS (INT 21h) out of a host directory: there
+/// is no sector-addressable image behind any of them. So the services that speak
+/// to the *controller* are answered here, and the ones that would move sectors
+/// are a hard stop — a fabricated "read ok" would hand the guest a buffer of
+/// zeroes it has no way to tell from data, which is exactly the sort of guess the
+/// prime directive forbids. If a game turns out to need real sector I/O, that is
+/// a disk model to build, not a status byte to invent.
+unsafe extern "C" fn int13h_impl(
+    _expected_retip: u16,
+    file: *const c_char,
+    func: *const c_char,
+    line: c_int,
+) {
+    shim_log(cstr!("int13h_impl"), file, func, line, ptr::null());
+    match ah() {
+        // Reset disk system. This resets the controller and recalibrates the
+        // drive; it never touches the medium, so it succeeds whether or not one
+        // is present — which is precisely why a game uses it to clear a previous
+        // error before retrying.
+        0x00 => bios_disk_status(0x00),
+        // Status of the last operation, from the BDA byte the others leave.
+        0x01 => {
+            let status = *seg_off(0x40, 0x41);
+            set_ah(status);
+            set_iret_carry((status != 0) as c_int);
+        }
+        _ => {
+            let mut msg = [0u8; 256];
+            libc::snprintf(
+                msg.as_mut_ptr() as *mut c_char,
+                msg.len(),
+                cstr!("unimplemented BIOS disk function AH=0x%02X DL=0x%02X (%s:%s:%d)"),
+                ah() as c_uint,
+                dl() as c_uint,
+                file,
+                func,
+                line,
+            );
+            shim_log_crash(cstr!("%s\n"), msg.as_ptr() as *const c_char);
+            save_bug_bundle(
+                cstr!("unimplemented_bios_disk"),
+                ((cs() as u32) << 4).wrapping_add(ip() as u32),
+                msg.as_ptr() as *const c_char,
+            );
+            libc::abort();
+        }
+    }
+    iret_impl(file, func, line);
+}
+
 unsafe extern "C" fn int10h_impl(
     _expected_retip: u16,
     file: *const c_char,
@@ -8944,6 +9049,16 @@ unsafe extern "C" fn int10h_impl(
         bios_video_alt_select_impl(file, func, line);
     } else if ah() == 0x08 {
         set_ax(bios_read_char_attr());
+    } else if (ah() == 0x0C || ah() == 0x0D) && is_cga_graphics_mode(bios_current_video_mode()) != 0
+    {
+        // Pixel write/read, served for the CGA graphics family. In any other mode
+        // these fall through to the unimplemented arm below and say so, rather
+        // than scribbling on memory laid out differently.
+        if ah() == 0x0C {
+            bios_write_pixel(al(), cx(), dx());
+        } else {
+            bios_read_pixel(cx(), dx());
+        }
     } else if ah() == 0x30 {
         let mut seg: u16 = 0;
         let mut off: u16 = 0;
@@ -9108,11 +9223,21 @@ unsafe extern "C" fn int33h_impl(
     iret_impl(file, func, line);
 }
 
-static mut base_call_targets: [CallTarget; 11] = [
+static mut base_call_targets: [CallTarget; 13] = [
     CallTarget {
         addr: DEFAULT_ISR_LINEAR,
         file: ptr::null(),
         fn_: Some(default_isr_impl),
+    },
+    CallTarget {
+        addr: BIOS_DISK_ISR_LINEAR,
+        file: ptr::null(),
+        fn_: Some(int13h_impl),
+    },
+    CallTarget {
+        addr: DOS_ABS_READ_ISR_LINEAR,
+        file: ptr::null(),
+        fn_: Some(int25h_impl),
     },
     CallTarget {
         addr: BIOS_IRQ0_ISR_LINEAR,
@@ -9165,7 +9290,7 @@ static mut base_call_targets: [CallTarget; 11] = [
         fn_: Some(int33h_impl),
     },
 ];
-const base_call_target_count: usize = 11;
+const base_call_target_count: usize = 13;
 
 unsafe fn is_builtin_call_target(addr: u32) -> c_int {
     for i in 0..base_call_target_count {

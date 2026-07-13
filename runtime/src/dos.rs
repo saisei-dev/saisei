@@ -140,7 +140,16 @@ pub struct InterruptSnapshot {
 
 static mut dos_current_psp: u16 = DEFAULT_PSP_SEG;
 static mut dos_ext_scancode_pending: u8 = 0; // 0 = none queued
-static mut dos_current_drive: u8 = 0; // 0 = A:
+
+// The drive the guest is running on. `build/<game>/` is its C: drive — the
+// program image is loaded from there and every path resolves into it — so the
+// only truthful answer to AH=19h is 2. Answering 0 told a game it had been
+// started from a floppy, and a game that believes it is on a floppy goes
+// looking for one: Popcorn asked for the current drive, was told A:, and went
+// straight to an absolute sector read (INT 25h) of it, which no directory-backed
+// drive can serve. The drive letter itself never reaches the file layer
+// (`dos_strip_drive_prefix`); this is purely what DOS says about itself.
+static mut dos_current_drive: u8 = 2; // 2 = C:
 static mut dos_last_alloc_seg: u16 = 0;
 static mut dos_child_return_code: u16 = 0;
 

@@ -7,11 +7,9 @@
 //!              chunk backend (`render_rs`/`render_rs_ir`). The reloc tests
 //!              drive relocations through the IR (`{"functions": …,
 //!              "relocations": [{"segment", "offset"}]}`) instead of poking the
-//!              retired renderer's `reloc_offsets` field. Two formerly
-//!              #[ignore]d tests are live again:
-//!              repe__other_repe_instructions_abort_translation (the C
-//!              renderer's process::exit(2) is a catchable Unsupported in the
-//!              Rust backend) and terminates__on_noreturn_funcs (the private
+//!              retired renderer's `reloc_offsets` field. A formerly
+//!              #[ignore]d test is live again: terminates__on_noreturn_funcs
+//!              (the private
 //!              _terminates/_NORETURN_FUNCS check re-expressed as the
 //!              observable state-machine behavior: a noreturn runtime call ends
 //!              its block with `return -1;` and drops the unreachable tail).
@@ -217,21 +215,110 @@ fn repe__scasb_and_cmpsw_translate() {
     }
 }
 
+/// Every prefix x string-compare pair the 8086 can encode must emit. The four
+/// bases (cmpsb/cmpsw/scasb/scasw) x repe/repne are one loop with one difference:
+/// the ZF that ends it. Popcorn far-jumps into runtime-loaded code holding
+/// `repne cmpsb` (F2 A6) — the whole chunk failed to translate over it, so the
+/// game could not boot (crash bundle: jit_compile_failed at 2AD2:0113).
 #[test]
-fn repe__other_repe_instructions_abort_translation() {
-    // The original asserted a catchable UnsupportedInstructionError with
-    // "scasw" in the message; the C port could only process::exit(2) and was
-    // #[ignore]d. The Rust backend returns Unsupported — assert it directly.
+fn rep_cmp__every_prefix_and_base_translates() {
+    // (mnemonic, bytes, expect-si-advance, expect-word-width)
+    let cases = [
+        ("repe cmpsb", "F3A6", true, false),
+        ("repe cmpsw", "F3A7", true, true),
+        ("repe scasb", "F3AE", false, false),
+        ("repe scasw", "F3AF", false, true),
+        ("repne cmpsb", "F2A6", true, false),
+        ("repne cmpsw", "F2A7", true, true),
+        ("repne scasw", "F2AF", false, true),
+    ];
+    for (mnem, bytes, advances_si, word) in cases {
+        let func = json!({
+            "start": 0x0000,
+            "instructions": [
+                {"address": 0x0000, "mnemonic": mnem, "op_str": "", "bytes": bytes},
+                {"address": 0x0002, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
+            ],
+        });
+        let src = render_rs(&func, &[], "");
+        assert!(src.contains("while i < count {"), "{mnem}: {src}");
+        // repe runs while ZF=1 (stop on the first mismatch); repne runs while
+        // ZF=0 (stop on the first match). That inversion is the prefix.
+        let brk = if mnem.starts_with("repne") {
+            "if lv == rv { break; }"
+        } else {
+            "if lv != rv { break; }"
+        };
+        assert!(src.contains(brk), "{mnem} wrong stop condition: {src}");
+        // cmps compares [seg:si] with [es:di] and advances both; scas compares
+        // the accumulator with [es:di] and advances di alone.
+        let acc = if word { "r.ax()" } else { "r.al()" };
+        let m = if word { "memw" } else { "memb" };
+        if advances_si {
+            assert!(
+                src.contains(&format!("lv = r.{m}(r.ds(), r.si());")),
+                "{mnem}: {src}"
+            );
+            assert!(src.contains("r.set_si("), "{mnem} must advance si: {src}");
+        } else {
+            assert!(src.contains(&format!("lv = {acc};")), "{mnem}: {src}");
+            assert!(
+                !src.contains("r.set_si("),
+                "{mnem} must not touch si: {src}"
+            );
+        }
+        assert!(
+            src.contains(&format!("rv = r.{m}(r.es(), r.di());")),
+            "{mnem}: {src}"
+        );
+        assert!(src.contains("r.set_di("), "{mnem} must advance di: {src}");
+        // cx is left holding the untraversed remainder, and the flags come from
+        // the last compare actually performed (cx=0 on entry leaves them alone).
+        assert!(
+            src.contains("r.set_cx(count.wrapping_sub(i));"),
+            "{mnem}: {src}"
+        );
+        assert!(src.contains("if i > 0 {"), "{mnem}: {src}");
+        assert!(src.contains("r.set_ZF((res == 0) as u8);"), "{mnem}: {src}");
+        assert!(
+            src.contains("r.set_CF((l32 < r32) as u8);"),
+            "{mnem}: {src}"
+        );
+    }
+}
+
+/// F3 in front of a string compare *is* REPE — same opcode, same semantics.
+/// A decoder that spells it "rep cmpsb" must not fall off the supported set.
+#[test]
+fn rep_cmp__bare_rep_prefix_on_a_compare_is_repe() {
+    for (mnem, bytes) in [("rep cmpsb", "F3A6"), ("rep scasw", "F3AF")] {
+        let func = json!({
+            "start": 0x0000,
+            "instructions": [
+                {"address": 0x0000, "mnemonic": mnem, "op_str": "", "bytes": bytes},
+                {"address": 0x0002, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
+            ],
+        });
+        let src = render_rs(&func, &[], "");
+        assert!(src.contains("if lv != rv { break; }"), "{mnem}: {src}");
+    }
+}
+
+#[test]
+fn rep_cmp__a_prefix_on_a_non_compare_is_still_unsupported() {
+    // The rep-compare loop is for cmps/scas only. A repe/repne on anything else
+    // is not a thing the ISA defines — it must stay a hard Unsupported, not get
+    // silently emitted as a compare.
     let func = json!({
         "start": 0x0000,
         "instructions": [
-            {"address": 0x0000, "mnemonic": "repe scasw",
-             "op_str": "word ptr es:[di]", "bytes": "F3AF"},
+            {"address": 0x0000, "mnemonic": "repne lodsb",
+             "op_str": "al, byte ptr [si]", "bytes": "F2AC"},
             {"address": 0x0002, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
     let err = try_render_rs(&func, &[], "").unwrap_err();
-    assert!(err.0.contains("scasw"), "{}", err.0);
+    assert!(err.0.contains("lodsb"), "{}", err.0);
 }
 
 // ===========================================================================

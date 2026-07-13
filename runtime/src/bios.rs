@@ -646,6 +646,58 @@ pub extern "C" fn bios_keyboard() {
     bios_keyboard_impl(c"<external>".as_ptr(), c"bios_keyboard".as_ptr(), 0);
 }
 
+/// Where pixel (x, y) lives in CGA graphics memory, and how far to shift a pixel
+/// down within its byte. The CGA stores even rows at B800:0000 and odd rows at
+/// B800:2000, 80 bytes to a row either way — four 2-bit pixels per byte in modes
+/// 4/5, eight 1-bit pixels per byte in mode 6, leftmost pixel in the high bits.
+/// Returns None for a coordinate off the screen, which the BIOS simply drops.
+fn cga_pixel_site(mode: u8, x: u16, y: u16) -> Option<(u16, u32, u8)> {
+    const BYTES_PER_ROW: u32 = 80;
+    let width: u32 = if mode == 0x06 { 640 } else { 320 };
+    let (x, y) = (x as u32, y as u32);
+    if x >= width || y >= 200 {
+        return None;
+    }
+    let row_base = (y & 1) * 0x2000 + (y >> 1) * BYTES_PER_ROW;
+    let (byte, shift, mask) = if mode == 0x06 {
+        (x >> 3, 7 - (x & 7), 0x01u8)
+    } else {
+        (x >> 2, (3 - (x & 3)) * 2, 0x03u8)
+    };
+    Some((((row_base + byte) & 0x3FFF) as u16, shift, mask))
+}
+
+/// INT 10h AH=0Ch — write a graphics pixel. AL = colour, and its bit 7 means XOR
+/// the colour into the pixel already there instead of replacing it (which is how
+/// a game draws and erases a sprite with the same call). CX = column, DX = row.
+/// The caller gates on a CGA graphics mode.
+#[no_mangle]
+pub extern "C" fn bios_write_pixel(color: u8, x: u16, y: u16) {
+    let mode = unsafe { (*bv()).video_mode };
+    if let Some((off, shift, mask)) = cga_pixel_site(mode, x, y) {
+        unsafe {
+            let p = seg_off(0xB800, off);
+            let bits = (color & mask) << shift;
+            if color & 0x80 != 0 {
+                *p ^= bits;
+            } else {
+                *p = (*p & !(mask << shift)) | bits;
+            }
+        }
+    }
+}
+
+/// INT 10h AH=0Dh — read a graphics pixel back into AL.
+#[no_mangle]
+pub extern "C" fn bios_read_pixel(x: u16, y: u16) {
+    let mode = unsafe { (*bv()).video_mode };
+    let color = match cga_pixel_site(mode, x, y) {
+        Some((off, shift, mask)) => unsafe { (*seg_off(0xB800, off) >> shift) & mask },
+        None => 0,
+    };
+    set_al(color);
+}
+
 #[no_mangle]
 pub extern "C" fn bios_current_video_mode() -> u8 {
     unsafe { (*bv()).video_mode }
