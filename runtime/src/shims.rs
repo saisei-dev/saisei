@@ -3181,6 +3181,13 @@ pub unsafe extern "C" fn shim_time_sync() -> u64 {
                 if isr_depth == 0 && now_ns - last_present_time_ns >= 16000000u64 {
                     last_present_time_ns = now_ns;
                     if headless_mode == 0 {
+                        // Top the audio queue up FIRST. Presenting a frame costs
+                        // real time — converting VRAM, uploading the texture — and
+                        // costs no *virtual* time at all, so not one sample is
+                        // produced while it happens. Anything already owed must be
+                        // in the queue before we go and spend that time, or the
+                        // device plays the gap.
+                        crate::audio::catchup();
                         stage_and_present_current_buffer();
                     } else {
                         save_manager_poll_pending();
@@ -3286,9 +3293,15 @@ unsafe fn maybe_enter_overlay(now_ns: u64) {
     // mouse coordinates into the renderer's logical space, and the guest's is not
     // the one the menu is laid out in.
     saisei_ui_begin();
+    // Fade the sound out into the queue before the clock stops. Virtual time is
+    // instruction-driven, so it simply stops here — and an abrupt stop mid-
+    // waveform is a click. Once the queue drains, SDL plays silence on its own;
+    // there is no device to pause and no pause machinery to get wrong.
+    crate::audio::shim_audio_suspend();
     vclock_halt();
     overlay(savable);
     vclock_resume();
+    crate::audio::shim_audio_resume();
     // Hand the window back: drop the menu's texture and put the game's own frame
     // on screen now, rather than leaving the menu up until the game next presents.
     saisei_ui_release();
@@ -3311,6 +3324,22 @@ pub unsafe extern "C" fn safe_point_impl(_file: *const c_char, func: *const c_ch
     let now_ns = shim_time_sync();
     jit_instr_budget = JIT_BUDGET_QUANTUM;
     jit_budget_last_refill = JIT_BUDGET_QUANTUM;
+
+    // Render what the guest has just earned BEFORE the pacer puts it to sleep.
+    //
+    // This ordering is the whole game. Audio is produced out of *virtual* time,
+    // and the pacer's sleep is real time in which virtual time does not move — so
+    // a sleep produces no audio, it only drains the queue. Rendering after the
+    // sleep (which is where this used to sit) meant every safepoint topped the
+    // queue up and then immediately let the sleep eat into it, with nothing to
+    // give back. Rendering before it means we go into the sleep with the queue as
+    // full as it will ever be. A game holding a note touches no port, so this is
+    // also the only thing feeding the mixer between register writes; it is
+    // rate-limited internally to ~1ms of virtual time.
+    if headless_mode == 0 {
+        crate::audio::service();
+    }
+
     let host_now_ns =
         if now_ns.wrapping_sub(last_host_probe_virtual_ns) >= HOST_PROBE_MIN_VIRTUAL_NS {
             last_host_probe_virtual_ns = now_ns;
@@ -6438,6 +6467,31 @@ pub unsafe extern "C" fn file_mapping_swap_impl(
 }
 
 #[no_mangle]
+/// A byte of guest physical memory. The DMA controller addresses memory linearly
+/// — it has no segments and no CPU to go through — so it needs this rather than
+/// the seg:off accessors everything else uses.
+pub unsafe fn phys_read_byte(addr: u32) -> u8 {
+    if virtual_memory.is_null() {
+        return 0;
+    }
+    *virtual_memory.add(mask_addr(addr) as usize)
+}
+
+#[cfg(test)]
+pub unsafe fn phys_write_byte(addr: u32, value: u8) {
+    *virtual_memory.add(mask_addr(addr) as usize) = value;
+}
+
+/// Guest memory, for device tests that touch it (the DMA controller reads it) but
+/// do not boot a machine to get it.
+#[cfg(test)]
+pub unsafe fn shim_test_init_memory() {
+    if virtual_memory.is_null() {
+        virtual_memory = libc::calloc(MEMORY_SIZE, 1) as *mut u8;
+    }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn memw_raw_read(seg: u16, off: u16) -> u16 {
     let addr = linear_addr(seg, off);
     (*virtual_memory.add(addr as usize) as u16)
@@ -7905,51 +7959,16 @@ unsafe extern "C" fn init_memory() {
 #[link_section = ".init_array"]
 static INIT_MEMORY_CTOR: unsafe extern "C" fn() = init_memory;
 
-static mut port61: u8 = 0;
+/// PPI port B: bit 0 = channel-2 gate, bit 1 = speaker data enable. Read by the
+/// audio mixer, which is the only thing outside this file that touches it.
+pub static mut port61: u8 = 0;
 static mut port92: u8 = 0;
-static mut dma3_addr: u16 = 0;
-static mut dma_ff: u8 = 0;
-static mut sb_dsp_read_data: u8 = 0xFF;
-static mut sb_dsp_read_ready: u8 = 0;
-static mut sb_dsp_reset_state: u8 = 0;
 
-unsafe fn sb_dsp_port(port: u16) -> c_int {
-    (port >= 0x220 && port <= 0x22F) as c_int
-}
-
-unsafe fn sb_dsp_write(port: u16, value: u8) {
-    match port & 0x00F {
-        0x6 => {
-            if value & 1 != 0 {
-                sb_dsp_reset_state = 1;
-            } else if sb_dsp_reset_state != 0 {
-                sb_dsp_reset_state = 0;
-                sb_dsp_read_data = 0xAA;
-                sb_dsp_read_ready = 1;
-            }
-        }
-        _ => {}
-    }
-}
-
-unsafe fn sb_dsp_read(port: u16) -> u8 {
-    match port & 0x00F {
-        0xA => {
-            let v = sb_dsp_read_data;
-            sb_dsp_read_ready = 0;
-            v
-        }
-        0xC => 0x00,
-        0xE => {
-            if sb_dsp_read_ready != 0 {
-                0x80
-            } else {
-                0x00
-            }
-        }
-        _ => 0xFF,
-    }
-}
+// The Sound Blaster and the 8237 DMA controller used to be stubbed here — a DSP
+// that answered only its reset handshake and dropped every command after it, and
+// a DMA "controller" that was one latch for channel 3 while every other DMA port
+// fell through to io_port_error() and killed the process. Both are now real
+// devices on the io_bus: see audio/sb.rs and audio/dma.rs.
 
 #[no_mangle]
 pub unsafe extern "C" fn a20_set_enabled(enabled: bool) {
@@ -7983,22 +8002,28 @@ unsafe fn pit_state_for_channel(channel: u8) -> *mut PITState {
 // gate rise — neither lives in the FROZEN PITState (snapshots serialize that
 // layout byte-for-byte), so they are separate statics. After a snapshot
 // restore they reset (a one-sound transient), which is benign.
-static mut pit_ch2_mode: u8 = 3;
+pub static mut pit_ch2_mode: u8 = 3;
 static mut pit_ch2_load_ns: u64 = 0;
 
-/// Virtual-time elapsed PIT ticks since `since_ns` (1 tick = 838.1ns).
-unsafe fn pit_ticks_since(since_ns: u64) -> u64 {
-    let elapsed = shim_virtual_now_ns().saturating_sub(since_ns);
+/// PIT ticks (1 tick = 838.1ns) between `since_ns` and `now_ns`.
+fn pit_ticks_between(since_ns: u64, now_ns: u64) -> u64 {
+    let elapsed = now_ns.saturating_sub(since_ns);
     ((elapsed as u128 * 1193182u128) / 1_000_000_000u128) as u64
 }
 
-/// The 8254 channel-2 output pin, as port 0x61 bit 5 reports it. Faithful for
-/// the modes games use: mode 0 (one-shot: out low from load until the count
-/// expires — the "wait for timer" poll idiom), mode 2 (rate generator: out
-/// high except one tick at terminal count; forced high while the gate is
-/// low), mode 3 (square wave: high first half of each period; forced high
-/// while the gate is low). The gate is port 0x61 bit 0.
-unsafe fn pit_ch2_output() -> u8 {
+/// The 8254 channel-2 output pin AT a given virtual instant. Faithful for the
+/// modes games use: mode 0 (one-shot: out low from load until the count expires
+/// — the "wait for timer" poll idiom), mode 2 (rate generator: out high except
+/// one tick at terminal count; forced high while the gate is low), mode 3
+/// (square wave: high first half of each period; forced high while the gate is
+/// low). The gate is port 0x61 bit 0.
+///
+/// Parameterised by time rather than reading the clock itself because the audio
+/// mixer renders *past* intervals and needs the pin as a function of time. Both
+/// callers — the guest's port 0x61 bit 5, and the speaker's PCM path — go
+/// through this one model, so the sound a game makes and the bit it reads back
+/// can never disagree.
+pub unsafe fn pit_ch2_output_at(now_ns: u64) -> u8 {
     let gate = port61 & 1;
     let reload: u64 = if pit_channel2.reload != 0 {
         pit_channel2.reload as u64
@@ -8012,21 +8037,26 @@ unsafe fn pit_ch2_output() -> u8 {
             if gate == 0 {
                 return 0;
             }
-            (pit_ticks_since(pit_ch2_load_ns) >= reload) as u8
+            (pit_ticks_between(pit_ch2_load_ns, now_ns) >= reload) as u8
         }
         2 => {
             if gate == 0 {
                 return 1;
             }
-            (pit_ticks_since(pit_ch2_load_ns) % reload != reload - 1) as u8
+            (pit_ticks_between(pit_ch2_load_ns, now_ns) % reload != reload - 1) as u8
         }
         _ => {
             if gate == 0 {
                 return 1;
             }
-            (pit_ticks_since(pit_ch2_load_ns) % reload < (reload + 1) / 2) as u8
+            (pit_ticks_between(pit_ch2_load_ns, now_ns) % reload < (reload + 1) / 2) as u8
         }
     }
+}
+
+/// The channel-2 output pin now, as port 0x61 bit 5 reports it.
+unsafe fn pit_ch2_output() -> u8 {
+    pit_ch2_output_at(shim_virtual_now_ns())
 }
 
 /// The AT's DRAM refresh-detect bit (port 0x61 bit 4): toggles on each PIT
@@ -8249,15 +8279,6 @@ pub unsafe extern "C" fn inb(port: u16) -> u8 {
     if port == 0x92 {
         return port92;
     }
-    if port == 0x06 {
-        let val = if dma_ff != 0 {
-            ((dma3_addr >> 8) & 0xFF) as u8
-        } else {
-            (dma3_addr & 0xFF) as u8
-        };
-        dma_ff ^= 1;
-        return val;
-    }
     if port == 0x64 {
         return if kbd.scancode_ready != 0 { 0x01 } else { 0x00 };
     }
@@ -8331,9 +8352,6 @@ pub unsafe extern "C" fn inb(port: u16) -> u8 {
     if port == 0x3D5 {
         return cga.crtc_regs[(cga.crtc_index & 0x1F) as usize];
     }
-    if sb_dsp_port(port) != 0 {
-        return sb_dsp_read(port);
-    }
     io_port_error(cstr!("inb"), port);
     0
 }
@@ -8355,18 +8373,17 @@ pub unsafe extern "C" fn outb(port: u16, value: u8) {
         ((*dev).write8.unwrap())(port, value);
         return;
     }
+    // The PC speaker's three ports. Render the audio owed up to this instant
+    // BEFORE the write lands, so the samples that precede it are made from the
+    // old state and the change takes effect at its own virtual timestamp. A PWM
+    // speaker driver toggles these thousands of times a second; quantising those
+    // edges to the next service tick would turn digitised speech into noise.
+    // (0x388/0x389 do the same inside the OPL2 device, above.)
+    let speaker_port = matches!(port, 0x42 | 0x43 | 0x61);
+    if speaker_port {
+        crate::audio::catchup();
+    }
     match port {
-        0x06 => {
-            if dma_ff != 0 {
-                dma3_addr = (dma3_addr & 0x00FF) | ((value as u16) << 8);
-            } else {
-                dma3_addr = (dma3_addr & 0xFF00) | value as u16;
-            }
-            dma_ff ^= 1;
-        }
-        0x0C => {
-            dma_ff = 0;
-        }
         0x20 => {
             // 8259A master command port. An EOI clears the IN-SERVICE bit of the
             // acknowledged line; it does NOT discard pending requests (IRR). The
@@ -8594,13 +8611,12 @@ pub unsafe extern "C" fn outb(port: u16, value: u8) {
         0x3CF => {
             vga.graphics_regs[(vga.graphics_index & 0x0F) as usize] = value;
         }
-        _ => {
-            if sb_dsp_port(port) != 0 {
-                sb_dsp_write(port, value);
-            } else {
-                io_port_error(cstr!("outb"), port);
-            }
-        }
+        _ => io_port_error(cstr!("outb"), port),
+    }
+    if speaker_port {
+        // The guest state is now current; hand the mixer the new gate/divisor as
+        // a timestamped event.
+        crate::audio::speaker::on_port_write();
     }
 }
 

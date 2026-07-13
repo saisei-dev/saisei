@@ -90,10 +90,16 @@ in the `saisei-jitc` binary, so the toolchain hash covers it.
   bin's Rust `main` calls it with C argv).
 - **`dos.rs`** (INT 21h: file I/O, memory alloc, console), **`bios.rs`**
   (INT 10h/16h, …), **`mouse.rs`** (INT 33h).
-- Device emulation: **`io_bus.rs`**, **`audio.rs`**, **`video.rs`**,
+- Device emulation: **`io_bus.rs`**, **`video.rs`**,
   **`keyboard.rs`**, **`timer.rs`**; display: **`sdl.rs`**; persistence:
   **`snapshot.rs`**, **`save_manager.rs`** (their `#[repr(C)]` layouts are
   frozen — snapshots serialize them byte-for-byte).
+- Sound: **`audio/`** — OPL2/AdLib FM, the PC speaker, the Tandy SN76489, and a
+  Sound Blaster with the 8237 DMA controller it needs, behind one mixer and one
+  SDL device. Rendered on the guest thread in virtual time. The speaker is
+  deliberately *re-voiced* rather than reproduced, which is argued out in full in
+  **`docs/audio.md`** — as are the three invariants that keep the device queue
+  from running dry.
 - Built as an rlib (linked into the `saisei-game` binary, `-rdynamic` so chunk
   `.so`s resolve shims from the host) and as a cdylib (`libsaisei_runtime.so`,
   dlopen'd in isolated copies by the shim unit tests). Port history and

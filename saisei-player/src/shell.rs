@@ -136,11 +136,13 @@ fn pump(ui: &mut Ui) -> (Action, bool) {
                 }
                 Action::None
             }
-            rt::UI_EV_MOUSE_MOVE => {
-                ui.mouse_move(ev.x as f32, ev.y as f32);
+            rt::UI_EV_MOUSE_MOVE => ui.mouse_move(ev.x as f32, ev.y as f32),
+            rt::UI_EV_MOUSE_DOWN => ui.click(ev.x as f32, ev.y as f32),
+            rt::UI_EV_MOUSE_UP => {
+                ui.mouse_up();
                 Action::None
             }
-            rt::UI_EV_MOUSE_DOWN => ui.click(ev.x as f32, ev.y as f32),
+            rt::UI_EV_MOUSE_WHEEL => ui.wheel(ev.code as f32),
             rt::UI_EV_DROP => {
                 let path = unsafe { std::ffi::CStr::from_ptr(ev.path.as_ptr()) }
                     .to_string_lossy()
@@ -226,11 +228,22 @@ pub fn run(root: &Path) -> ! {
     intro(&mut ui, &mut p);
 
     let mut dirty = true;
+    // Whose volume the slider is currently showing. The library's game page has
+    // one too — a game's loudness is worth being able to set before you open it,
+    // not only once it is already blaring — and moving to another game has to
+    // bring that game's value with it.
+    let mut volume_of: Option<String> = None;
     loop {
         let (act, touched) = pump(&mut ui);
         match act {
             Action::Launch { game, restore } => launch(root, &ui, game, restore),
             Action::Quit => std::process::exit(0),
+            Action::SetVolume(v) => {
+                if let Some(g) = ui.games.get(ui.game) {
+                    crate::settings::set_volume_for(&g.key, v);
+                }
+                dirty = true;
+            }
             Action::AddPath(path) => {
                 crate::add::from_path(root, &mut ui, Path::new(&path));
                 ui.games = games_view(root);
@@ -262,6 +275,16 @@ pub fn run(root: &Path) -> ! {
             // Nothing to resume into: the library is all there is.
             Action::Resume | Action::Save | Action::ToLibrary | Action::None => {}
         }
+        // Keep the slider on the game the player is actually looking at. Only on
+        // a *change* of game — re-seeding every frame would fight a drag.
+        let cur = ui.games.get(ui.game).map(|g| g.key.clone());
+        if cur != volume_of {
+            if let Some(k) = &cur {
+                ui.volume = crate::settings::volume_for(k);
+                dirty = true;
+            }
+            volume_of = cur;
+        }
         if touched || dirty || p.resize_to_window() {
             p.paint(&mut ui, false);
             dirty = false;
@@ -285,6 +308,10 @@ pub fn play(root: &Path, spec: &LaunchSpec, show_logo: bool) -> ! {
     rt::virtual_display_set_splash_logo(show_logo);
     RUNNING.set((root.to_path_buf(), spec.game.clone())).ok();
     unsafe { saisei_runtime::shims::saisei_set_overlay_entry(Some(overlay_entry)) };
+    // This game's remembered volume, before it has had a chance to make a sound.
+    unsafe {
+        saisei_runtime::audio::saisei_audio_set_volume(crate::settings::volume_for(&spec.game))
+    };
     std::process::exit(crate::host::run(root, spec));
 }
 
@@ -316,6 +343,8 @@ unsafe extern "C" fn overlay_entry(can_save: bool) {
         return;
     };
     ui.open_overlay(idx, can_save);
+    // Show the slider where this game actually is, not where a fresh Ui guessed.
+    ui.volume = crate::settings::volume_for(key);
 
     let mut p = Painter::new();
     let mut dirty = true;
@@ -324,6 +353,17 @@ unsafe extern "C" fn overlay_entry(can_save: bool) {
         match act {
             // Back to the game, exactly where it was.
             Action::Resume => return,
+            Action::SetVolume(v) => {
+                // Applied now so it is already right when the guest resumes, and
+                // written now so it survives the player being killed rather than
+                // quit. The preview is what makes the slider usable at all: the
+                // guest is frozen while the menu is up, so without it you would be
+                // setting a level you cannot hear until you close the menu.
+                saisei_runtime::audio::saisei_audio_set_volume(v);
+                saisei_runtime::audio::saisei_audio_preview();
+                crate::settings::set_volume_for(key, v);
+                dirty = true;
+            }
             Action::Save => {
                 ui.message = Some(match save::write(root, key) {
                     Ok(()) => "Saved.".to_string(),

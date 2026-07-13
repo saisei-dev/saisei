@@ -50,27 +50,38 @@ pub fn paint(ui: &mut Ui, cv: &mut Canvas, over_game: bool) {
 
     match ui.screen {
         Screen::Library => paint_library(ui, cv, full, s),
-        Screen::Game => {
-            if over_game {
-                // Centre the page in a panel rather than letting it sprawl over the
-                // whole frozen frame.
-                let w = (1080.0 * s).min(full.w);
-                let h = (620.0 * s).min(full.h);
-                let panel = Rect::new((cv.w as f32 - w) / 2.0, (cv.h as f32 - h) / 2.0, w, h);
-                // The scrim is deliberately light, so the panel has to carry the
-                // separation itself: a soft shadow and an opaque face, not a wash
-                // over the whole window.
-                shadow(cv, panel, t::RADIUS * 1.6, 18.0 * s);
-                cv.rounded(panel, t::RADIUS * 1.6, t::SURFACE);
-                cv.stroke(panel, t::RADIUS * 1.6, 1.0, t::BORDER);
-                paint_game(ui, cv, panel.inset(32.0 * s), s);
+        // The game page and settings are two pages of one surface. In the overlay
+        // they share a single panel, drawn once, here — stepping into Settings
+        // must not resize the thing you are looking at underneath your cursor.
+        Screen::Game | Screen::Settings => {
+            let inner = if over_game {
+                overlay_panel(cv, full, s)
             } else {
-                paint_game(ui, cv, full, s);
+                full
+            };
+            if ui.screen == Screen::Game {
+                paint_game(ui, cv, inner, s);
+            } else {
+                paint_settings(ui, cv, inner, s);
             }
         }
-        Screen::Settings => paint_settings(ui, cv, full, s, over_game),
         Screen::AddGame => paint_add(ui, cv, full, s),
     }
+}
+
+/// The overlay's panel, and the rect its contents get.
+///
+/// The scrim over the frozen game is deliberately light, so the panel has to
+/// carry the separation itself: a soft shadow and an opaque face, rather than
+/// washing out the whole window.
+fn overlay_panel(cv: &mut Canvas, full: Rect, s: f32) -> Rect {
+    let w = (1080.0 * s).min(full.w);
+    let h = (620.0 * s).min(full.h);
+    let panel = Rect::new((cv.w as f32 - w) / 2.0, (cv.h as f32 - h) / 2.0, w, h);
+    shadow(cv, panel, t::RADIUS * 1.6, 18.0 * s);
+    cv.rounded(panel, t::RADIUS * 1.6, t::SURFACE);
+    cv.stroke(panel, t::RADIUS * 1.6, 1.0, t::BORDER);
+    panel.inset(32.0 * s)
 }
 
 fn cv_rect(cv: &Canvas) -> Rect {
@@ -673,30 +684,40 @@ fn paint_saves(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
 
 // ---- settings ---------------------------------------------------------------
 
-fn paint_settings(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32, over_game: bool) {
-    let r = if over_game {
-        let w = (620.0 * s).min(r.w);
-        let h = (300.0 * s).min(r.h);
-        let p = Rect::new((cv.w as f32 - w) / 2.0, (cv.h as f32 - h) / 2.0, w, h);
-        shadow(cv, p, t::RADIUS * 1.6, 18.0 * s);
-        cv.rounded(p, t::RADIUS * 1.6, t::SURFACE);
-        cv.stroke(p, t::RADIUS * 1.6, 1.0, t::BORDER);
-        p.inset(30.0 * s)
-    } else {
-        r
-    };
+fn paint_settings(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
+    let title = ui
+        .games
+        .get(ui.game)
+        .map(|g| g.title.clone())
+        .unwrap_or_default();
     ui.fonts
         .draw_top(cv, "Settings", r.x, r.y, Weight::Bold, 30.0 * s, t::TEXT);
+    // Volume is per game, so say whose. A slider that silently meant something
+    // different depending on where you opened it from would be a trap.
     ui.fonts.draw_top(
         cv,
-        "Nothing to set yet.",
+        &title,
         r.x,
-        r.y + 52.0 * s,
+        r.y + 42.0 * s,
         Weight::Regular,
-        15.0 * s,
-        t::TEXT_DIM,
+        14.5 * s,
+        t::ACCENT,
     );
-    hint(ui, cv, r, s, "Esc back");
+
+    let col_w = (380.0 * s).min(r.w);
+    paint_volume(ui, cv, Rect::new(r.x, r.y + 90.0 * s, col_w, 44.0 * s), s);
+
+    ui.fonts.draw_top(
+        cv,
+        "Remembered for this game.",
+        r.x,
+        r.y + 152.0 * s,
+        Weight::Regular,
+        13.0 * s,
+        t::TEXT_OFF,
+    );
+
+    hint(ui, cv, r, s, "Left/Right or wheel adjusts    Esc back");
 }
 
 // ---- add a game -------------------------------------------------------------
@@ -847,6 +868,57 @@ fn paint_add(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
 
 // ---- shared -----------------------------------------------------------------
 
+/// The volume slider: a label, a track, a filled portion, and a knob.
+///
+/// The track rect is what gets registered as the hit target *and* what rides in
+/// the `Hit`, because for a slider "where you clicked" is the whole message —
+/// the input layer has to be able to turn an x back into a value, and the only
+/// honest source for that mapping is the geometry that was actually painted.
+fn paint_volume(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
+    let v = ui.volume.clamp(0.0, 1.0);
+
+    let label_h = 16.0 * s;
+    ui.fonts
+        .draw_top(cv, "Volume", r.x, r.y, Weight::Bold, 13.0 * s, t::ACCENT);
+    let pct = format!("{}%", (v * 100.0).round() as i32);
+    let pw = ui.fonts.width(&pct, Weight::Regular, 13.0 * s);
+    ui.fonts.draw_top(
+        cv,
+        &pct,
+        r.x + r.w - pw,
+        r.y,
+        Weight::Regular,
+        13.0 * s,
+        t::TEXT_DIM,
+    );
+
+    // The track is inset by the knob's radius at each end, so that a knob at 0%
+    // and a knob at 100% both sit fully inside the widget instead of hanging off.
+    let knob_r = 9.0 * s;
+    let th = 6.0 * s;
+    let ty = r.y + label_h + 12.0 * s;
+    let track = Rect::new(r.x + knob_r, ty, (r.w - knob_r * 2.0).max(1.0), th);
+
+    cv.rounded(track, th / 2.0, t::SURFACE_HI);
+    let filled = Rect::new(track.x, track.y, track.w * v, th);
+    cv.rounded(filled, th / 2.0, t::ACCENT);
+
+    let kx = track.x + track.w * v;
+    let knob = Rect::new(
+        kx - knob_r,
+        ty + th / 2.0 - knob_r,
+        knob_r * 2.0,
+        knob_r * 2.0,
+    );
+    cv.rounded(knob, knob_r, t::TEXT);
+    cv.stroke(knob, knob_r, 2.0 * s, t::ACCENT);
+
+    // Hit area is generous vertically — a 6px track is not something anyone
+    // should have to aim at — but the value always comes from the track's own x.
+    let grab = Rect::new(r.x, r.y, r.w, r.h);
+    ui.push_hot(grab, Hit::Volume(track));
+}
+
 fn hint(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32, text: &str) {
     ui.fonts.draw_top(
         cv,
@@ -857,4 +929,174 @@ fn hint(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32, text: &str) {
         13.0 * s,
         t::TEXT_OFF,
     );
+}
+
+#[cfg(test)]
+mod volume_tests {
+    use crate::{Action, Canvas, GameView, Image, Key, Screen, Ui};
+
+    /// The overlay, stepped into its Settings page — where the slider lives.
+    fn ui() -> Ui {
+        let logo = Image {
+            w: 1,
+            h: 1,
+            rgb: vec![0, 0, 0],
+        };
+        let mut ui = Ui::new(
+            logo,
+            vec![GameView {
+                key: "zeliard_dos_en".into(),
+                title: "Zeliard".into(),
+                saves: vec![],
+            }],
+        );
+        ui.open_overlay(0, true);
+        ui.screen = Screen::Settings;
+        ui.volume = 0.5;
+        ui
+    }
+
+    /// Paint once so the hit rects exist — the slider's geometry is *defined* by
+    /// the paint, so nothing can be clicked before it has been drawn.
+    fn painted(ui: &mut Ui) -> Canvas {
+        let mut cv = Canvas::new(1280, 800);
+        ui.paint(&mut cv, true);
+        cv
+    }
+
+    #[test]
+    fn dragging_the_knob_sets_the_volume() {
+        let mut ui = ui();
+        let cv = painted(&mut ui);
+        let _ = cv;
+        // Find the track the paint registered, then click its far right.
+        let track = ui
+            .hot
+            .iter()
+            .find_map(|(_, h)| match h {
+                crate::Hit::Volume(t) => Some(*t),
+                _ => None,
+            })
+            .expect("the overlay must have a volume slider");
+
+        let act = ui.click(track.x + track.w, track.y + track.h / 2.0);
+        assert_eq!(act, Action::SetVolume(1.0));
+        assert_eq!(ui.volume, 1.0);
+
+        // Dragging left keeps tracking the pointer even off the end of the track.
+        let act = ui.mouse_move(track.x - 500.0, track.y);
+        assert_eq!(act, Action::SetVolume(0.0));
+        assert_eq!(ui.volume, 0.0);
+
+        // ...until the button comes up.
+        ui.mouse_up();
+        assert_eq!(ui.mouse_move(track.x + track.w, track.y), Action::None);
+        assert_eq!(ui.volume, 0.0);
+    }
+
+    #[test]
+    fn the_wheel_moves_it() {
+        let mut ui = ui();
+        painted(&mut ui);
+        // Compared with a tolerance: these are accumulated f32s, and an exact
+        // match would be testing IEEE rounding, not the slider.
+        assert!(matches!(ui.wheel(1.0), Action::SetVolume(_)));
+        assert!((ui.volume - 0.55).abs() < 1e-5, "{}", ui.volume);
+        assert!(matches!(ui.wheel(-2.0), Action::SetVolume(_)));
+        assert!((ui.volume - 0.45).abs() < 1e-5, "{}", ui.volume);
+
+        // And it cannot be driven past the ends.
+        for _ in 0..50 {
+            ui.wheel(-1.0);
+        }
+        assert_eq!(ui.volume, 0.0);
+        assert_eq!(ui.wheel(-1.0), Action::None);
+    }
+
+    #[test]
+    fn arrows_move_it() {
+        let mut ui = ui();
+        painted(&mut ui);
+        // Settings holds one control, so the arrows go straight to it.
+        assert_eq!(ui.key(Key::Right), Action::SetVolume(0.55));
+        assert_eq!(ui.key(Key::Left), Action::SetVolume(0.5));
+        // Esc leaves, and does not move the value on the way out.
+        ui.key(Key::Escape);
+        assert_eq!(ui.screen, Screen::Game);
+        assert_eq!(ui.volume, 0.5);
+    }
+
+    /// The overlay and its Settings page must be the same panel: stepping between
+    /// them cannot resize the thing under the player's cursor.
+    #[test]
+    fn settings_shares_the_overlays_panel() {
+        let mut ui = ui();
+        ui.screen = Screen::Game;
+        let mut a = Canvas::new(1280, 800);
+        ui.paint(&mut a, true);
+
+        ui.screen = Screen::Settings;
+        let mut b = Canvas::new(1280, 800);
+        ui.paint(&mut b, true);
+
+        // The panel's face is opaque SURFACE; find its extent on the centre row
+        // of each and require them to match.
+        let extent = |cv: &Canvas| {
+            let y = cv.h / 2;
+            let row: Vec<bool> = (0..cv.w)
+                .map(|x| cv.px[(y * cv.w + x) * 4 + 3] > 200)
+                .collect();
+            let l = row.iter().position(|&o| o);
+            let r = row.iter().rposition(|&o| o);
+            (l, r)
+        };
+        assert_eq!(
+            extent(&a),
+            extent(&b),
+            "Settings must not resize the overlay panel"
+        );
+    }
+
+    #[test]
+    fn the_knob_is_actually_drawn_where_the_value_says() {
+        let mut ui = ui();
+        ui.volume = 1.0;
+        let cv = painted(&mut ui);
+        let track = ui
+            .hot
+            .iter()
+            .find_map(|(_, h)| match h {
+                crate::Hit::Volume(t) => Some(*t),
+                _ => None,
+            })
+            .unwrap();
+        let y = (track.y + track.h / 2.0) as usize;
+        let at = |x: usize| {
+            let i = (y * cv.w + x) * 4;
+            (cv.px[i], cv.px[i + 1], cv.px[i + 2])
+        };
+        // At 100% the far end of the track is filled and the knob is on it.
+        let right = at((track.x + track.w - 2.0) as usize);
+        let left = at((track.x + 2.0) as usize);
+        assert!(
+            right.0 > 100,
+            "track should be filled at full volume: {right:?}"
+        );
+        assert!(
+            left.0 > 100,
+            "track should be filled at full volume: {left:?}"
+        );
+
+        ui.volume = 0.0;
+        let cv = painted(&mut ui);
+        let at0 = |x: usize| {
+            let i = (y * cv.w + x) * 4;
+            (cv.px[i], cv.px[i + 1], cv.px[i + 2])
+        };
+        let right0 = at0((track.x + track.w - 2.0) as usize);
+        assert!(
+            right0.0 < 80,
+            "track should be empty at zero volume: {right0:?}"
+        );
+    }
 }

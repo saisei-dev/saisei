@@ -56,6 +56,10 @@ pub enum Action {
     AddUrl(String),
     /// The player picked which executable in the bundle is the game.
     PickExe(usize),
+    /// The volume changed. The UI cannot make a sound or write a settings file,
+    /// so it does what it does with everything else: it says so, and the host
+    /// applies it and remembers it.
+    SetVolume(f32),
     /// Put the clipboard's text in the link field. Only the host can read a
     /// clipboard, so the UI can only ask.
     Paste,
@@ -116,6 +120,9 @@ enum Hit {
     Paste,
     ConfirmYes,
     ConfirmNo,
+    /// The volume slider's track. Unlike every other hit, this one is
+    /// *positional*: where along it you landed is the value you asked for.
+    Volume(Rect),
 }
 
 pub struct Ui {
@@ -144,6 +151,13 @@ pub struct Ui {
     /// dangerous answer should never be the one a stray Enter gives.
     delete_yes: bool,
 
+    /// Master volume, 0..1. The host seeds this from the settings file (per game,
+    /// falling back to the default) and writes it back when it changes.
+    pub volume: f32,
+    /// True while the volume knob is being dragged, so a mouse-move keeps moving
+    /// it even once the pointer has slid off the track.
+    dragging_volume: bool,
+
     /// Filled by paint; read by the mouse. Cleared each frame.
     hot: Vec<(Rect, Hit)>,
     /// Columns the library grid last used, so Up/Down move by a row.
@@ -169,6 +183,8 @@ impl Ui {
             message: None,
             deleting: None,
             delete_yes: false,
+            volume: 0.6,
+            dragging_volume: false,
             hot: Vec::new(),
             cols: 1,
             scroll: 0,
@@ -238,12 +254,17 @@ impl Ui {
         match self.screen {
             Screen::Library => self.key_library(k),
             Screen::Game => self.key_game(k),
-            Screen::Settings => {
-                if matches!(k, Key::Escape | Key::Enter | Key::Overlay) {
+            // Settings holds one control, so it takes the arrows directly rather
+            // than making you first move a cursor onto the only thing there is.
+            Screen::Settings => match k {
+                Key::Left => self.volume_from_key(-0.05),
+                Key::Right => self.volume_from_key(0.05),
+                Key::Escape | Key::Enter | Key::Overlay => {
                     self.screen = Screen::Game;
+                    Action::None
                 }
-                Action::None
-            }
+                _ => Action::None,
+            },
             Screen::AddGame => self.key_add(k),
         }
     }
@@ -463,10 +484,32 @@ impl Ui {
         Action::AddPath(path.to_string())
     }
 
-    pub fn mouse_move(&mut self, x: f32, y: f32) {
+    pub fn mouse_move(&mut self, x: f32, y: f32) -> Action {
+        // A drag in progress owns the pointer: the knob keeps following it even
+        // once it has slid off the track, which is what every slider does and
+        // what anyone dragging one expects.
+        if self.dragging_volume {
+            if let Some(track) = self.volume_track() {
+                return self.set_volume(value_along(track, x));
+            }
+        }
         if let Some(hit) = self.hit(x, y) {
             self.point_at(hit);
         }
+        Action::None
+    }
+
+    /// The mouse came up. Ends a drag; nothing else in the UI cares.
+    pub fn mouse_up(&mut self) {
+        self.dragging_volume = false;
+    }
+
+    /// The wheel turned. `dy` is in notches, positive away from the user.
+    pub fn wheel(&mut self, dy: f32) -> Action {
+        if self.volume_track().is_some() {
+            return self.set_volume(self.volume + dy * 0.05);
+        }
+        Action::None
     }
 
     pub fn click(&mut self, x: f32, y: f32) -> Action {
@@ -478,6 +521,12 @@ impl Ui {
                     Hit::Action(_) | Hit::Save(_) => self.activate(),
                     Hit::Exe(i) => Action::PickExe(i),
                     Hit::Paste => Action::Paste,
+                    // Clicking a slider anywhere jumps to that value and starts a
+                    // drag from there — one gesture, not two.
+                    Hit::Volume(track) => {
+                        self.dragging_volume = true;
+                        self.set_volume(value_along(track, x))
+                    }
                     Hit::Trash(i) => {
                         self.offer_delete(i);
                         Action::None
@@ -496,6 +545,24 @@ impl Ui {
         }
     }
 
+    /// The volume slider's track, if one is on screen. Recorded during paint, so
+    /// it cannot drift from what the player can actually see.
+    fn volume_track(&self) -> Option<Rect> {
+        self.hot.iter().find_map(|(_, h)| match h {
+            Hit::Volume(track) => Some(*track),
+            _ => None,
+        })
+    }
+
+    fn set_volume(&mut self, v: f32) -> Action {
+        let v = v.clamp(0.0, 1.0);
+        if (v - self.volume).abs() < 1.0e-4 {
+            return Action::None;
+        }
+        self.volume = v;
+        Action::SetVolume(v)
+    }
+
     /// Move the cursor to whatever the pointer is over, so the keyboard and the
     /// mouse share one selection rather than fighting over two.
     fn point_at(&mut self, hit: Hit) {
@@ -510,6 +577,9 @@ impl Ui {
                 self.focus = Focus::Saves;
                 self.save = i;
             }
+            // The slider is not a cursor position — it is a value, and hovering it
+            // must not steal the selection from the actions behind it.
+            Hit::Volume(_) => {}
             Hit::Exe(i) => self.add.exe_idx = i,
             // Hovering the trash must not arm it — only pressing it opens the
             // question.
@@ -527,6 +597,11 @@ impl Ui {
             .map(|(_, h)| *h)
     }
 
+    /// Where along a track an x lands, as 0..1.
+    fn volume_from_key(&mut self, delta: f32) -> Action {
+        self.set_volume(self.volume + delta)
+    }
+
     // ---- paint ------------------------------------------------------------
 
     /// Paint the interface into `cv`.
@@ -541,6 +616,14 @@ impl Ui {
     fn push_hot(&mut self, r: Rect, h: Hit) {
         self.hot.push((r, h));
     }
+}
+
+/// Where along `track` the x coordinate `x` lands, as 0..1.
+fn value_along(track: Rect, x: f32) -> f32 {
+    if track.w <= 0.0 {
+        return 0.0;
+    }
+    ((x - track.x) / track.w).clamp(0.0, 1.0)
 }
 
 #[cfg(test)]

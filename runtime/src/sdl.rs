@@ -93,12 +93,26 @@ struct SdlDropEvent {
     window_id: u32,
 }
 #[repr(C)]
+#[derive(Clone, Copy)]
+struct SdlMouseWheelEvent {
+    type_: u32,
+    timestamp: u32,
+    window_id: u32,
+    which: u32,
+    x: i32,
+    y: i32,
+    /// SDL_MOUSEWHEEL_FLIPPED (1) means the platform already inverted it.
+    direction: u32,
+}
+
+#[repr(C)]
 union SdlEvent {
     type_: u32,
     window: SdlWindowEvent,
     key: SdlKeyboardEvent,
     motion: SdlMouseMotionEvent,
     button: SdlMouseButtonEvent,
+    wheel: SdlMouseWheelEvent,
     text: SdlTextInputEvent,
     drop: SdlDropEvent,
     padding: [u8; 56],
@@ -200,6 +214,8 @@ const SDL_KEYUP: u32 = 0x301;
 const SDL_MOUSEMOTION: u32 = 0x400;
 const SDL_MOUSEBUTTONDOWN: u32 = 0x401;
 const SDL_MOUSEBUTTONUP: u32 = 0x402;
+const SDL_MOUSEWHEEL: u32 = 0x403;
+const SDL_MOUSEWHEEL_FLIPPED: u32 = 1;
 
 const SDL_WINDOWEVENT_HIDDEN: u8 = 2;
 const SDL_WINDOWEVENT_SIZE_CHANGED: u8 = 6;
@@ -1035,6 +1051,10 @@ pub extern "C" fn virtual_display_open_window(width: c_int, height: c_int, scale
             SDL_Quit();
             return false;
         }
+        // Sound rides on the same "we have a UI" decision as the window, so a
+        // headless run never opens a device. A machine with no sound card is not
+        // an error: the game runs silent rather than refusing to start.
+        crate::audio::saisei_audio_init();
         true
     }
 }
@@ -1070,6 +1090,7 @@ pub extern "C" fn virtual_display_init(width: c_int, height: c_int, scale: c_int
 #[no_mangle]
 pub extern "C" fn virtual_display_shutdown() {
     unsafe {
+        crate::audio::saisei_audio_shutdown();
         free(RGB_BUFFER as *mut c_void);
         RGB_BUFFER = core::ptr::null_mut();
         RGB_BUFFER_SIZE = 0;
@@ -1187,6 +1208,11 @@ pub const UI_EV_QUIT: c_int = 3;
 pub const UI_EV_MOUSE_MOVE: c_int = 4;
 pub const UI_EV_MOUSE_DOWN: c_int = 5;
 pub const UI_EV_DROP: c_int = 6;
+/// The button came up. The menu never needed this until it grew a control you
+/// can *drag* — a slider — which has to know when the drag ended.
+pub const UI_EV_MOUSE_UP: c_int = 7;
+/// The wheel turned; `code` carries the notch count, positive away from the user.
+pub const UI_EV_MOUSE_WHEEL: c_int = 8;
 
 pub const UI_KEY_UP: c_int = 1;
 pub const UI_KEY_DOWN: c_int = 2;
@@ -1348,6 +1374,27 @@ pub extern "C" fn saisei_ui_poll(out: *mut UiEvent) -> bool {
                     ev.kind = UI_EV_MOUSE_DOWN;
                     ev.x = (e.button.x as f32 * scale) as c_int;
                     ev.y = (e.button.y as f32 * scale) as c_int;
+                }
+            }
+            SDL_MOUSEBUTTONUP => {
+                if e.button.button == 1 {
+                    ev.kind = UI_EV_MOUSE_UP;
+                    ev.x = (e.button.x as f32 * scale) as c_int;
+                    ev.y = (e.button.y as f32 * scale) as c_int;
+                }
+            }
+            SDL_MOUSEWHEEL => {
+                // The wheel event carries no usable pointer position before SDL
+                // 2.26, so it deliberately carries none here either: the menu
+                // routes a wheel to whatever continuous control is on screen, not
+                // to whatever the pointer happens to be over.
+                let mut dy = e.wheel.y;
+                if e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED {
+                    dy = -dy;
+                }
+                if dy != 0 {
+                    ev.kind = UI_EV_MOUSE_WHEEL;
+                    ev.code = dy as c_int;
                 }
             }
             SDL_DROPFILE => {

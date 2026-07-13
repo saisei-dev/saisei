@@ -26,7 +26,12 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 [lib]
 crate-type = ["rlib", "cdylib"]
 path = "src/lib.rs"
-# No unit tests here (it links extern C symbols from the rest of the runtime,
-# unavailable at test-link time); validated end-to-end by running the game.
-test = false
+# Unit tests run here for the parts that are pure functions of their own state —
+# the emulated sound chips, the splash, the window title. Anything that needs a
+# live machine (the shims, the dispatcher) is still tested end-to-end by running
+# the game, and by the dlopen'd shim tests in saisei-jitc/tests.
+#
+# The chips are `static mut` globals, exactly as the guest sees them, so their
+# tests must take a lock rather than run in parallel — see audio::opl2::tests.
+test = true
 doctest = false

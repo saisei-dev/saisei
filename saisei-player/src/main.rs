@@ -11,6 +11,7 @@ mod host;
 mod library;
 mod relaunch;
 mod save;
+mod settings;
 mod shell;
 
 use host::LaunchSpec;
