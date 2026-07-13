@@ -7964,6 +7964,123 @@ static INIT_MEMORY_CTOR: unsafe extern "C" fn() = init_memory;
 pub static mut port61: u8 = 0;
 static mut port92: u8 = 0;
 
+// ---------------------------------------------------------------------------
+// Snapshot blocks for the hardware modelled in this file (see devices.rs).
+//
+// None of this was in ShimRuntimeState, which stopped at the video regs, the
+// OPL2 register file and PIT channel 0. Everything below is guest-programmable
+// and was being dropped by a save/load: the 8259A's mask (so a restored game got
+// back whichever IRQs *we* unmask at power-on, not the ones it had chosen), the
+// speaker's gate and its channel-2 divisor (its pitch), and the A20 port.
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PicSnap {
+    imr: u8,
+    isr: u8,
+    read_isr: u8,
+    vector_base: u8,
+    icw_step: u8,
+    icw_needs_icw4: u8,
+    icw_single: u8,
+    pic2_imr: u8,
+    pic2_isr: u8,
+    pic2_read_isr: u8,
+}
+
+pub(crate) unsafe fn pic_state_capture(out: &mut Vec<u8>) {
+    let s = PicSnap {
+        imr: pic_imr,
+        isr: pic_isr,
+        read_isr: pic_read_isr,
+        vector_base: pic_vector_base,
+        icw_step: pic_icw_step,
+        icw_needs_icw4: pic_icw_needs_icw4,
+        icw_single: pic_icw_single,
+        pic2_imr,
+        pic2_isr,
+        pic2_read_isr,
+    };
+    crate::devices::pod_capture(&s, out);
+}
+
+pub(crate) unsafe fn pic_state_restore(b: &[u8]) -> bool {
+    match crate::devices::pod_restore::<PicSnap>(b) {
+        Some(s) => {
+            pic_imr = s.imr;
+            pic_isr = s.isr;
+            pic_read_isr = s.read_isr;
+            pic_vector_base = s.vector_base;
+            pic_icw_step = s.icw_step;
+            pic_icw_needs_icw4 = s.icw_needs_icw4;
+            pic_icw_single = s.icw_single;
+            pic2_imr = s.pic2_imr;
+            pic2_isr = s.pic2_isr;
+            pic2_read_isr = s.pic2_read_isr;
+            true
+        }
+        None => false,
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PortSnap {
+    port61: u8,
+    port92: u8,
+}
+
+pub(crate) unsafe fn port_state_capture(out: &mut Vec<u8>) {
+    let s = PortSnap { port61, port92 };
+    crate::devices::pod_capture(&s, out);
+}
+
+pub(crate) unsafe fn port_state_restore(b: &[u8]) -> bool {
+    match crate::devices::pod_restore::<PortSnap>(b) {
+        Some(s) => {
+            port61 = s.port61;
+            port92 = s.port92;
+            true
+        }
+        None => false,
+    }
+}
+
+/// PIT channels 1 and 2, and channel 2's mode/load time. ShimRuntimeState
+/// carries channel 0 (the BIOS tick) and nothing else — but channel 2 *is* the
+/// speaker's pitch, and a game sets a tone's divisor once and leaves it.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PitAuxSnap {
+    channel1: PITState,
+    channel2: PITState,
+    ch2_mode: u8,
+    ch2_load_ns: u64,
+}
+
+pub(crate) unsafe fn pit_aux_state_capture(out: &mut Vec<u8>) {
+    let mut s: PitAuxSnap = core::mem::zeroed();
+    s.channel1 = pit_channel1;
+    s.channel2 = pit_channel2;
+    s.ch2_mode = pit_ch2_mode;
+    s.ch2_load_ns = pit_ch2_load_ns;
+    crate::devices::pod_capture(&s, out);
+}
+
+pub(crate) unsafe fn pit_aux_state_restore(b: &[u8]) -> bool {
+    match crate::devices::pod_restore::<PitAuxSnap>(b) {
+        Some(s) => {
+            pit_channel1 = s.channel1;
+            pit_channel2 = s.channel2;
+            pit_ch2_mode = s.ch2_mode;
+            pit_ch2_load_ns = s.ch2_load_ns;
+            true
+        }
+        None => false,
+    }
+}
+
 // The Sound Blaster and the 8237 DMA controller used to be stubbed here — a DSP
 // that answered only its reset handshake and dropped every command after it, and
 // a DMA "controller" that was one latch for channel 3 while every other DMA port

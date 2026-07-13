@@ -40,6 +40,37 @@ pub extern "C" fn io_bus_register(dev: *const IoDevice) {
     }
 }
 
+/// Every device currently on the bus, as (name, claimed ports).
+///
+/// The snapshot guardrail (`devices::tests`) walks this to assert that each
+/// device on the bus has somewhere to keep its state across a save — so a new
+/// sound card cannot be added without either persisting it or saying, in the
+/// test, why it needs no persisting.
+pub fn registered_devices() -> Vec<(String, Vec<u16>)> {
+    unsafe {
+        let count = core::ptr::addr_of!(IO_DEVICE_COUNT).read();
+        let devs = core::ptr::addr_of!(IO_DEVICES) as *const *const IoDevice;
+        let mut out = Vec::new();
+        for i in 0..count {
+            let dev = devs.add(i).read();
+            if dev.is_null() {
+                continue;
+            }
+            let name = core::ffi::CStr::from_ptr((*dev).name)
+                .to_string_lossy()
+                .into_owned();
+            let mut ports = Vec::new();
+            let mut p = (*dev).ports;
+            while !p.is_null() && *p != 0xFFFF {
+                ports.push(*p);
+                p = p.add(1);
+            }
+            out.push((name, ports));
+        }
+        out
+    }
+}
+
 /// The device claiming `port`, or NULL if none (caller falls back to legacy).
 #[no_mangle]
 pub extern "C" fn io_bus_lookup(port: u16) -> *const IoDevice {

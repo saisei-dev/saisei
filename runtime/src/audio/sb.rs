@@ -78,6 +78,118 @@ pub struct Sb {
 
 static mut SB: Option<Sb> = None;
 
+// ---- snapshot block (see devices.rs) ---------------------------------------
+//
+// The mixer registers and the sample rate are set once, when the game finds the
+// card; the playback mode and the pending IRQ are what a sound in progress
+// consists of. `acc`/`level`/`lpf` are the render side — a fraction of one
+// sample period and the DAC's own filter — and are deliberately left out: they
+// re-derive within a sample of resuming, and they are not state the guest can
+// name. The command being assembled (`cmd`/`args`) travels because a save can
+// land between a DSP command byte and its arguments.
+
+/// Bounds for the two Vec fields. A DSP command takes at most a handful of
+/// argument bytes and `0xE1` is the longest reply; anything past this is a bug,
+/// not a state we need to carry.
+const SNAP_ARGS_MAX: usize = 8;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SbSnap {
+    /// 0 = no command in progress, else `cmd + 1`.
+    cmd_plus1: u16,
+    args_len: u8,
+    args: [u8; SNAP_ARGS_MAX],
+    reset_latch: u8,
+    out: u8,
+    out_ready: u8,
+    out_queue_len: u8,
+    out_queue: [u8; SNAP_ARGS_MAX],
+    rate_hz: u32,
+    block_len: u16,
+    /// 0 = Idle, 1 = Single, 2 = AutoInit.
+    mode: u8,
+    paused: u8,
+    speaker_on: u8,
+    irq: u8,
+    irq_pending: u8,
+    mixer_addr: u8,
+    mixer_regs: [u8; 256],
+}
+
+fn mode_to_u8(m: Mode) -> u8 {
+    match m {
+        Mode::Idle => 0,
+        Mode::Single => 1,
+        Mode::AutoInit => 2,
+    }
+}
+
+fn mode_from_u8(v: u8) -> Mode {
+    match v {
+        1 => Mode::Single,
+        2 => Mode::AutoInit,
+        _ => Mode::Idle,
+    }
+}
+
+pub(crate) unsafe fn state_capture(out_buf: &mut Vec<u8>) {
+    let c = sb();
+    // Zeroed, not a struct literal: `pod_capture` copies the struct's bytes and
+    // a literal leaves any padding undefined, so two captures of the same card
+    // would not compare equal. See devices::pod_capture.
+    let mut s: SbSnap = core::mem::zeroed();
+    s.cmd_plus1 = c.cmd.map_or(0, |b| b as u16 + 1);
+    s.reset_latch = c.reset_latch as u8;
+    s.out = c.out;
+    s.out_ready = c.out_ready as u8;
+    s.rate_hz = c.rate_hz;
+    s.block_len = c.block_len;
+    s.mode = mode_to_u8(c.mode);
+    s.paused = c.paused as u8;
+    s.speaker_on = c.speaker_on as u8;
+    s.irq = c.irq;
+    s.irq_pending = c.irq_pending as u8;
+    s.mixer_addr = c.mixer_addr;
+    s.mixer_regs = c.mixer_regs;
+    let n = c.args.len().min(SNAP_ARGS_MAX);
+    s.args_len = n as u8;
+    s.args[..n].copy_from_slice(&c.args[..n]);
+    let n = c.out_queue.len().min(SNAP_ARGS_MAX);
+    s.out_queue_len = n as u8;
+    s.out_queue[..n].copy_from_slice(&c.out_queue[..n]);
+    crate::devices::pod_capture(&s, out_buf);
+}
+
+pub(crate) unsafe fn state_restore(b: &[u8]) -> bool {
+    let s = match crate::devices::pod_restore::<SbSnap>(b) {
+        Some(s) => s,
+        None => return false,
+    };
+    reset();
+    let c = sb();
+    c.cmd = if s.cmd_plus1 == 0 {
+        None
+    } else {
+        Some((s.cmd_plus1 - 1) as u8)
+    };
+    c.args = s.args[..(s.args_len as usize).min(SNAP_ARGS_MAX)].to_vec();
+    c.reset_latch = s.reset_latch != 0;
+    c.out = s.out;
+    c.out_ready = s.out_ready != 0;
+    c.out_queue = s.out_queue[..(s.out_queue_len as usize).min(SNAP_ARGS_MAX)].to_vec();
+    c.rate_hz = s.rate_hz;
+    c.block_len = s.block_len;
+    c.mode = mode_from_u8(s.mode);
+    c.paused = s.paused != 0;
+    c.speaker_on = s.speaker_on != 0;
+    c.irq = s.irq;
+    c.irq_pending = s.irq_pending != 0;
+    c.mixer_addr = s.mixer_addr;
+    c.mixer_regs = s.mixer_regs;
+    true
+}
+
 unsafe fn sb() -> &'static mut Sb {
     if (*core::ptr::addr_of!(SB)).is_none() {
         reset();
@@ -379,12 +491,12 @@ pub unsafe fn render(buf: &mut [f32]) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::{Mutex, MutexGuard};
 
     static LOCK: Mutex<()> = Mutex::new(());
-    fn claim() -> MutexGuard<'static, ()> {
+    pub(crate) fn claim() -> MutexGuard<'static, ()> {
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 

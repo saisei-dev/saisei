@@ -62,6 +62,79 @@ pub struct Dma {
 
 static mut DMA: Option<Dma> = None;
 
+// ---- snapshot block (see devices.rs) ---------------------------------------
+//
+// A Sound Blaster playing a sample is a DMA transfer in flight: the channel's
+// *current* address and count are how far through the buffer the card has got.
+// Lose them and a save taken during a digitised sound comes back with the
+// channel masked at power-on — the transfer does not resume, and (worse) an
+// auto-init block that the game expects to keep looping simply stops.
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ChannelSnap {
+    base_addr: u16,
+    base_count: u16,
+    cur_addr: u16,
+    cur_count: u16,
+    page: u8,
+    mode: u8,
+    masked: u8,
+    tc: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DmaSnap {
+    ch: [ChannelSnap; CHANNELS],
+    flip: u8,
+}
+
+pub(crate) unsafe fn state_capture(out: &mut Vec<u8>) {
+    let d = dma();
+    // Zeroed, not a struct literal: `pod_capture` copies the struct's bytes and
+    // a literal leaves any padding undefined, so two captures of the same chip
+    // would not compare equal. See devices::pod_capture.
+    let mut s: DmaSnap = core::mem::zeroed();
+    s.flip = d.flip as u8;
+    for i in 0..CHANNELS {
+        let c = &d.ch[i];
+        s.ch[i].base_addr = c.base_addr;
+        s.ch[i].base_count = c.base_count;
+        s.ch[i].cur_addr = c.cur_addr;
+        s.ch[i].cur_count = c.cur_count;
+        s.ch[i].page = c.page;
+        s.ch[i].mode = c.mode;
+        s.ch[i].masked = c.masked as u8;
+        s.ch[i].tc = c.tc as u8;
+    }
+    crate::devices::pod_capture(&s, out);
+}
+
+pub(crate) unsafe fn state_restore(b: &[u8]) -> bool {
+    let s = match crate::devices::pod_restore::<DmaSnap>(b) {
+        Some(s) => s,
+        None => return false,
+    };
+    reset();
+    let d = dma();
+    d.flip = s.flip != 0;
+    for i in 0..CHANNELS {
+        let c = &s.ch[i];
+        d.ch[i] = Channel {
+            base_addr: c.base_addr,
+            base_count: c.base_count,
+            cur_addr: c.cur_addr,
+            cur_count: c.cur_count,
+            page: c.page,
+            mode: c.mode,
+            masked: c.masked != 0,
+            tc: c.tc != 0,
+        };
+    }
+    true
+}
+
 unsafe fn dma() -> &'static mut Dma {
     if (*core::ptr::addr_of!(DMA)).is_none() {
         reset();

@@ -44,6 +44,7 @@ struct MouseEvent {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct MouseState {
     x: i16,
     y: i16,
@@ -157,6 +158,34 @@ fn mouse_reset_state() {
         m.show_count = -1; // driver starts with the cursor hidden
         m.installed = 1;
         MOUSE_DELIVERING = 0;
+    }
+}
+
+/// Snapshot capture/restore (see `devices.rs`).
+///
+/// The whole driver is one POD struct, so its bytes *are* its state. On a real
+/// machine the mouse driver is a TSR: it sits in memory across a game's save and
+/// load, and the game never re-initializes it. Ours lives in the host process,
+/// which a restore replaces — so without this the driver came back at its
+/// power-on zeros, and those zeros are lethal twice over. `installed` is 0, so
+/// the fn-0x0C callback never fires; and the clamp window is 0x0 — every
+/// position clamps to (0,0), so the pointer cannot move and fn 0x03 forever
+/// reports the top-left corner. The mouse is not broken after a load, it is
+/// *absent*.
+pub unsafe fn state_capture(out: &mut Vec<u8>) {
+    crate::devices::pod_capture(&*mm(), out);
+}
+
+pub unsafe fn state_restore(b: &[u8]) -> bool {
+    match crate::devices::pod_restore::<MouseState>(b) {
+        Some(s) => {
+            *mm() = s;
+            // Not a captured field: the guard is only ever set while we are
+            // inside a callback, and a fresh process is not inside one.
+            MOUSE_DELIVERING = 0;
+            true
+        }
+        None => false,
     }
 }
 

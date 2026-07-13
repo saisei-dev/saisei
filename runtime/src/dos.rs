@@ -144,6 +144,52 @@ static mut dos_current_drive: u8 = 0; // 0 = A:
 static mut dos_last_alloc_seg: u16 = 0;
 static mut dos_child_return_code: u16 = 0;
 
+// ---- snapshot block (see devices.rs) ---------------------------------------
+//
+// DOS is a device too, as far as a save is concerned: these are the values INT
+// 21h reports back, and none of them was in ShimRuntimeState. The DTA is the one
+// that needs a conversion — it is held as a host pointer into guest RAM, which
+// means nothing in the next process, so it travels as the linear address it
+// actually is.
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DosSnap {
+    current_psp: u16,
+    ext_scancode_pending: u8,
+    current_drive: u8,
+    last_alloc_seg: u16,
+    child_return_code: u16,
+    dta_linear: u32,
+}
+
+pub(crate) unsafe fn state_capture(out: &mut Vec<u8>) {
+    let s = DosSnap {
+        current_psp: dos_current_psp,
+        ext_scancode_pending: dos_ext_scancode_pending,
+        current_drive: dos_current_drive,
+        last_alloc_seg: dos_last_alloc_seg,
+        child_return_code: dos_child_return_code,
+        dta_linear: crate::devices::ptr_to_linear(dta_ptr),
+    };
+    crate::devices::pod_capture(&s, out);
+}
+
+pub(crate) unsafe fn state_restore(b: &[u8]) -> bool {
+    match crate::devices::pod_restore::<DosSnap>(b) {
+        Some(s) => {
+            dos_current_psp = s.current_psp;
+            dos_ext_scancode_pending = s.ext_scancode_pending;
+            dos_current_drive = s.current_drive;
+            dos_last_alloc_seg = s.last_alloc_seg;
+            dos_child_return_code = s.child_return_code;
+            dta_ptr = crate::devices::linear_to_ptr(s.dta_linear);
+            true
+        }
+        None => false,
+    }
+}
+
 // ---- small helpers ---------------------------------------------------------
 
 #[inline(always)]

@@ -53,6 +53,57 @@ pub struct Sn76489 {
 
 static mut CHIP: Option<Sn76489> = None;
 
+// ---- snapshot block (see devices.rs) ---------------------------------------
+//
+// The SN76489 is a write-only chip: there is no port to read a register back
+// from, so nothing in the guest ever rewrites what it has already set. Its
+// register file *is* the voice — drop it across a load and a game that
+// programmed its tones at the start of a level comes back to a silent chip and
+// never says another word to it. The oscillator state (counters, flip-flops,
+// LFSR) rides along because it is cheap and it keeps a held note continuous
+// across the load rather than restarting its phase.
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SnSnap {
+    regs: [u16; 8],
+    latch: u32,
+    counters: [i32; 4],
+    flip: [u8; 3],
+    lfsr: u16,
+    noise_out: u8,
+}
+
+pub(crate) unsafe fn state_capture(out: &mut Vec<u8>) {
+    let c = chip();
+    let mut s: SnSnap = core::mem::zeroed();
+    s.regs = c.regs;
+    s.latch = c.latch as u32;
+    s.counters = c.counters;
+    s.flip = [c.flip[0] as u8, c.flip[1] as u8, c.flip[2] as u8];
+    s.lfsr = c.lfsr;
+    s.noise_out = c.noise_out as u8;
+    crate::devices::pod_capture(&s, out);
+}
+
+pub(crate) unsafe fn state_restore(b: &[u8]) -> bool {
+    let s = match crate::devices::pod_restore::<SnSnap>(b) {
+        Some(s) => s,
+        None => return false,
+    };
+    // `reset()` first: it is what builds the chip (and its filter) in a process
+    // that has not seen a register write yet.
+    reset();
+    let c = chip();
+    c.regs = s.regs;
+    c.latch = (s.latch as usize).min(7);
+    c.counters = s.counters;
+    c.flip = [s.flip[0] != 0, s.flip[1] != 0, s.flip[2] != 0];
+    c.lfsr = s.lfsr;
+    c.noise_out = s.noise_out != 0;
+    true
+}
+
 /// The chip exists from its first register write, not from audio init: a game
 /// may program it before (or without) a device being open, and its register file
 /// *is* its state — dropping those writes would lose the voice. Rendering is
@@ -234,12 +285,12 @@ extern "C" fn sn_register() {
 static SN_CTOR: extern "C" fn() = sn_register;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::{Mutex, MutexGuard};
 
     static LOCK: Mutex<()> = Mutex::new(());
-    fn claim() -> MutexGuard<'static, ()> {
+    pub(crate) fn claim() -> MutexGuard<'static, ()> {
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 

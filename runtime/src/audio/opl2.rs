@@ -361,6 +361,31 @@ pub unsafe fn synth_reset() {
     });
 }
 
+/// Rebuild the FM synth from the restored register file (see `devices.rs`).
+///
+/// The OPL2's register file is the one piece of audio state a snapshot always
+/// carried — it rides in `ShimRuntimeState`. But the chip you *hear* is not that
+/// byte array: it is `SYNTH`, and `SYNTH` is built up by `synth_write` on each
+/// port write, not from the array. So a restore used to hand the guest a
+/// perfectly programmed register file attached to a synth that had never been
+/// programmed at all: every instrument patch, the waveform-select enable and
+/// rhythm mode were back to ctor defaults, and the game — which sets its patches
+/// once and then only sends notes — had no reason to ever write them again.
+///
+/// Replaying the whole file in ascending order is exactly the sequence of writes
+/// that would have produced it. Order is not delicate: `synth_write` reads every
+/// register it consults (0xBD for rhythm, 0xB0-0xB8 for the keys) out of the
+/// restored file rather than out of the replay, so each write already sees the
+/// finished chip. A note that was sounding re-attacks rather than resuming
+/// mid-envelope — the envelope phase is derived state we do not carry — which
+/// costs one note's attack on load and nothing else.
+pub unsafe fn resync_synth_from_registers() {
+    synth_reset();
+    for r in 0..=0xFFusize {
+        synth_write(r as u8, reg(r));
+    }
+}
+
 // ---- register access ---------------------------------------------------------
 
 #[inline]
@@ -927,7 +952,7 @@ pub(crate) mod tests {
     /// with it or they simply overwrite each other's notes.
     static CHIP_LOCK: Mutex<()> = Mutex::new(());
 
-    pub(super) fn claim_chip() -> MutexGuard<'static, ()> {
+    pub(crate) fn claim_chip() -> MutexGuard<'static, ()> {
         // A panicking test poisons the lock; the next one still wants the chip.
         CHIP_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }

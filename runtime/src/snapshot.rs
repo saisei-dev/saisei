@@ -575,6 +575,15 @@ fn write_pre_key_snapshot(dir: *const c_char) {
             core::mem::size_of::<ShimRuntimeState>(),
         );
 
+        /* 3c. Device state — the mouse, the PIC, PIT channels 1/2, port 61h/92h,
+         * DOS, and the sound chips. ShimRuntimeState is a frozen v6 layout that
+         * restore refuses on a version mismatch, so extending it would make every
+         * save the player already has unloadable. The devices go in their own
+         * tagged block file instead. */
+        if !crate::devices::write_to_bundle(dir) {
+            sr_log!(c"save: failed to write devices.bin\n".as_ptr());
+        }
+
         /* 4. file_mappings TSV */
         libc::snprintf(
             path.as_mut_ptr(),
@@ -913,6 +922,11 @@ pub extern "C" fn snapshot_restore_and_resume(bundle_dir: *const c_char) -> c_in
 
         /* 5. keyboard queue */
         shim_kbd_state_restore(core::ptr::addr_of!(SNAP_CPU.kbd));
+
+        /* 5b. Device state. Must come after the shim_state restore above: the
+         * OPL2's register file arrives with *that*, and this is what replays it
+         * into the FM synth the guest is actually heard through. */
+        crate::devices::read_from_bundle(bundle_dir);
 
         /* 6. re-enter the binary that was executing at capture time. */
         let ab_ptr = core::ptr::addr_of!(SNAP_CPU.active_binary) as *const c_char;
