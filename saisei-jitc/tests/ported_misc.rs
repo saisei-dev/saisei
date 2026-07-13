@@ -118,7 +118,9 @@ fn rcb_mov__reads_and_writes_via_rcb_helpers() {
 }
 
 #[test]
-fn rcb_arithmetic__is_unsupported() {
+fn rcb_arithmetic__traps_rather_than_reading_the_wrong_place() {
+    // An RCB field as an arithmetic operand has no faithful lowering, so it must
+    // not be emitted as an ordinary memory access: it becomes a named trap.
     let func = json!({
         "start": 0x0000,
         "instructions": [
@@ -126,8 +128,11 @@ fn rcb_arithmetic__is_unsupported() {
             {"address": 0x0003, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-    let err = try_render_rs(&func, &[], "").unwrap_err();
-    assert!(err.0.contains("rcb"), "{}", err.0);
+    let src = render_rs(&func, &[], "");
+    assert!(
+        src.contains(r#"r.jit_unsupported_instruction(c"add rcb".as_ptr());"#),
+        "{src}"
+    );
 }
 
 // ==========================================================================

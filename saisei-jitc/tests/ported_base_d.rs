@@ -304,21 +304,79 @@ fn rep_cmp__bare_rep_prefix_on_a_compare_is_repe() {
     }
 }
 
+/// Only the compares set flags, so only they can end a repeat early on ZF. On
+/// every other string op F2 and F3 mean the same thing — repeat CX times — and
+/// the assembler's choice of spelling must not decide whether we can run it.
+/// MechWarrior clears a buffer with `repne stosw`, which is `rep stosw`.
 #[test]
-fn rep_cmp__a_prefix_on_a_non_compare_is_still_unsupported() {
-    // The rep-compare loop is for cmps/scas only. A repe/repne on anything else
-    // is not a thing the ISA defines — it must stay a hard Unsupported, not get
-    // silently emitted as a compare.
-    let func = json!({
-        "start": 0x0000,
-        "instructions": [
-            {"address": 0x0000, "mnemonic": "repne lodsb",
-             "op_str": "al, byte ptr [si]", "bytes": "F2AC"},
-            {"address": 0x0002, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
-        ],
-    });
-    let err = try_render_rs(&func, &[], "").unwrap_err();
-    assert!(err.0.contains("lodsb"), "{}", err.0);
+fn rep__zf_prefix_on_a_non_compare_is_a_plain_rep() {
+    for (mnem, bytes, plain) in [
+        ("repne stosw", "F2AB", "rep stosw"),
+        ("repe stosw", "F3AB", "rep stosw"),
+        ("repne movsb", "F2A4", "rep movsb"),
+        ("repne lodsb", "F2AC", "rep lodsb"),
+    ] {
+        let one = |m: &str, b: &str| {
+            let func = json!({
+                "start": 0x0000,
+                "instructions": [
+                    {"address": 0x0000, "mnemonic": m, "op_str": "", "bytes": b},
+                    {"address": 0x0002, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
+                ],
+            });
+            render_rs(&func, &[], "")
+        };
+        // Byte-for-byte the same body as the F3 spelling, and never the compare
+        // loop (there is no ZF here for a repeat to test).
+        assert_eq!(one(mnem, bytes), one(plain, bytes), "{mnem} != {plain}");
+        assert!(!one(mnem, bytes).contains("if lv == rv"), "{mnem}");
+    }
+}
+
+/// The port-string ops. Unlike rep movs/stos these must stay a real loop: each
+/// iteration is a separate port access, and a device answers differently every
+/// time — collapsing it into a block copy would read one byte and duplicate it.
+#[test]
+fn ins_outs__port_string_ops_translate() {
+    let cases = [
+        ("insb", "6C", "r.memb_write(r.es(), r.di(), r.inb(r.dx()));"),
+        ("insw", "6D", "r.memw_write(r.es(), r.di(), r.inw(r.dx()));"),
+        ("outsb", "6E", "r.outb(r.dx(), r.memb(r.ds(), r.si()));"),
+        ("outsw", "6F", "r.outw(r.dx(), r.memw(r.ds(), r.si()));"),
+    ];
+    for (mnem, bytes, expect) in cases {
+        for prefixed in [false, true] {
+            let m = if prefixed {
+                format!("rep {mnem}")
+            } else {
+                mnem.to_string()
+            };
+            let func = json!({
+                "start": 0x0000,
+                "instructions": [
+                    {"address": 0x0000, "mnemonic": m, "op_str": "", "bytes": bytes},
+                    {"address": 0x0002, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
+                ],
+            });
+            let src = render_rs(&func, &[], "");
+            assert!(src.contains(expect), "{m}: {src}");
+            // ins walks di, outs walks si — each in the direction DF picks.
+            let walks = if mnem.starts_with("ins") {
+                "r.set_di("
+            } else {
+                "r.set_si("
+            };
+            assert!(src.contains(walks), "{m} must walk its pointer: {src}");
+            assert!(src.contains("if r.DF() != 0"), "{m} must honor DF: {src}");
+            if prefixed {
+                assert!(src.contains("while r.cx() != 0 {"), "{m} must loop: {src}");
+                assert!(
+                    src.contains("r.set_cx(r.cx().wrapping_sub(1));"),
+                    "{m} must count down: {src}"
+                );
+            }
+        }
+    }
 }
 
 // ===========================================================================

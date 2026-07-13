@@ -33,6 +33,12 @@ pub struct VgaState {
     pub feature_control: u8,
     pub graphics_index: u8,
     pub graphics_regs: [u8; 16],
+    /// VGA Sequencer (0x3C4 index / 0x3C5 data). SR2 is the Map Mask — which of
+    /// the four planes a write to video memory lands in — and SR4 the memory
+    /// mode. A game writes these before it writes a pixel, and reads them back to
+    /// decide a VGA is there at all, so they must round-trip exactly.
+    pub sequencer_index: u8,
+    pub sequencer_regs: [u8; 8],
 }
 
 #[repr(C)]
@@ -71,6 +77,8 @@ pub static mut vga: VgaState = VgaState {
     feature_control: 0,
     graphics_index: 0,
     graphics_regs: [0; 16],
+    sequencer_index: 0,
+    sequencer_regs: [0; 8],
 };
 
 #[no_mangle]
@@ -125,7 +133,7 @@ const DATA_BASE_SEG: u16 = 0xFF2C; // rcb_fields.h
 static mut STAGING_TEXT: [u8; 640 * 400] = [0; 640 * 400];
 static mut STAGING_CGA: [u8; 640 * 200] = [0; 640 * 200];
 static mut STAGING_TANDY: [u8; 640 * 200] = [0; 640 * 200];
-static mut STAGING_PLANAR: [u8; 640 * 200] = [0; 640 * 200];
+static mut STAGING_PLANAR: [u8; 640 * 480] = [0; 640 * 480];
 static mut STAGING_OTHER: [u8; 320 * 200] = [0; 320 * 200];
 
 #[inline]
@@ -239,16 +247,27 @@ fn is_tandy_graphics_mode(mode: u8) -> bool {
     matches!(mode, 0x08 | 0x09 | 0x0A)
 }
 fn is_planar_graphics_mode(mode: u8) -> bool {
-    matches!(mode, 0x0D | 0x0E)
+    matches!(mode, 0x0D | 0x0E | 0x10 | 0x12)
 }
+
+/// Same predicate, for `vga_mem` — the memory controller and the display decode
+/// must agree on which modes put the pixels in the planes.
+pub fn is_planar_graphics_mode_pub(mode: u8) -> bool {
+    is_planar_graphics_mode(mode)
+}
+
 fn planar_mode_width(mode: u8) -> i32 {
     match mode {
-        0x0E => 640,
+        0x0E | 0x10 | 0x12 => 640,
         _ => 320,
     }
 }
-fn planar_mode_height(_mode: u8) -> i32 {
-    200
+fn planar_mode_height(mode: u8) -> i32 {
+    match mode {
+        0x10 => 350,
+        0x12 => 480,
+        _ => 200,
+    }
 }
 fn cga_mode_width(mode: u8) -> i32 {
     if mode == 0x06 {
@@ -283,6 +302,71 @@ unsafe fn ensure_display_geometry(width: c_int, height: c_int) {
     current_display_width = width;
     current_display_height = height;
     crate::sdl::virtual_display_configure(width, height);
+}
+
+// ---- BIOS default palette (INT 10h AH=00h) ---------------------------------
+
+/// The 16 attribute-palette registers as the BIOS leaves them after a mode set.
+/// These are EGA colour *values*, not indices: 6 bits `rgbRGB`, low three the
+/// primary R/G/B and high three the secondary. Colour 6 is 0x14, not 0x06 —
+/// that is what makes CGA brown brown instead of dark yellow.
+const EGA_DEFAULT_ATTR_PALETTE: [u8; 16] = [
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x14, 0x07, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F,
+];
+
+/// Decode one 6-bit EGA colour value to a 6-bit DAC triple. Each channel is a
+/// 2-bit level (primary bit is the high one, secondary the low) scaled over the
+/// full range: 0, 0x15, 0x2A, 0x3F.
+fn ega_color_to_dac(value: u8) -> [u8; 3] {
+    let level = |primary: u8, secondary: u8| -> u8 {
+        let v = ((value >> primary) & 1) * 2 + ((value >> secondary) & 1);
+        v * 0x15
+    };
+    [level(2, 5), level(1, 4), level(0, 3)]
+}
+
+/// What a real BIOS does on every INT 10h AH=00h and we did not: load the
+/// default palette. Without it `vga.palette` stays at its power-on zeros, so a
+/// game that programs the *attribute* registers (AH=10h) and then draws — which
+/// is the whole EGA idiom — has every pixel index a DAC entry of black. The
+/// screen is then not blank because nothing was drawn; it is blank because
+/// everything was drawn in black.
+///
+/// Scope is modes 0x00-0x0E, whose default is the 64-colour EGA table. Mode 13h
+/// has its own 256-entry default DAC, which is NOT loaded here.
+unsafe fn load_default_palette(mode: u8) {
+    if mode > 0x0E {
+        return;
+    }
+    let vs = &mut *vs();
+    vs.attr_palette = EGA_DEFAULT_ATTR_PALETTE;
+    for i in 0..64usize {
+        let rgb = ega_color_to_dac(i as u8);
+        vs.palette[i * 3] = rgb[0];
+        vs.palette[i * 3 + 1] = rgb[1];
+        vs.palette[i * 3 + 2] = rgb[2];
+    }
+    vs.palette_mask = 0xFF;
+}
+
+/// The other half of what INT 10h AH=00h does and we did not: leave the
+/// Sequencer and Graphics Controller in the state the BIOS leaves them.
+///
+/// It matters most for the two registers that are *masks*. From their power-on
+/// zeros, a Map Mask of 0 enables no plane, so every write the guest makes is
+/// discarded; and a Bit Mask of 0 protects every bit, so every merge just writes
+/// the latch back. A game that programs neither (because a real BIOS already
+/// did) draws its whole screen into a chip that is throwing all of it away.
+unsafe fn load_default_chip_state(mode: u8) {
+    let vs = &mut *vs();
+    vs.sequencer_regs = [0; 8];
+    vs.sequencer_regs[2] = 0x0F; // map mask: all four planes enabled
+    vs.sequencer_regs[4] = if mode == 0x13 { 0x0E } else { 0x06 };
+    vs.graphics_regs = [0; 16];
+    vs.graphics_regs[5] = if mode == 0x13 { 0x40 } else { 0x00 }; // write mode 0
+    vs.graphics_regs[6] = if is_text_mode(mode) != 0 { 0x0E } else { 0x05 };
+    vs.graphics_regs[7] = 0x0F; // colour don't care: compare against all planes
+    vs.graphics_regs[8] = 0xFF; // bit mask: no bit protected
 }
 
 // ---- palette derivation ----------------------------------------------------
@@ -375,7 +459,10 @@ unsafe fn ensure_tandy_palette() {
 
 // ---- staging ---------------------------------------------------------------
 
-unsafe fn stage_and_present_text_mode() {
+/// Rasterize the live text page into `dst` as palette indices, returning its
+/// pixel geometry. Shared by the presenter and the screenshot so a captured
+/// frame is the frame that was shown.
+unsafe fn decode_text_mode(dst: *mut u8) -> (i32, i32) {
     const CELL_W: i32 = 8;
     const CELL_H: i32 = 8;
     const MAX_COLS: u16 = 80;
@@ -406,7 +493,7 @@ unsafe fn stage_and_present_text_mode() {
     };
     let src = seg_off(segment, base as u16);
 
-    let staging = staging_text();
+    let staging = dst;
     let width = cols as i32 * CELL_W;
     let height = rows as i32 * CELL_H;
 
@@ -433,6 +520,12 @@ unsafe fn stage_and_present_text_mode() {
         }
     }
 
+    (width, height)
+}
+
+unsafe fn stage_and_present_text_mode() {
+    let staging = staging_text();
+    let (width, height) = decode_text_mode(staging);
     ensure_text_mode_palette();
     ensure_display_geometry(width, height);
     crate::sdl::virtual_display_present(staging, width, width, height, text_pal(), 0x3F);
@@ -549,24 +642,20 @@ unsafe fn decode_planar_mode(mode: u8, dst: *mut u8) {
     let height = planar_mode_height(mode);
     let bytes_per_row = width / 8;
 
-    let plane0 = seg_off(0xA000, 0x0000);
-    let plane1 = seg_off(0xA000, 0x2000);
-    let plane2 = seg_off(0xA000, 0x4000);
-    let plane3 = seg_off(0xA000, 0x6000);
+    // The pixels are in the four planes, not in the 0xA0000 page of guest RAM:
+    // all four planes answer to the same addresses, and which one a CPU write
+    // reached was decided by the Map Mask (see vga_mem).
     let attr_palette = core::ptr::addr_of!((*vs()).attr_palette) as *const u8;
 
     for y in 0..height {
-        let row0 = plane0.add((y * bytes_per_row) as usize);
-        let row1 = plane1.add((y * bytes_per_row) as usize);
-        let row2 = plane2.add((y * bytes_per_row) as usize);
-        let row3 = plane3.add((y * bytes_per_row) as usize);
+        let row_off = (y * bytes_per_row) as usize;
         let row = dst.add((y * width) as usize);
 
         for byte in 0..bytes_per_row {
-            let b0 = *row0.add(byte as usize);
-            let b1 = *row1.add(byte as usize);
-            let b2 = *row2.add(byte as usize);
-            let b3 = *row3.add(byte as usize);
+            let b0 = crate::vga_mem::plane_byte(0, row_off + byte as usize);
+            let b1 = crate::vga_mem::plane_byte(1, row_off + byte as usize);
+            let b2 = crate::vga_mem::plane_byte(2, row_off + byte as usize);
+            let b3 = crate::vga_mem::plane_byte(3, row_off + byte as usize);
 
             for bit in 0..8 {
                 let mask = 0x80u8 >> bit;
@@ -591,7 +680,7 @@ unsafe fn decode_planar_mode(mode: u8, dst: *mut u8) {
 
 unsafe fn stage_and_present_planar_mode() {
     const MAX_W: i32 = 640;
-    const MAX_H: i32 = 200;
+    const MAX_H: i32 = 480;
     let mode = (*bv()).video_mode;
     let width = planar_mode_width(mode);
     let height = planar_mode_height(mode);
@@ -707,6 +796,9 @@ pub extern "C" fn apply_video_mode_state(mode: u8) {
         memb_set(0x40, 0x49, mode);
         let crtc_port = if mode == 0x07 { 0x3B4u16 } else { 0x3D4u16 };
         memw_raw_write(0x40, 0x0063, crtc_port);
+        load_default_palette(mode);
+        load_default_chip_state(mode);
+        crate::vga_mem::refresh_planar_active(mode);
         if headless_mode == 0 {
             crate::sdl::virtual_display_set_mode(mode as c_int);
             if is_text_mode(mode) != 0 {
@@ -747,36 +839,61 @@ pub extern "C" fn apply_video_mode_state(mode: u8) {
 #[no_mangle]
 pub extern "C" fn shim_render_screenshot_png(path: *const c_char) -> c_int {
     unsafe {
+        // Decode exactly the way the display presents (stage_and_present_current
+        // _buffer): a screenshot that re-derives the frame its own way is a
+        // picture of a machine nobody is running. A planar EGA mode read as a
+        // linear 0xA000 byte array through the (never-programmed) VGA DAC is how
+        // this used to hand back a black frame for a game that was drawing.
         let mode = (*bv()).video_mode;
-        let (width, height): (i32, i32) = if is_cga_graphics_mode(mode) != 0 {
+        let (width, height): (i32, i32) = if is_text_mode(mode) != 0 {
+            (640, 400) // upper bound; decode_text_mode returns the real geometry
+        } else if is_cga_graphics_mode(mode) != 0 {
             (cga_mode_width(mode), 200)
         } else if is_tandy_graphics_mode(mode) {
             (tandy_mode_width(mode), tandy_mode_height(mode))
+        } else if is_planar_graphics_mode(mode) {
+            (planar_mode_width(mode), planar_mode_height(mode))
         } else {
             (320, 200)
         };
-        let n = (width * height) as usize;
-        let mut indices = vec![0u8; n];
+        let mut indices = vec![0u8; (width * height) as usize];
 
         let palette: *const u8;
         let palette_mask: u8;
-
-        if is_cga_graphics_mode(mode) != 0 {
-            decode_cga_mode(mode, indices.as_mut_ptr());
-            ensure_cga_palette();
-            palette = cga_pal();
+        let (width, height) = if is_text_mode(mode) != 0 {
+            let geom = decode_text_mode(indices.as_mut_ptr());
+            ensure_text_mode_palette();
+            palette = text_pal();
             palette_mask = 0x3F;
-        } else if is_tandy_graphics_mode(mode) {
-            decode_tandy_mode(mode, indices.as_mut_ptr());
-            ensure_tandy_palette();
-            palette = tandy_pal();
-            palette_mask = 0x3F;
+            geom
         } else {
-            let src = seg_off(0xA000, 0);
-            core::ptr::copy_nonoverlapping(src, indices.as_mut_ptr(), n);
-            palette = (*vs()).palette.as_ptr();
-            palette_mask = (*vs()).palette_mask;
-        }
+            if is_cga_graphics_mode(mode) != 0 {
+                decode_cga_mode(mode, indices.as_mut_ptr());
+                ensure_cga_palette();
+                palette = cga_pal();
+                palette_mask = 0x3F;
+            } else if is_tandy_graphics_mode(mode) {
+                decode_tandy_mode(mode, indices.as_mut_ptr());
+                ensure_tandy_palette();
+                palette = tandy_pal();
+                palette_mask = 0x3F;
+            } else {
+                if is_planar_graphics_mode(mode) {
+                    decode_planar_mode(mode, indices.as_mut_ptr());
+                } else {
+                    let src = seg_off(0xA000, 0);
+                    core::ptr::copy_nonoverlapping(
+                        src,
+                        indices.as_mut_ptr(),
+                        (width * height) as usize,
+                    );
+                }
+                palette = (*vs()).palette.as_ptr();
+                palette_mask = (*vs()).palette_mask;
+            }
+            (width, height)
+        };
+        let n = (width * height) as usize;
 
         let mut img = vec![0u8; n * 3];
         for y in 0..height {

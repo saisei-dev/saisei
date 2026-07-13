@@ -114,10 +114,14 @@ fn basic_block_comment__omitted_when_instructions_handled() {
     );
 }
 
-// The C renderer used to process::exit(2) on an unknown mnemonic (this test
-// was #[ignore]d); the Rust backend returns a catchable Unsupported naming it.
+// An instruction the translator cannot emit does NOT fail the chunk: decoding is
+// speculative (a packed game's CFG runs straight into its own ciphertext, which
+// its stub rewrites into real code before ever jumping there), so refusing the
+// chunk would throw away the runnable code next to it — including the code that
+// does the decrypting. It becomes a trap instead, so the gap is paid only if
+// control actually arrives, and it is still named, still fatal, still reported.
 #[test]
-fn basic_block_comment__unhandled_instruction_raises() {
+fn basic_block_comment__unhandled_instruction_traps_at_run_time() {
     let func = json!({
         "start": 0x0000,
         "instructions": [
@@ -125,8 +129,37 @@ fn basic_block_comment__unhandled_instruction_raises() {
             {"address": 0x0001, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-    let err = try_render_rs(&func, &[], "").unwrap_err();
-    assert!(err.0.contains("foo"), "{}", err.0);
+    let src = render_rs(&func, &[], "");
+    // The IP is set before it, so the crash names the exact instruction, and the
+    // block ends there — nothing after an instruction we cannot model may run.
+    assert!(src.contains("r.set_ip(0x0000);"), "{src}");
+    assert!(
+        src.contains(r#"r.jit_unsupported_instruction(c"mnemonic:foo".as_ptr());"#),
+        "{src}"
+    );
+    assert!(src.contains("return -1;"), "{src}");
+    // ...and the chunk still compiles: the `ret` after it is unreachable, but the
+    // rest of the chunk (other functions, other blocks) is intact.
+    assert!(src.contains("_dispatch"), "{src}");
+}
+
+/// The gaps stay visible. They are no longer an Err, so anything that wants to
+/// see the frontier (jit-compile's log, the gap_sweep test) asks for them.
+#[test]
+fn unsupported_constructs_are_reported_even_though_the_chunk_compiles() {
+    let ir = json!({
+        "functions": [{
+            "start": 0x0000,
+            "instructions": [
+                {"address": 0x0000, "mnemonic": "foo", "op_str": "", "bytes": "90"},
+                {"address": 0x0001, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
+            ],
+        }],
+    });
+    let (src, gaps) = saisei_jitc::codegen::emit_chunk_gaps(&ir, "t_", Some(0x10100), "rt.rs")
+        .expect("chunk still compiles");
+    assert!(src.contains("jit_unsupported_instruction"), "{src}");
+    assert_eq!(gaps, vec!["mnemonic:foo".to_string()]);
 }
 
 // ---------------------------------------------------------------------------

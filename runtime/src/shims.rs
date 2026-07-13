@@ -296,6 +296,12 @@ pub struct VgaState {
     pub feature_control: u8,
     pub graphics_index: u8,
     pub graphics_regs: [u8; 16],
+    /// VGA Sequencer (0x3C4 index / 0x3C5 data). SR2 is the Map Mask — which of
+    /// the four planes a write to video memory lands in — and SR4 the memory
+    /// mode. A game writes these before it writes a pixel, and reads them back to
+    /// decide a VGA is there at all, so they must round-trip exactly.
+    pub sequencer_index: u8,
+    pub sequencer_regs: [u8; 8],
 }
 
 const KBD_BUFFER_SIZE: usize = 64;
@@ -1917,7 +1923,32 @@ const BIOS_DISK_ISR_OFF: u16 = (BIOS_DISK_ISR_LINEAR & 0xF) as u16;
 const DOS_ABS_READ_ISR_LINEAR: u32 = 0x000F0C00;
 const DOS_ABS_READ_ISR_SEG: u16 = (DOS_ABS_READ_ISR_LINEAR >> 4) as u16;
 const DOS_ABS_READ_ISR_OFF: u16 = (DOS_ABS_READ_ISR_LINEAR & 0xF) as u16;
-const BIOS_EQUIPMENT_WORD: u16 = 0x0063;
+const BIOS_MEMSIZE_ISR_LINEAR: u32 = 0x000F0D00;
+const BIOS_MEMSIZE_ISR_SEG: u16 = (BIOS_MEMSIZE_ISR_LINEAR >> 4) as u16;
+const BIOS_MEMSIZE_ISR_OFF: u16 = (BIOS_MEMSIZE_ISR_LINEAR & 0xF) as u16;
+const DOS_MULTIPLEX_ISR_LINEAR: u32 = 0x000F0E00;
+const DOS_MULTIPLEX_ISR_SEG: u16 = (DOS_MULTIPLEX_ISR_LINEAR >> 4) as u16;
+const DOS_MULTIPLEX_ISR_OFF: u16 = (DOS_MULTIPLEX_ISR_LINEAR & 0xF) as u16;
+const BIOS_SYSTEM_ISR_LINEAR: u32 = 0x000F0A00;
+const BIOS_SYSTEM_ISR_SEG: u16 = (BIOS_SYSTEM_ISR_LINEAR >> 4) as u16;
+const BIOS_SYSTEM_ISR_OFF: u16 = (BIOS_SYSTEM_ISR_LINEAR & 0xF) as u16;
+/// Conventional memory, in KB — the RAM below the 0xA000 video window, which is
+/// the same 640K the memory manager hands out. INT 12h reports it, out of the BDA
+/// word where the BIOS leaves it.
+const BIOS_MEMORY_SIZE_KB: u16 = (CONVENTIONAL_TOP_SEG >> 6) as u16;
+/// The BIOS equipment word (BDA 0040:0010), and specifically bits 5-4: the
+/// initial video mode. On an EGA/VGA machine the BIOS leaves them **00** — the
+/// display is not one of the CGA/MDA text types, so the answer lives in the EGA
+/// info byte and INT 10h instead. We used to leave them at 10b, "80x25 colour",
+/// which says CGA. Everything else about this machine says VGA (INT 10h AH=1Ah
+/// reports display combination 07h, AH=1Bh answers, mode 13h works), so a game
+/// that asks the equipment word instead of the BIOS got told a different machine
+/// from the one it is running on, and turned its EGA path off.
+///
+/// Bit 1 (a maths coprocessor) stays clear: there is no x87 here, and saying so
+/// is what keeps a program on its integer path instead of issuing instructions
+/// this CPU cannot execute.
+const BIOS_EQUIPMENT_WORD: u16 = 0x0041;
 
 unsafe extern "C" fn default_isr_impl(
     _expected_retip: u16,
@@ -4016,6 +4047,11 @@ unsafe fn init_bios_data_area() {
     let bda = seg_off(0x40, 0);
     libc::memset(bda as *mut c_void, 0, 0x100);
     memw_raw_write(0x40, 0x0010, BIOS_EQUIPMENT_WORD);
+    memw_raw_write(0x40, 0x0013, BIOS_MEMORY_SIZE_KB);
+    // The type-ahead ring lives in this page (40:1E), and its head/tail must be
+    // pointing into it before the first key arrives — the memset above left them
+    // at zero, which is the COM1 port address, not a key slot.
+    crate::keyboard::kbd_bios_buffer_init();
     // Keyboard shift-flag byte: real AT BIOSes boot with NumLock ON (bit 5).
     // The extended-key senders consult this to emit the authentic fake-shift
     // framing (E0 2A / E0 AA) around grey-cluster make/break — several games
@@ -6702,6 +6738,13 @@ pub unsafe extern "C" fn memw_read_impl(
         let field = (0xFF00 + (addr - rcb_base)) as c_int;
         return rcb_read16_impl(field, file, func, line);
     }
+    if crate::vga_mem::routed(addr) {
+        // A word access to the planar window is two byte cycles, low then high;
+        // the latches end up holding the high byte's address, as on the chip.
+        let lo = crate::vga_mem::read(addr) as u16;
+        let hi = crate::vga_mem::read(addr.wrapping_add(1)) as u16;
+        return lo | (hi << 8);
+    }
     let v = memw_raw_read(seg, off);
     stack_op_record(SWO_POP, seg, off, v, file, line);
     v
@@ -6965,6 +7008,12 @@ pub unsafe extern "C" fn mem_page_flags_recompute() {
     }
     // null-pointer page (the 0000:0000..000F warning lives in the impl)
     mem_page_flags[0] = 1;
+    // The planar-VGA window, while a planar mode is up: a store there is not a
+    // store, it is a Map-Mask-steered merge through the latches (vga_mem). Only
+    // flagged while planar, so a linear mode 13h game keeps the inline fast path.
+    if crate::vga_mem::vga_planar_active != 0 {
+        mem_page_flag_range(crate::vga_mem::VRAM_BASE, crate::vga_mem::VRAM_END);
+    }
     // live JIT chunk code ranges (self-modifying-code invalidation)
     for i in 0..jit_chunk_count {
         let c = &jit_chunks[i];
@@ -7101,6 +7150,11 @@ pub unsafe extern "C" fn memw_write_impl(
         rcb_write16_impl(field, value, file, func, line);
         return;
     }
+    if crate::vga_mem::routed(addr) {
+        crate::vga_mem::write(addr, (value & 0xFF) as u8);
+        crate::vga_mem::write(addr.wrapping_add(1), (value >> 8) as u8);
+        return;
+    }
     stack_op_record(SWO_PUSH, seg, off, value, file, line);
     // The special write behaviors (bookend capture, watches/annotation vars,
     // .drv cross-binary tripwire, protected slots, JIT'd-code invalidation)
@@ -7134,6 +7188,9 @@ pub unsafe extern "C" fn memb_read_impl(
         let field = (0xFF00 + (addr - rcb_base)) as c_int;
         return rcb_read8_impl(field, file, func, line);
     }
+    if crate::vga_mem::routed(addr) {
+        return crate::vga_mem::read(addr);
+    }
     *seg_off(seg, off)
 }
 
@@ -7151,6 +7208,10 @@ pub unsafe extern "C" fn memb_write_impl(
     if seg == es() && addr >= rcb_base && addr < rcb_base + 0x100 {
         let field = (0xFF00 + (addr - rcb_base)) as c_int;
         rcb_write8_impl(field, value, file, func, line);
+        return;
+    }
+    if crate::vga_mem::routed(addr) {
+        crate::vga_mem::write(addr, value);
         return;
     }
     // Flag-gated like memw_write_impl: unflagged pages carry no special write
@@ -7289,9 +7350,14 @@ pub unsafe extern "C" fn rep_movsb_block_impl(
     let src_lo = linear_addr(src_seg, src_first_off);
     let dst_lo = linear_addr(dst_seg, dst_first_off);
 
+    // A block copy through the planar window is not a block copy: each byte is a
+    // latch load and a Map-Mask-steered merge. Drop to the per-byte path, which
+    // routes through the memory controller.
     if rep_range_touches_rcb(dst_seg, dst_lo, count) != 0
         || rep_range_touches_rcb(src_seg, src_lo, count) != 0
         || rep_range_touches_watch(dst_lo, count) != 0
+        || crate::vga_mem::range_routed(dst_lo, count)
+        || crate::vga_mem::range_routed(src_lo, count)
     {
         while cx() != 0 {
             let b = memb_read_impl(src_seg, si(), file, func, line);
@@ -7361,6 +7427,7 @@ pub unsafe extern "C" fn rep_stosb_block_impl(
 
     if rep_range_touches_rcb(dst_seg, dst_lo, count) != 0
         || rep_range_touches_watch(dst_lo, count) != 0
+        || crate::vga_mem::range_routed(dst_lo, count)
     {
         while cx() != 0 {
             memb_write_impl(dst_seg, di(), al(), file, func, line);
@@ -7428,6 +7495,8 @@ pub unsafe extern "C" fn rep_movsw_block_impl(
     if rep_range_touches_rcb(dst_seg, dst_lo, count_bytes) != 0
         || rep_range_touches_rcb(src_seg, src_lo, count_bytes) != 0
         || rep_range_touches_watch(dst_lo, count_bytes) != 0
+        || crate::vga_mem::range_routed(dst_lo, count_bytes)
+        || crate::vga_mem::range_routed(src_lo, count_bytes)
     {
         while cx() != 0 {
             let w = memw_read_impl(src_seg, si(), file, func, line);
@@ -7867,6 +7936,8 @@ pub unsafe extern "C" fn shim_boot_machine() {
     init_psp();
     init_standard_handles();
     init_bios_data_area();
+    init_bios_config_table();
+    crate::bios::init_bios_static_functionality_table();
     for i in 0..256 {
         let addr: u16 = i as u16 * 4;
         memw_raw_write(0, addr, DEFAULT_ISR_OFF);
@@ -7884,6 +7955,12 @@ pub unsafe extern "C" fn shim_boot_machine() {
     memw_raw_write(0, 0x13 * 4 + 2, BIOS_DISK_ISR_SEG);
     memw_raw_write(0, 0x25 * 4, DOS_ABS_READ_ISR_OFF);
     memw_raw_write(0, 0x25 * 4 + 2, DOS_ABS_READ_ISR_SEG);
+    memw_raw_write(0, 0x12 * 4, BIOS_MEMSIZE_ISR_OFF);
+    memw_raw_write(0, 0x12 * 4 + 2, BIOS_MEMSIZE_ISR_SEG);
+    memw_raw_write(0, 0x2F * 4, DOS_MULTIPLEX_ISR_OFF);
+    memw_raw_write(0, 0x2F * 4 + 2, DOS_MULTIPLEX_ISR_SEG);
+    memw_raw_write(0, 0x15 * 4, BIOS_SYSTEM_ISR_OFF);
+    memw_raw_write(0, 0x15 * 4 + 2, BIOS_SYSTEM_ISR_SEG);
     memw_raw_write(0, 0x16 * 4, BIOS_KBD_ISR_OFF);
     memw_raw_write(0, 0x16 * 4 + 2, BIOS_KBD_ISR_SEG);
     memw_raw_write(0, 0x20 * 4, DOS_TERM_ISR_OFF);
@@ -8415,6 +8492,24 @@ pub unsafe extern "C" fn inb(port: u16) -> u8 {
     if port == 0x201 {
         return 0xFF;
     }
+    // MPU-401 (Roland MIDI) at its stock 0x330/0x331. There is no such card in
+    // this machine — the sound we model is AdLib/Sound Blaster/Tandy/speaker — and
+    // an ISA port with nothing driving it reads back 0xFF. A game probing for a
+    // Roland reads the status port, sees neither DSR nor DRR asserted, concludes
+    // there is no MPU-401, and picks another device. Which is the truth.
+    if port == 0x330 || port == 0x331 {
+        return 0xFF;
+    }
+    // The POST diagnostic port, read back with nothing driving it.
+    if port == 0x80 {
+        return 0xFF;
+    }
+    if port == 0x3C4 {
+        return vga.sequencer_index;
+    }
+    if port == 0x3C5 {
+        return vga.sequencer_regs[(vga.sequencer_index & 0x07) as usize];
+    }
     if port == 0x3C2 || port == 0x3CC {
         return vga.misc_output;
     }
@@ -8735,6 +8830,23 @@ pub unsafe extern "C" fn outb(port: u16, value: u8) {
         0x3C6 => {
             vga.palette_mask = value;
         }
+        // Writes to the absent MPU-401 go nowhere, as they do on a real bus.
+        0x330 | 0x331 => {}
+        // The POST diagnostic port. Nothing is listening (the LED card is an
+        // option nobody fitted), but `out 0x80, al` is *the* idiom for "wait one
+        // I/O bus cycle", so it is written constantly by code that wants a delay
+        // and not a device. Discarding the byte is what the bus does; the delay
+        // itself is charged as the I/O access it is (see insn_weight).
+        0x80 => {}
+        0x3C4 => {
+            // Sequencer index. Only SR0-SR4 exist; the index register itself is
+            // 3 bits wide on real silicon, so a write of 0x07 and 0x0F land in
+            // the same place and a read gives back what the hardware kept.
+            vga.sequencer_index = value & 0x07;
+        }
+        0x3C5 => {
+            vga.sequencer_regs[(vga.sequencer_index & 0x07) as usize] = value;
+        }
         0x3CE => {
             vga.graphics_index = value & 0x0F;
         }
@@ -8918,6 +9030,156 @@ unsafe extern "C" fn int11h_impl(
     iret_impl(file, func, line);
 }
 
+/// A chunk reached bytes the translator could not turn into Rust.
+///
+/// Decoding is speculative — the CFG walker follows every edge it can see, and a
+/// packed game's edges lead into bytes that are still *ciphertext* at decode time
+/// and only become instructions once the stub decrypts them in place. Refusing to
+/// compile the chunk because those bytes decode to nonsense throws away the real,
+/// runnable code sitting right next to them (and the decrypt loop is *in* that
+/// code). So an untranslatable instruction is emitted as a call to this, and the
+/// gap becomes what it always was: a problem only if control actually arrives.
+///
+/// If it does arrive, that is a genuine codegen gap in code the game really
+/// executes, and it is exactly as loud as the old compile-time failure — louder,
+/// in fact, because now we know the instruction *ran* rather than merely decoded.
+#[no_mangle]
+pub unsafe extern "C" fn jit_unsupported_instruction_impl(what: *const c_char) {
+    let mut msg = [0u8; 256];
+    libc::snprintf(
+        msg.as_mut_ptr() as *mut c_char,
+        msg.len(),
+        cstr!("reached an instruction the translator cannot emit: %s at cs:ip=%04X:%04X"),
+        what,
+        cs() as c_uint,
+        ip() as c_uint,
+    );
+    shim_log_crash(cstr!("%s\n"), msg.as_ptr() as *const c_char);
+    save_bug_bundle(
+        cstr!("unsupported_instruction"),
+        ((cs() as u32) << 4).wrapping_add(ip() as u32),
+        msg.as_ptr() as *const c_char,
+    );
+    shim_flush_all_streams();
+    libc::abort();
+}
+
+/// INT 12h — BIOS get memory size. AX = contiguous conventional KB, read from the
+/// BDA word the BIOS fills in at boot.
+unsafe extern "C" fn int12h_impl(
+    _expected_retip: u16,
+    file: *const c_char,
+    func: *const c_char,
+    line: c_int,
+) {
+    shim_log(cstr!("int12h_impl"), file, func, line, ptr::null());
+    set_ax(memw_raw_read(0x40, 0x0013));
+    iret_impl(file, func, line);
+}
+
+/// The ROM configuration table INT 15h AH=C0h hands back a pointer to. It lives
+/// in the BIOS ROM segment, alongside the ISR stubs, because that is where a
+/// caller expects to find it — the pointer is ES:BX into ROM, and a program is
+/// entitled to keep it and read it later.
+///
+/// Model byte 0xFC is "PC AT", which is what this machine is: an 80286-class
+/// PC with a second interrupt controller and a real-time clock. Feature byte 1
+/// bit 6 says the second 8259 is there (it is — see the PIC model), bit 5 the
+/// RTC. Nothing here is a guess; it is a description of the machine we emulate,
+/// and it must stay one — a program that reads "AT" and then uses an AT-only
+/// service has to find that service working.
+const BIOS_CONFIG_TABLE_LINEAR: u32 = 0x000F0F00;
+const BIOS_CONFIG_TABLE_SEG: u16 = (BIOS_CONFIG_TABLE_LINEAR >> 4) as u16;
+const BIOS_CONFIG_TABLE_OFF: u16 = (BIOS_CONFIG_TABLE_LINEAR & 0xF) as u16;
+
+unsafe fn init_bios_config_table() {
+    let t = [
+        0x08u8, 0x00, // length of the table that follows
+        0xFC, // model: PC AT
+        0x01, // submodel
+        0x00, // BIOS revision
+        0x60, // feature 1: bit6 second 8259, bit5 real-time clock
+        0x00, 0x00, 0x00, 0x00, // features 2-5
+    ];
+    for (i, b) in t.iter().enumerate() {
+        *seg_off(BIOS_CONFIG_TABLE_SEG, BIOS_CONFIG_TABLE_OFF + i as u16) = *b;
+    }
+}
+
+/// INT 15h — the AT BIOS system services.
+///
+/// The one that matters is AH=C0h, get configuration: it is how a program asks
+/// what machine it is on, and MechWarrior's launcher asks before it will start.
+/// The rest of the function space is answered the way a real AT BIOS answers a
+/// service it does not have — CF=1, AH=86h — which is a real answer, not a stub:
+/// "this BIOS does not implement that", which every caller is written to handle.
+/// AH=88h is the exception worth stating outright: extended memory is 0 KB,
+/// because there is none above the 1MB line on this machine.
+unsafe extern "C" fn int15h_impl(
+    _expected_retip: u16,
+    file: *const c_char,
+    func: *const c_char,
+    line: c_int,
+) {
+    shim_log(cstr!("int15h_impl"), file, func, line, ptr::null());
+    match ah() {
+        0xC0 => {
+            set_es(BIOS_CONFIG_TABLE_SEG);
+            set_bx(BIOS_CONFIG_TABLE_OFF);
+            set_ah(0x00);
+            set_CF(0);
+        }
+        0x88 => {
+            // Extended memory size in KB above 1MB. There is none.
+            set_ax(0x0000);
+            set_CF(0);
+        }
+        0x86 => {
+            // Wait CX:DX microseconds. Virtual time is instruction-driven, and
+            // the caller is about to spend it: let the safepoint pump advance it.
+            set_CF(0);
+        }
+        _ => {
+            shim_log_stdout(
+                cstr!("Trace: int 15h AX=0x%04X — this BIOS has no such service (CF=1, AH=86h)\n"),
+                ax() as c_uint,
+            );
+            set_ah(0x86);
+            set_CF(1);
+        }
+    }
+    iret_impl(file, func, line);
+}
+
+/// INT 2Fh — the DOS multiplex.
+///
+/// A multiplex call is a broadcast: whoever has hooked the vector for that ID
+/// answers it, and if nobody has, the chain ends at DOS's own handler, which
+/// simply returns with the registers as they were. That "unchanged" *is* the
+/// answer — it is how the installation-check convention reports **not
+/// installed**, because a caller zeroes AL and an installed handler is the thing
+/// that makes it non-zero.
+///
+/// This machine boots DOS with no TSRs and no drivers: no HIMEM, no EMS, no
+/// SHARE, no APPEND, and it is not running under Windows. So there is nothing
+/// here to hook the vector, and returning unchanged is not a stub — it is the
+/// truth about the machine, and every ID gets the same honest "nobody is home".
+/// Might & Magic asks AX=4300h (is XMS installed?) and, hearing nothing, uses
+/// conventional memory, which is exactly what it should do.
+unsafe extern "C" fn int2Fh_impl(
+    _expected_retip: u16,
+    file: *const c_char,
+    func: *const c_char,
+    line: c_int,
+) {
+    shim_log(cstr!("int2Fh_impl"), file, func, line, ptr::null());
+    shim_log_stdout(
+        cstr!("Trace: int 2Fh multiplex AX=0x%04X — nothing is installed to answer it\n"),
+        ax() as c_uint,
+    );
+    iret_impl(file, func, line);
+}
+
 /// INT 25h — DOS absolute disk read (AL=drive, CX=sectors, DX=first logical
 /// sector, DS:BX=buffer).
 ///
@@ -9017,6 +9279,7 @@ unsafe extern "C" fn int10h_impl(
     line: c_int,
 ) {
     shim_log(cstr!("int10h_impl"), file, func, line, ptr::null());
+    shim_log_stdout(cstr!("Trace: int 10h AX=0x%04X\n"), ax() as c_uint);
     if ah() == 0x00 {
         bios_set_video_mode_impl(al(), file, func, line);
     } else if ah() == 0x02 {
@@ -9065,6 +9328,8 @@ unsafe extern "C" fn int10h_impl(
         bios_get_video_parameter_block(al(), &mut seg, &mut off);
         set_cx(seg);
         set_dx(off);
+    } else if ah() == 0x1B {
+        crate::bios::bios_get_functionality_info();
     } else {
         let mut msg = [0u8; 256];
         libc::snprintf(
@@ -9223,11 +9488,16 @@ unsafe extern "C" fn int33h_impl(
     iret_impl(file, func, line);
 }
 
-static mut base_call_targets: [CallTarget; 13] = [
+static mut base_call_targets: [CallTarget; 16] = [
     CallTarget {
         addr: DEFAULT_ISR_LINEAR,
         file: ptr::null(),
         fn_: Some(default_isr_impl),
+    },
+    CallTarget {
+        addr: BIOS_SYSTEM_ISR_LINEAR,
+        file: ptr::null(),
+        fn_: Some(int15h_impl),
     },
     CallTarget {
         addr: BIOS_DISK_ISR_LINEAR,
@@ -9238,6 +9508,16 @@ static mut base_call_targets: [CallTarget; 13] = [
         addr: DOS_ABS_READ_ISR_LINEAR,
         file: ptr::null(),
         fn_: Some(int25h_impl),
+    },
+    CallTarget {
+        addr: BIOS_MEMSIZE_ISR_LINEAR,
+        file: ptr::null(),
+        fn_: Some(int12h_impl),
+    },
+    CallTarget {
+        addr: DOS_MULTIPLEX_ISR_LINEAR,
+        file: ptr::null(),
+        fn_: Some(int2Fh_impl),
     },
     CallTarget {
         addr: BIOS_IRQ0_ISR_LINEAR,
@@ -9290,7 +9570,7 @@ static mut base_call_targets: [CallTarget; 13] = [
         fn_: Some(int33h_impl),
     },
 ];
-const base_call_target_count: usize = 13;
+const base_call_target_count: usize = 16;
 
 unsafe fn is_builtin_call_target(addr: u32) -> c_int {
     for i in 0..base_call_target_count {

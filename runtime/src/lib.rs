@@ -33,4 +33,5 @@ pub mod sdl;
 pub mod shims;
 pub mod snapshot;
 pub mod timer;
+pub mod vga_mem;
 pub mod video;

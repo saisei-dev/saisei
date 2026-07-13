@@ -1781,9 +1781,31 @@ pub extern "C" fn dos_ioctl_impl(
             core::ptr::null(),
         );
     }
-    let _ = bx_handle;
     if subfunc == 0x00 {
-        set_dx(0); // bit 7 (ISDEV) clear => regular file; low byte = drive A
+        // Get device information. The standard handles are *character devices* —
+        // that is what a C runtime is asking when it calls this five times at
+        // startup, and answering "a regular file on drive A" for all of them
+        // (which is what a flat DX=0 says) describes a program whose console has
+        // been redirected into a file on a floppy that is not in the machine.
+        //
+        //   bit 7  ISDEV      this handle is a device, not a file
+        //   bit 6  not-EOF    the device has data / is ready
+        //   bit 4  special    it is the console (CON)
+        //   bit 1  ISCOT      console output
+        //   bit 0  ISCIN      console input
+        //
+        // For a real file the word is not a device word at all: bit 7 clear, and
+        // the low bits carry the drive the file lives on (C: is 2, and this
+        // machine's disk is C:).
+        let info: u16 = match bx_handle {
+            0 | 1 | 2 => 0x80D3, // CON: device, ready, console in+out
+            3 | 4 => 0x80C0,     // AUX / PRN: character devices, not the console
+            _ => 0x0002,         // a file, on drive C:
+        };
+        set_dx(info);
+        set_ax(info);
+        set_CF(0);
+        return 0;
     } else if subfunc == 0x0D && (cx() & 0xFF) == 0x60 {
         let b = ((((ds() as u32) << 4) + dx() as u32) & 0xFFFFF) as usize;
         let dpb = |off: usize, v: u8| unsafe {
@@ -2320,6 +2342,173 @@ pub extern "C" fn dos_find_first(path: *const c_char, attr: u16) -> u8 {
 }
 
 // ---- memory services -------------------------------------------------------
+//
+// The DOS memory arena. This used to be a bump pointer with a free() that did
+// nothing, and that is not a simplification of DOS — it is a different machine.
+// The standard way a DOS program finds out how much memory it has is to *ask for
+// all of it*, look at what it got, and give it back; a launcher then loads the
+// game into the space it just freed. Against a bump allocator that sequence
+// consumes the arena instead of measuring it, so the load fails at the 640K
+// ceiling. MechWarrior's MW.EXE does exactly this, and then reports the only
+// thing it can conclude: "Please put DISK 1 in drive C:".
+//
+// So: a real block chain, with first-fit allocation, a free that frees and
+// coalesces, and a resize that can grow into the free block above it. Blocks
+// tile the arena — every paragraph from the program's PSP to the 640K line
+// belongs to exactly one block, owned or free.
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MemBlock {
+    pub seg: u16,
+    pub parags: u16,
+    /// The PSP that owns this block; 0 means free (DOS's own convention).
+    pub owner: u16,
+}
+
+pub const DOS_MEM_BLOCK_MAX: usize = 256;
+
+#[no_mangle]
+pub static mut dos_mem_blocks: [MemBlock; DOS_MEM_BLOCK_MAX] = [MemBlock {
+    seg: 0,
+    parags: 0,
+    owner: 0,
+}; DOS_MEM_BLOCK_MAX];
+#[no_mangle]
+pub static mut dos_mem_block_count: u16 = 0;
+
+/// Build the arena the first time anyone asks for memory. It cannot be built at
+/// boot: the program's own block is not sized until `load_executable` has read
+/// the MZ header, and `next_free_seg` is where that lands it.
+unsafe fn arena_init_if_needed() {
+    if dos_mem_block_count != 0 {
+        return;
+    }
+    let base = psp_seg;
+    let top = next_free_seg;
+    dos_mem_blocks[0] = MemBlock {
+        seg: base,
+        parags: top.wrapping_sub(base),
+        owner: base,
+    };
+    dos_mem_blocks[1] = MemBlock {
+        seg: top,
+        parags: (CONVENTIONAL_TOP_SEG as u16).wrapping_sub(top),
+        owner: 0,
+    };
+    dos_mem_block_count = 2;
+}
+
+/// `next_free_seg` is where `load_executable` puts an image and what the frozen
+/// snapshot carries, so it stays meaningful: the first paragraph above every
+/// owned block.
+unsafe fn arena_sync_next_free() {
+    let mut top = psp_seg;
+    for i in 0..dos_mem_block_count as usize {
+        let b = dos_mem_blocks[i];
+        if b.owner != 0 {
+            let end = b.seg.wrapping_add(b.parags);
+            if end > top {
+                top = end;
+            }
+        }
+    }
+    next_free_seg = top;
+}
+
+unsafe fn arena_coalesce() {
+    let mut i = 0usize;
+    while i + 1 < dos_mem_block_count as usize {
+        if dos_mem_blocks[i].owner == 0 && dos_mem_blocks[i + 1].owner == 0 {
+            dos_mem_blocks[i].parags = dos_mem_blocks[i]
+                .parags
+                .wrapping_add(dos_mem_blocks[i + 1].parags);
+            for j in i + 1..dos_mem_block_count as usize - 1 {
+                dos_mem_blocks[j] = dos_mem_blocks[j + 1];
+            }
+            dos_mem_block_count -= 1;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Split block `i` so it is exactly `parags` long, leaving the remainder as a
+/// free block behind it. No-op when there is no remainder.
+unsafe fn arena_split(i: usize, parags: u16) -> bool {
+    let cur = dos_mem_blocks[i].parags;
+    if parags >= cur {
+        return true;
+    }
+    if dos_mem_block_count as usize >= DOS_MEM_BLOCK_MAX {
+        return false; // no room to describe the remainder: keep the block whole
+    }
+    let mut j = dos_mem_block_count as usize;
+    while j > i + 1 {
+        dos_mem_blocks[j] = dos_mem_blocks[j - 1];
+        j -= 1;
+    }
+    dos_mem_blocks[i + 1] = MemBlock {
+        seg: dos_mem_blocks[i].seg.wrapping_add(parags),
+        parags: cur - parags,
+        owner: 0,
+    };
+    dos_mem_blocks[i].parags = parags;
+    dos_mem_block_count += 1;
+    true
+}
+
+unsafe fn arena_largest_free() -> u16 {
+    let mut best = 0u16;
+    for i in 0..dos_mem_block_count as usize {
+        let b = dos_mem_blocks[i];
+        if b.owner == 0 && b.parags > best {
+            best = b.parags;
+        }
+    }
+    best
+}
+
+/// First fit, which is what DOS uses unless a program asks for another strategy.
+pub unsafe fn arena_alloc(parags: u16, owner: u16) -> Option<u16> {
+    arena_init_if_needed();
+    for i in 0..dos_mem_block_count as usize {
+        if dos_mem_blocks[i].owner != 0 || dos_mem_blocks[i].parags < parags {
+            continue;
+        }
+        if !arena_split(i, parags) {
+            continue;
+        }
+        dos_mem_blocks[i].owner = if owner == 0 { psp_seg } else { owner };
+        arena_sync_next_free();
+        return Some(dos_mem_blocks[i].seg);
+    }
+    None
+}
+
+/// What DOS does when a program terminates: every block it owns goes back.
+pub unsafe fn arena_free_owner(owner: u16) {
+    for i in 0..dos_mem_block_count as usize {
+        if dos_mem_blocks[i].owner == owner {
+            dos_mem_blocks[i].owner = 0;
+        }
+    }
+    arena_coalesce();
+    arena_sync_next_free();
+}
+
+pub unsafe fn arena_free(seg: u16) -> bool {
+    arena_init_if_needed();
+    for i in 0..dos_mem_block_count as usize {
+        if dos_mem_blocks[i].seg == seg && dos_mem_blocks[i].owner != 0 {
+            dos_mem_blocks[i].owner = 0;
+            arena_coalesce();
+            arena_sync_next_free();
+            return true;
+        }
+    }
+    false
+}
 
 #[no_mangle]
 pub extern "C" fn dos_alloc_mem_impl(
@@ -2336,27 +2525,24 @@ pub extern "C" fn dos_alloc_mem_impl(
             line,
             core::ptr::null(),
         );
+        match arena_alloc(parags, psp_seg) {
+            Some(seg) => {
+                dos_last_alloc_seg = seg;
+                set_ax(seg);
+                set_CF(0);
+                0
+            }
+            None => {
+                // The documented failure: AX=8 (insufficient memory), BX = the
+                // size of the largest block there is. A program that asked for
+                // 0xFFFF to size the arena reads its answer out of BX.
+                set_CF(1);
+                set_ax(8);
+                set_bx(arena_largest_free());
+                1
+            }
+        }
     }
-    let end_seg = unsafe { next_free_seg } as u32 + parags as u32;
-    if end_seg > CONVENTIONAL_TOP_SEG {
-        set_CF(1);
-        set_ax(8);
-        let nfs = unsafe { next_free_seg } as u32;
-        let avail = if nfs < CONVENTIONAL_TOP_SEG {
-            CONVENTIONAL_TOP_SEG - nfs
-        } else {
-            0
-        };
-        set_bx(avail as u16);
-        return 1;
-    }
-    set_ax(unsafe { next_free_seg });
-    unsafe {
-        dos_last_alloc_seg = next_free_seg;
-        next_free_seg = end_seg as u16;
-    }
-    set_CF(0);
-    0
 }
 
 #[no_mangle]
@@ -2382,10 +2568,18 @@ pub extern "C" fn dos_free_mem_impl(
             line,
             core::ptr::null(),
         );
+        // The caller hands us the block as a host pointer into guest memory
+        // (ES:0000); the arena speaks segments.
+        let seg = (((ptr as usize) - (virtual_memory as usize)) >> 4) as u16;
+        if arena_free(seg) {
+            set_CF(0);
+            0
+        } else {
+            set_CF(1);
+            set_ax(9); // invalid memory block address
+            1
+        }
     }
-    let _ = ptr;
-    set_CF(0);
-    0
 }
 
 #[no_mangle]
@@ -2416,54 +2610,77 @@ pub extern "C" fn dos_resize_mem_impl(
             program_min_block_paras as c_int,
         );
     }
-    let max_paras: u32 = CONVENTIONAL_TOP_SEG;
-    if segment < unsafe { psp_seg } || (segment as u32) >= unsafe { next_free_seg } as u32 {
-        set_CF(1);
-        set_ax(9); // invalid memory block
-        set_bx(0);
-        return 1;
-    }
-    if (segment as u32) >= max_paras {
-        set_CF(1);
-        set_ax(8);
-        set_bx(0);
-        return 1;
-    }
-    let requested_top = (segment as u32) + (parags as u32);
-    if requested_top > max_paras {
-        set_CF(1);
-        set_ax(8); // insufficient memory
-        let mut avail = max_paras - segment as u32;
-        if avail > 0xFFFF {
-            avail = 0xFFFF;
+    unsafe {
+        arena_init_if_needed();
+        let mut idx: Option<usize> = None;
+        for i in 0..dos_mem_block_count as usize {
+            if dos_mem_blocks[i].seg == segment && dos_mem_blocks[i].owner != 0 {
+                idx = Some(i);
+                break;
+            }
         }
-        set_bx(avail as u16);
-        return 1;
-    }
-    if segment == unsafe { psp_seg } {
-        let min_required: u16 = 0x10; // the PSP itself (LOAD_SEG = PSP_SEG + 0x10)
-        if parags < min_required {
+        let i = match idx {
+            Some(i) => i,
+            None => {
+                set_CF(1);
+                set_ax(9); // invalid memory block
+                set_bx(0);
+                return 1;
+            }
+        };
+
+        let cur = dos_mem_blocks[i].parags;
+        if parags <= cur {
+            // Shrink: the tail goes back to the arena. This is how a program
+            // gives back the memory DOS handed it at load — the whole rest of
+            // conventional memory — before it allocates anything of its own.
+            if parags < cur {
+                arena_split(i, parags);
+                arena_coalesce();
+            }
+            if segment == psp_seg {
+                program_min_block_paras = parags;
+            }
+            arena_sync_next_free();
+            set_CF(0);
+            set_ax(0);
+            return 0;
+        }
+
+        // Grow: only into the free block immediately above, and only if it is
+        // big enough. Anything else is "insufficient memory", and BX must say
+        // how large the block *could* have been made.
+        let want_extra = parags - cur;
+        let next_free = dos_mem_blocks
+            .get(i + 1)
+            .filter(|_| i + 1 < dos_mem_block_count as usize)
+            .filter(|b| b.owner == 0)
+            .map(|b| b.parags)
+            .unwrap_or(0);
+        if next_free < want_extra {
             set_CF(1);
-            set_ax(8); // insufficient memory for requested block
-            set_bx(min_required);
+            set_ax(8); // insufficient memory
+            set_bx(cur.wrapping_add(next_free));
             return 1;
         }
-        unsafe {
-            program_min_block_paras = parags;
-            next_free_seg = requested_top as u16;
+        dos_mem_blocks[i].parags = parags;
+        if next_free == want_extra {
+            for j in i + 1..dos_mem_block_count as usize - 1 {
+                dos_mem_blocks[j] = dos_mem_blocks[j + 1];
+            }
+            dos_mem_block_count -= 1;
+        } else {
+            dos_mem_blocks[i + 1].seg = segment.wrapping_add(parags);
+            dos_mem_blocks[i + 1].parags = next_free - want_extra;
         }
+        if segment == psp_seg {
+            program_min_block_paras = parags;
+        }
+        arena_sync_next_free();
         set_CF(0);
         set_ax(0);
-        return 0;
+        0
     }
-    if segment == unsafe { dos_last_alloc_seg } {
-        unsafe {
-            next_free_seg = requested_top as u16;
-        }
-    }
-    set_CF(0);
-    set_ax(0);
-    0
 }
 
 #[no_mangle]
@@ -2657,8 +2874,20 @@ pub extern "C" fn dos_exec_impl(
     unsafe {
         shim_log(c"dos_exec_impl".as_ptr(), file, func, line, cmd);
     }
-    let parent_next_free = unsafe { next_free_seg };
-    let child_psp = unsafe { next_free_seg };
+    // DOS gives the child the largest free block it has. Taking `next_free_seg`
+    // instead only works while nothing is ever freed.
+    let (child_psp, child_block) = unsafe {
+        arena_init_if_needed();
+        let want = arena_largest_free();
+        match arena_alloc(want, psp_seg) {
+            Some(seg) => (seg, want),
+            None => {
+                set_CF(1);
+                set_ax(8); // insufficient memory
+                return 1;
+            }
+        }
+    };
     let child_load = child_psp.wrapping_add(0x10);
     unsafe {
         libc::memcpy(
@@ -2686,6 +2915,18 @@ pub extern "C" fn dos_exec_impl(
                 i += 1;
             }
             *vm().add((dst + 1 + len as usize) & 0xFFFFF) = 0x0D; // CR terminator
+
+            let env_seg = (*pb as u16) | ((*pb.add(1) as u16) << 8);
+            let mut tail = [0u8; 0x80];
+            for i in 0..len as usize {
+                tail[i] = *vm().add((tail_lin + 1 + i) & 0xFFFFF);
+            }
+            shim_log_stdout(
+                c"Trace: dos_exec command tail len=%d \"%s\" env_seg=0x%04X\n".as_ptr(),
+                len as c_int,
+                tail.as_ptr() as *const c_char,
+                env_seg as c_int,
+            );
         }
     }
     let mut new_cs: u16 = 0;
@@ -2704,17 +2945,22 @@ pub extern "C" fn dos_exec_impl(
         )
     } != 0
     {
+        unsafe {
+            arena_free(child_psp);
+        }
         set_CF(1);
-        set_ax(2);
+        set_ax(2); // file not found
         return 1;
     }
+    let _ = child_block;
 
     unsafe {
         shim_exec_run_child(new_cs, new_ip, new_ss, new_sp, child_psp);
     }
-    // DOS frees the child's block when it exits: reclaim the arena.
+    // DOS frees every block the child owned when it terminates, not just the one
+    // it was loaded into.
     unsafe {
-        next_free_seg = parent_next_free;
+        arena_free_owner(child_psp);
     }
     set_CF(0);
     0
@@ -3017,6 +3263,13 @@ pub extern "C" fn dos_api_impl(file: *const c_char, func: *const c_char, line: c
             func,
             line,
             core::ptr::null(),
+        );
+    }
+    unsafe {
+        shim_log_stdout(
+            c"Trace: int 21h AX=0x%04X ds=0x%04X\n".as_ptr(),
+            ax() as c_int,
+            ds() as c_int,
         );
     }
     let mut result: u8 = 0;

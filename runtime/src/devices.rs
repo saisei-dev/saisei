@@ -111,6 +111,14 @@ pub static DEVICE_BLOCKS: &[DeviceBlock] = &[
         capture: audio::dma::state_capture,
         restore: audio::dma::state_restore,
     },
+    // The EGA/VGA display planes, the latches and the Sequencer registers. The
+    // planes are the one piece of guest-visible memory the snapshot's linear
+    // image does not contain — they answer at 0xA0000 but they are not there.
+    DeviceBlock {
+        tag: *b"VGAM",
+        capture: crate::vga_mem::state_capture,
+        restore: crate::vga_mem::state_restore,
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -238,6 +246,11 @@ pub unsafe fn post_restore() {
     // channel 2, both of which are only now back. Its own doc comment always
     // said it was to be called "after a snapshot restore"; nothing called it.
     audio::speaker::reset();
+    // Whether 0xA0000 is RAM or the four planes is derived from the video mode,
+    // and the page-flag table that routes the guest's writes there is derived
+    // from that. Both are host-side statics, so both are at power-on after a
+    // restore: re-derive them from the mode the guest is in.
+    crate::vga_mem::post_restore(crate::bios::bios_current_video_mode());
 }
 
 fn warn(msg: &str) {

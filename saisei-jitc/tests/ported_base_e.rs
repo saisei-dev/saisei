@@ -56,12 +56,13 @@ fn repo_root() -> PathBuf {
 }
 
 // ===========================================================================
-// An instruction the emitter can't express is a hard Unsupported error (the
-// JIT caller dies on it); the C renderer used to process::exit(2).
+// An instruction the emitter can't express becomes a run-time trap, not a failed
+// chunk: the decode is speculative and mostly reaches bytes the game never
+// executes. It still names the construct, and still aborts if control gets there.
 // ===========================================================================
 
 #[test]
-fn unknown_prefix__is_unsupported() {
+fn unknown_prefix__traps_when_reached() {
     let func = json!({
         "start": 0x0000,
         "instructions": [
@@ -69,8 +70,11 @@ fn unknown_prefix__is_unsupported() {
             {"address": 0x0001, "mnemonic": "ret", "op_str": "", "bytes": ""},
         ],
     });
-    let err = try_render_rs(&func, &[0x0000], "").unwrap_err();
-    assert!(err.0.contains("lock inc"), "{}", err.0);
+    let src = render_rs(&func, &[0x0000], "");
+    assert!(
+        src.contains(r#"r.jit_unsupported_instruction(c"prefix:lock inc".as_ptr());"#),
+        "{src}"
+    );
 }
 
 // ===========================================================================

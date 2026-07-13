@@ -256,6 +256,9 @@ pub extern "C" fn kbd_reset() {
         st.scancode = 0;
         st.last_scancode = 0;
         st.scancode_ready = 0;
+        // bios_head/bios_tail/bios_count are vestigial: the type-ahead ring now
+        // lives in the BDA, where the guest can see it. They stay in the struct
+        // because its layout is frozen for snapshots.
         st.bios_head = 0;
         st.bios_tail = 0;
         st.bios_count = 0;
@@ -263,39 +266,118 @@ pub extern "C" fn kbd_reset() {
         st.pending_bios_scancode = 0;
         st.pending_bios_valid = 0;
     }
+    kbd_bios_buffer_init();
+}
+
+// ---- the BIOS type-ahead buffer, where the BIOS keeps it -------------------
+//
+// This is a ring of 16 two-byte entries (low = ASCII, high = scancode) that
+// lives **in the BIOS data area**, with its head and tail at 40:1A and 40:1C and
+// its bounds published at 40:80 and 40:82. It is not an implementation detail of
+// INT 16h: reading it is a documented way to test for a keypress without one,
+// and `head = tail` is *the* way to flush it. Games do both, constantly.
+//
+// It used to be a host-side struct instead — a buffer with the right contents in
+// the wrong place. INT 16h worked, and a game that read the buffer directly saw
+// head == tail == 0 and concluded, forever, that nobody had pressed anything.
+// MechWarrior polls it at its prompt: it waits about fifteen timer ticks for a
+// key, is told there are none, and quits. Nothing in a trace shows it happening,
+// because reading a BDA word is just a memory read.
+//
+// Now the guest's buffer and ours are the same object, so they cannot disagree.
+// It also snapshots for free: it is guest RAM.
+
+const BDA_KBD_HEAD: u16 = 0x1A;
+const BDA_KBD_TAIL: u16 = 0x1C;
+pub const BDA_KBD_BUF_START: u16 = 0x1E;
+pub const BDA_KBD_BUF_END: u16 = 0x3E; // one past the last entry
+
+#[inline]
+unsafe fn bda_word(off: u16) -> u16 {
+    let p = memb_raw_ptr(0x40, off);
+    (*p as u16) | ((*p.add(1) as u16) << 8)
+}
+
+#[inline]
+unsafe fn bda_set_word(off: u16, v: u16) {
+    let p = memb_raw_ptr(0x40, off);
+    *p = (v & 0xFF) as u8;
+    *p.add(1) = (v >> 8) as u8;
+}
+
+/// The ring's bounds as the BIOS publishes them. A program is allowed to move
+/// the buffer by rewriting these (that is what they are for), so follow them
+/// rather than assuming 1E/3E — but keep the ring inside the BDA page, since
+/// that is the only memory the BIOS owns here.
+#[inline]
+unsafe fn ring_bounds() -> (u16, u16) {
+    let start = bda_word(0x80);
+    let end = bda_word(0x82);
+    if start >= BDA_KBD_BUF_START && end > start && end <= 0x100 && (end - start) >= 4 {
+        (start, end)
+    } else {
+        (BDA_KBD_BUF_START, BDA_KBD_BUF_END)
+    }
+}
+
+#[inline]
+unsafe fn ring_next(off: u16, start: u16, end: u16) -> u16 {
+    let n = off.wrapping_add(2);
+    if n >= end {
+        start
+    } else {
+        n
+    }
+}
+
+/// Head/tail as the guest left them, snapped back into the ring if they are not
+/// in it (an uninitialized BDA would otherwise have us writing keys over the
+/// COM1 port address at 40:00).
+#[inline]
+unsafe fn ring_ptrs(start: u16, end: u16) -> (u16, u16) {
+    let fix = |p: u16| {
+        if p >= start && p < end && (p - start) % 2 == 0 {
+            p
+        } else {
+            start
+        }
+    };
+    (fix(bda_word(BDA_KBD_HEAD)), fix(bda_word(BDA_KBD_TAIL)))
 }
 
 #[no_mangle]
 pub extern "C" fn kbd_bios_push(ascii: u8, scancode: u8) {
     unsafe {
-        let st = &mut *k();
         if kbd_is_break_scancode(scancode) != 0 {
             return;
         }
-        if st.bios_count >= SZ {
-            return;
+        let (start, end) = ring_bounds();
+        let (head, tail) = ring_ptrs(start, end);
+        let next = ring_next(tail, start, end);
+        if next == head {
+            return; // full: the BIOS beeps and drops the key
         }
-        let tail = st.bios_tail as usize;
-        st.bios_buf[tail].ascii = ascii;
-        st.bios_buf[tail].scancode = scancode;
-        st.bios_tail = (st.bios_tail + 1) % SZ;
-        st.bios_count += 1;
+        let p = memb_raw_ptr(0x40, tail);
+        *p = ascii;
+        *p.add(1) = scancode;
+        bda_set_word(BDA_KBD_TAIL, next);
     }
 }
 
 #[no_mangle]
 pub extern "C" fn kbd_bios_peek(ascii: *mut u8, scancode: *mut u8) -> i32 {
     unsafe {
-        let st = &*k();
-        if st.bios_count <= 0 {
+        let (start, end) = ring_bounds();
+        let (head, tail) = ring_ptrs(start, end);
+        if head == tail {
             return 0;
         }
-        let head = st.bios_head as usize;
+        let p = memb_raw_ptr(0x40, head);
         if !ascii.is_null() {
-            *ascii = st.bios_buf[head].ascii;
+            *ascii = *p;
         }
         if !scancode.is_null() {
-            *scancode = st.bios_buf[head].scancode;
+            *scancode = *p.add(1);
         }
         1
     }
@@ -304,19 +386,19 @@ pub extern "C" fn kbd_bios_peek(ascii: *mut u8, scancode: *mut u8) -> i32 {
 #[no_mangle]
 pub extern "C" fn kbd_bios_pop(ascii: *mut u8, scancode: *mut u8) -> i32 {
     unsafe {
-        let st = &mut *k();
-        if st.bios_count <= 0 {
+        let (start, end) = ring_bounds();
+        let (head, tail) = ring_ptrs(start, end);
+        if head == tail {
             return 0;
         }
-        let head = st.bios_head as usize;
+        let p = memb_raw_ptr(0x40, head);
         if !ascii.is_null() {
-            *ascii = st.bios_buf[head].ascii;
+            *ascii = *p;
         }
         if !scancode.is_null() {
-            *scancode = st.bios_buf[head].scancode;
+            *scancode = *p.add(1);
         }
-        st.bios_head = (st.bios_head + 1) % SZ;
-        st.bios_count -= 1;
+        bda_set_word(BDA_KBD_HEAD, ring_next(head, start, end));
         shim_input_phase_started = 1;
         snapshot_on_key_consumed();
         1
@@ -325,7 +407,23 @@ pub extern "C" fn kbd_bios_pop(ascii: *mut u8, scancode: *mut u8) -> i32 {
 
 #[no_mangle]
 pub extern "C" fn kbd_bios_has_event() -> i32 {
-    (unsafe { (*k()).bios_count } > 0) as i32
+    unsafe {
+        let (start, end) = ring_bounds();
+        let (head, tail) = ring_ptrs(start, end);
+        (head != tail) as i32
+    }
+}
+
+/// Put the ring back the way the BIOS leaves it at power-on. Called from
+/// `init_bios_data_area` (which zeroes the page first) and from `kbd_reset`.
+#[no_mangle]
+pub extern "C" fn kbd_bios_buffer_init() {
+    unsafe {
+        bda_set_word(0x80, BDA_KBD_BUF_START);
+        bda_set_word(0x82, BDA_KBD_BUF_END);
+        bda_set_word(BDA_KBD_HEAD, BDA_KBD_BUF_START);
+        bda_set_word(BDA_KBD_TAIL, BDA_KBD_BUF_START);
+    }
 }
 
 const fn build_us() -> [u8; 0x40] {

@@ -115,14 +115,18 @@ fn if_else__hex_suffix_targets_are_rejected() {
         ],
     });
     // h-suffix targets are a hand-written-fixture idiom; real capstone IR is
-    // always 0x-prefixed (and carries `target`). The Rust backend rejects them.
-    let err = render_rs_ir(
+    // always 0x-prefixed (and carries `target`). The backend cannot express one,
+    // so it becomes a trap that names it — reached only if control gets there.
+    let src = render_rs_ir(
         &json!({"functions": [func]}),
         &[0x0000, 0x1000, 0x2000],
         "g_",
     )
-    .unwrap_err();
-    assert!(err.0.contains("0008h"), "{}", err.0);
+    .expect("chunk still compiles");
+    assert!(
+        src.contains(r#"r.jit_unsupported_instruction(c"jz 0008h".as_ptr());"#),
+        "{src}"
+    );
 }
 
 // ==========================================================================
@@ -292,8 +296,9 @@ fn if_else__bp_relative_operands_lower_to_ss() {
 }
 
 #[test]
-fn if_else__nested_bp_relative_operand_is_unsupported() {
-    // `[si + [bp - 4]]` is not real x86 addressing; the Rust backend refuses it.
+fn if_else__nested_bp_relative_operand_traps() {
+    // `[si + [bp - 4]]` is not real x86 addressing, so there is nothing faithful
+    // to emit for it: it becomes a trap rather than silently computing something.
     let func = json!({
         "start": 0x0000,
         "instructions": [
@@ -301,7 +306,12 @@ fn if_else__nested_bp_relative_operand_is_unsupported() {
             {"address": 0x0003, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
         ],
     });
-    assert!(try_render_rs(&func, &[], "").is_err());
+    let src = render_rs(&func, &[], "");
+    assert!(src.contains("r.jit_unsupported_instruction(c\""), "{src}");
+    assert!(
+        !src.contains("r.set_ax(r.memw("),
+        "must not invent an address: {src}"
+    );
 }
 
 // ==========================================================================

@@ -60,6 +60,10 @@ extern "C" {
     // write behavior (JIT'd code, watches, protected slots, null page, .drv
     // mapping, bookend capture) — route the write through the *_impl.
     static mut mem_page_flags: [u8; 512];
+    // Nonzero while a planar (EGA) video mode is up: 0xA0000..0xAFFFF is then the
+    // VGA memory controller, not RAM (runtime/src/vga_mem.rs). Writes are also
+    // page-flagged above; reads have only this.
+    static mut vga_planar_active: u8;
     fn shim_idle_wait();
 
     // Stack-op forensics ring (runtime/src/shims.rs) — appended INLINE by the
@@ -133,7 +137,7 @@ fn virtual_now_ns_inline() -> u64 {
 #[inline(never)]
 fn memw_read_slow(seg: u16, off: u16) -> u16 {
     unsafe {
-        if (seg == es() && off >= 0xFF00) || (seg == 0 && off < 0x10) {
+        if (seg == es() && off >= 0xFF00) || (seg == 0 && off < 0x10) || vga_routed(seg, off) {
             return memw_read_impl(seg, off, site(), site(), 0);
         }
         let v = memw_raw_read_inline(seg, off);
@@ -462,6 +466,12 @@ extern "C" {
     pub fn outb(port: u16, value: u8);
     pub fn outw(port: u16, value: u16);
 
+    /// Reached bytes the translator could not emit. Never returns: it writes a
+    /// crash bundle naming the instruction and aborts. A chunk carries one of
+    /// these wherever decoding hit something untranslatable, so the gap only
+    /// bites if control actually gets there.
+    fn jit_unsupported_instruction_impl(what: *const c_char);
+
     // DOS (INT 21h) services used by the chunk corpus.
     fn dos_api_impl(file: *const c_char, func: *const c_char, line: c_int) -> u8;
     fn dos_exit_impl(file: *const c_char, func: *const c_char, line: c_int);
@@ -496,9 +506,23 @@ extern "C" {
 //   memb: the es:FF00 RCB register-window (memory-mapped CPU registers).
 //   memw: the RCB window and the null page 0000:0000..000F (null-pointer
 //         warning). Stack-segment reads record their POP event inline.
+/// A read of the planar-VGA window is not a load: it latches all four planes and
+/// hands back a read-mode-dependent value (runtime/src/vga_mem.rs). Writes route
+/// via the page-flag table, but reads have no such table, so they test this.
+/// `vga_planar_active` is 0 for every non-planar mode, so the common case is one
+/// global load and a not-taken branch.
+#[inline(always)] fn vga_routed(seg: u16, off: u16) -> bool {
+    unsafe {
+        if vga_planar_active == 0 {
+            return false;
+        }
+        let addr = linear_addr(seg, off);
+        addr >= 0xA0000 && addr < 0xB0000
+    }
+}
 #[inline(always)] pub fn memb(seg: u16, off: u16) -> u8 {
     unsafe {
-        if seg == es() && off >= 0xFF00 {
+        if (seg == es() && off >= 0xFF00) || vga_routed(seg, off) {
             return memb_read_impl(seg, off, site(), site(), 0);
         }
         *seg_off(seg, off)
@@ -506,7 +530,11 @@ extern "C" {
 }
 #[inline(always)] pub fn memw(seg: u16, off: u16) -> u16 {
     unsafe {
-        if (seg == es() && off >= 0xFF00) || seg == ss() || (seg == 0 && off < 0x10) {
+        if (seg == es() && off >= 0xFF00)
+            || seg == ss()
+            || (seg == 0 && off < 0x10)
+            || vga_routed(seg, off)
+        {
             return memw_read_slow(seg, off);
         }
         memw_raw_read_inline(seg, off)
@@ -564,6 +592,7 @@ extern "C" {
 
 #[inline(always)] pub fn dos_api() -> u8 { unsafe { dos_api_impl(site(), site(), 0) } }
 #[inline(always)] pub fn dos_exit() { unsafe { dos_exit_impl(site(), site(), 0) } }
+#[inline(always)] pub fn jit_unsupported_instruction(what: *const c_char) { unsafe { jit_unsupported_instruction_impl(what) } }
 #[inline(always)] pub fn dos_get_version() -> u8 { unsafe { dos_get_version_impl(site(), site(), 0) } }
 #[inline(always)] pub fn dos_print_string(s: *const c_char) -> u8 { unsafe { dos_print_string_impl(s, site(), site(), 0) } }
 #[inline(always)] pub fn dos_write_char(ch_val: u8) -> u8 { unsafe { dos_write_char_impl(ch_val, site(), site(), 0) } }
@@ -758,7 +787,7 @@ impl Regs {
     #[inline(always)]
     pub fn memb(&self, seg: u16, off: u16) -> u8 {
         unsafe {
-            if seg == self.es_ && off >= 0xFF00 {
+            if (seg == self.es_ && off >= 0xFF00) || vga_routed(seg, off) {
                 return self.memb_rcb_read(seg, off);
             }
             *seg_off(seg, off)
@@ -772,7 +801,11 @@ impl Regs {
     #[inline(always)]
     pub fn memw(&self, seg: u16, off: u16) -> u16 {
         unsafe {
-            if (seg == self.es_ && off >= 0xFF00) || seg == self.ss_ || (seg == 0 && off < 0x10) {
+            if (seg == self.es_ && off >= 0xFF00)
+                || seg == self.ss_
+                || (seg == 0 && off < 0x10)
+                || vga_routed(seg, off)
+            {
                 return self.memw_read_slow(seg, off);
             }
             memw_raw_read_inline(seg, off)
@@ -781,7 +814,8 @@ impl Regs {
     #[inline(never)]
     fn memw_read_slow(&self, seg: u16, off: u16) -> u16 {
         unsafe {
-            if (seg == self.es_ && off >= 0xFF00) || (seg == 0 && off < 0x10) {
+            if (seg == self.es_ && off >= 0xFF00) || (seg == 0 && off < 0x10) || vga_routed(seg, off)
+            {
                 self.spill();
                 return memw_read_impl(seg, off, site(), site(), 0);
             }
@@ -919,6 +953,10 @@ impl Regs {
     regs_ffi_mut!(iret_());
     regs_ffi_mut!(retf_());
     regs_ffi_mut!(retf_pop_(pop_bytes: u16));
+    // Spills before it aborts, so the crash bundle reports the guest registers
+    // as they actually were at the faulting instruction, not as of the last
+    // block boundary.
+    regs_ffi_mut!(jit_unsupported_instruction(what: *const c_char));
 }
 
 // ---- RCB field ids (rcb_fields.h) -------------------------------------------

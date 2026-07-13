@@ -28,6 +28,12 @@ pub struct VgaState {
     pub feature_control: u8,
     pub graphics_index: u8,
     pub graphics_regs: [u8; 16],
+    /// VGA Sequencer (0x3C4 index / 0x3C5 data). SR2 is the Map Mask — which of
+    /// the four planes a write to video memory lands in — and SR4 the memory
+    /// mode. A game writes these before it writes a pixel, and reads them back to
+    /// decide a VGA is there at all, so they must round-trip exactly.
+    pub sequencer_index: u8,
+    pub sequencer_regs: [u8; 8],
 }
 
 #[repr(C)]
@@ -710,6 +716,106 @@ pub extern "C" fn bios_current_video_columns() -> u8 {
 pub extern "C" fn bios_current_active_page() -> u8 {
     unsafe { (*bv()).active_page }
 }
+/// Where the static functionality table lives in the BIOS ROM segment. A caller
+/// gets a far pointer to it and is entitled to keep it, so it must be at a real
+/// address in ROM, not in a buffer we hand back.
+const BIOS_STATIC_FUNC_TABLE_SEG: u16 = 0xF000;
+const BIOS_STATIC_FUNC_TABLE_OFF: u16 = 0x0F10;
+
+/// The static functionality table (INT 10h AH=1Bh, offset 0 of the state block).
+/// Every bit here is a claim about what this BIOS can do, so every bit is one we
+/// actually implement — the mode bitmaps say yes only to modes `video.rs` can
+/// really set and really display.
+pub unsafe fn init_bios_static_functionality_table() {
+    let t: [u8; 16] = [
+        // modes 00-07: text 0-3 and 7, CGA 4-6. All of them.
+        0xFF, // modes 08-0F: Tandy 8/9/0A (bits 0-2), EGA 0Dh (bit 5), 0Eh (bit 6).
+        // 0Bh/0Ch are not modes, and 0Fh (mono graphics) we do not have.
+        0x67, // modes 10-13: 10h (bit 0), 12h (bit 2), 13h (bit 3). Not 11h.
+        0x0D, 0x00, 0x00, 0x00, 0x00, // reserved
+        0x07, // scan lines available: 200, 350, 400
+        0x01, // character blocks
+        0x01, // maximum active character blocks
+        // misc flags 1: default palette loading (bit 3), summing to grey (bit 1),
+        // EGA attribute palette (bit 5), DAC colour palette (bit 6).
+        0x6A, // misc flags 2: display combination code supported (bit 3).
+        0x08, 0x00, 0x00, // reserved
+        0x00, // save-pointer function flags: none of them
+        0x00, // reserved
+    ];
+    for (i, b) in t.iter().enumerate() {
+        *seg_off(
+            BIOS_STATIC_FUNC_TABLE_SEG,
+            BIOS_STATIC_FUNC_TABLE_OFF + i as u16,
+        ) = *b;
+    }
+}
+
+fn mode_colors(mode: u8) -> u16 {
+    match mode {
+        0x13 => 256,
+        0x06 | 0x0A => 2,
+        0x04 | 0x05 => 4,
+        _ => 16,
+    }
+}
+
+fn mode_scan_line_code(mode: u8) -> u8 {
+    match mode {
+        0x10 => 1, // 350
+        0x12 => 3, // 480
+        _ => 0,    // 200
+    }
+}
+
+/// INT 10h AH=1Bh — get functionality/state information. A VGA-only call, and we
+/// report DCC 07h (VGA with an analogue colour display), so a program that asks
+/// has to get a real answer. Every field below is read out of the state this
+/// machine actually keeps; none of it is invented for the caller's benefit.
+#[no_mangle]
+pub extern "C" fn bios_get_functionality_info() {
+    unsafe {
+        let dst = seg_off(es(), di());
+        core::ptr::write_bytes(dst, 0, 64);
+        let mode = (*bv()).video_mode;
+        let cols = bios_video_columns();
+        let rows = bios_video_rows();
+
+        let put16 = |off: usize, v: u16| {
+            *dst.add(off) = (v & 0xFF) as u8;
+            *dst.add(off + 1) = (v >> 8) as u8;
+        };
+
+        put16(0x00, BIOS_STATIC_FUNC_TABLE_OFF);
+        put16(0x02, BIOS_STATIC_FUNC_TABLE_SEG);
+        *dst.add(0x04) = mode;
+        put16(0x05, cols);
+        put16(0x07, bios_page_stride());
+        put16(0x09, 0x0000);
+        for page in 0..8usize {
+            let col = (*bv()).cursor_col[page] as u16;
+            let row = (*bv()).cursor_row[page] as u16;
+            put16(0x0B + page * 2, (row << 8) | col);
+        }
+        put16(0x1B, crate::shims::memw_raw_read(0x40, 0x0060));
+        *dst.add(0x1D) = (*bv()).active_page;
+        put16(0x1E, crate::shims::memw_raw_read(0x40, 0x0063));
+        *dst.add(0x22) = rows as u8;
+        put16(0x23, 8); // bytes per character: the 8x8 font
+        *dst.add(0x25) = bios_display_combination_code();
+        *dst.add(0x26) = bios_display_combination_alt_code();
+        put16(0x27, mode_colors(mode));
+        *dst.add(0x29) = if mode == 0x13 { 1 } else { 8 };
+        *dst.add(0x2A) = mode_scan_line_code(mode);
+        *dst.add(0x2B) = 0;
+        *dst.add(0x2C) = 0;
+        *dst.add(0x2D) = 0;
+        *dst.add(0x31) = 3; // video memory available: 256K
+        *dst.add(0x32) = 0;
+        set_al(0x1B);
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn bios_display_combination_code() -> u8 {
     0x07

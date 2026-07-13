@@ -41,6 +41,23 @@ fn uns<T>(what: impl Into<String>) -> R<T> {
     Err(Unsupported(what.into()))
 }
 
+/// A Rust `c"..."` literal holding `what`, safe to paste into emitted code.
+/// Interior NULs cannot occur (the strings are built from mnemonics), but quotes
+/// and backslashes must not be able to end the literal early.
+fn c_string_literal(what: &str) -> String {
+    let mut out = String::from("c\"");
+    for ch in what.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 || (c as u32) > 0x7E => out.push('?'),
+            c => out.push(c),
+        }
+    }
+    out.push_str("\".as_ptr()");
+    out
+}
+
 // ---- tiny IR accessors ------------------------------------------------------
 
 fn s<'a>(i: &'a Insn, k: &str) -> &'a str {
@@ -101,6 +118,7 @@ fn terminates(line: &str) -> bool {
         return true;
     }
     const NORET: &[&str] = &[
+        "jit_unsupported_instruction",
         "call_table_",
         "lcall_table_",
         "jump_table_",
@@ -147,7 +165,7 @@ fn localize_regs(line: &str) -> String {
     });
     let calls_re = CALLS_RE.get_or_init(|| {
         Regex::new(
-            r"\b(memb_write|memw_write|memb|memw|rcb_read8|rcb_read16|rcb_write8|rcb_write16|inb|inw|outb|outw|JIT_BUDGET|HLT_WAIT|run_interrupt|schedule_interrupt|dos_api|dos_exit|bios_keyboard|rep_movsb_block|rep_movsw_block|rep_stosb_block|call_table_|lcall_table_|jump_table_|near_ret_tail_|long_jump_|iret_|retf_pop_|retf_)\(",
+            r"\b(memb_write|memw_write|memb|memw|rcb_read8|rcb_read16|rcb_write8|rcb_write16|inb|inw|outb|outw|JIT_BUDGET|HLT_WAIT|run_interrupt|schedule_interrupt|dos_api|dos_exit|bios_keyboard|rep_movsb_block|rep_movsw_block|rep_stosb_block|call_table_|lcall_table_|jump_table_|near_ret_tail_|long_jump_|iret_|retf_pop_|retf_|jit_unsupported_instruction)\(",
         )
         .unwrap()
     });
@@ -179,7 +197,16 @@ fn insn_weight(insn: &Insn) -> u32 {
         "aam" | "aad" => 5,   // 17–19 cycles
         "int" => 10,          // INT dispatch ≈ 37 cycles
         "iret" => 10,
-        "in" | "out" => 4, // 12–26 cycles
+        // An I/O access is not priced in CPU cycles: the core stalls for a whole
+        // ISA bus cycle, ~1us, which dwarfs the 12-26 cycles the instruction
+        // itself takes. That is not a detail — it is the unit DOS drivers measure
+        // delays in. "Wait 80us" is written as "read the status port N times",
+        // and the AdLib manual specifies its post-write delays in exactly those
+        // terms. Priced at 4 units (160ns) the loop runs ~6x short, so an AdLib
+        // presence check starts timer 1 and gives up polling for the overflow
+        // before virtual time has reached it — the card is there and is never
+        // found. See runtime/src/audio/opl2.rs for the handshake it fails.
+        "in" | "out" => 25,
         "enter" => 4,
         "pushaw" | "popaw" => 6,                // 18–24 cycles
         "push" | "pop" | "pushf" | "popf" => 2, // 5–7 cycles
@@ -190,9 +217,10 @@ fn insn_weight(insn: &Insn) -> u32 {
         "shl" | "shr" | "sar" | "sal" | "rol" | "ror" | "rcl" | "rcr" => 2, // 3+n cycles
         // Bare string op ≈ 7 cycles; under rep this is setup only (the
         // per-iteration debit happens at run time).
-        "movsb" | "movsw" | "stosb" | "stosw" | "lodsb" | "lodsw" | "cmpsb" | "scasb" | "scasw" => {
-            2
-        }
+        "movsb" | "movsw" | "stosb" | "stosw" | "lodsb" | "lodsw" | "cmpsb" | "cmpsw" | "scasb"
+        | "scasw" => 2,
+        // The port-string ops carry an I/O access, like `in`/`out` above.
+        "insb" | "insw" | "outsb" | "outsw" => 25,
         "lea" => 1, // address arithmetic only — no memory access
         "hlt" => 1, // idles at host pace anyway
         "jmp" => 2,
@@ -341,6 +369,10 @@ pub struct RRenderer {
     block_fns: Vec<String>,
     seen_cases: BTreeSet<i64>,
     known_funcs: BTreeSet<i64>,
+    /// Constructs this chunk could not translate. Each one became a run-time trap
+    /// rather than a compile-time failure (see render_block), but they are still
+    /// the gap frontier — jit-compile logs them and `gap_sweep` aggregates them.
+    unsupported: Vec<String>,
 }
 
 impl RRenderer {
@@ -949,9 +981,71 @@ impl RRenderer {
         Ok(lines)
     }
 
+    /// insb/insw — read a port into [es:di] and step di. The port is DX; the
+    /// destination segment is ES and cannot be overridden.
+    fn h_ins(&mut self, w: i64) -> R<Vec<String>> {
+        let (m, i) = if w == 1 {
+            ("memb", "inb")
+        } else {
+            ("memw", "inw")
+        };
+        Ok(vec![
+            "{".into(),
+            format!("    let delta: i32 = if DF() != 0 {{ -{w} }} else {{ {w} }};"),
+            format!("    {m}_write(es(), di(), {i}(dx()));"),
+            "    set_di(((di() as i32 + delta) & 0xFFFF) as u16);".into(),
+            "}".into(),
+        ])
+    }
+    /// outsb/outsw — write [ds:si] to the port in DX and step si. The source
+    /// segment defaults to DS and *can* be overridden.
+    fn h_outs(&mut self, insn: &Insn, w: i64) -> R<Vec<String>> {
+        let seg = self.string_source_segment(insn);
+        let (m, o) = if w == 1 {
+            ("memb", "outb")
+        } else {
+            ("memw", "outw")
+        };
+        Ok(vec![
+            "{".into(),
+            format!("    let delta: i32 = if DF() != 0 {{ -{w} }} else {{ {w} }};"),
+            format!("    {o}(dx(), {m}({seg}(), si()));"),
+            "    set_si(((si() as i32 + delta) & 0xFFFF) as u16);".into(),
+            "}".into(),
+        ])
+    }
+
+    /// A rep'd port-string op. Unlike rep movs/stos, this cannot be collapsed into
+    /// a block helper: every iteration is a separate port access, and a device
+    /// hands back a different byte each time it is read (that is the whole point —
+    /// it is how a game streams a sector or a palette through a single port).
+    fn rep_port_string(&mut self, insn: &Insn, base: &str, w: i64) -> R<Vec<String>> {
+        let inner = if base.starts_with("ins") {
+            self.h_ins(w)?
+        } else {
+            self.h_outs(insn, w)?
+        };
+        let mut l = vec![
+            "{".into(),
+            "    JIT_BUDGET(cx() as u32); // rep iterations debit virtual time".into(),
+            "    while cx() != 0 {".into(),
+        ];
+        for line in inner {
+            l.push(format!("    {line}"));
+        }
+        l.push("        set_cx(cx().wrapping_sub(1));".into());
+        l.push("    }".into());
+        l.push("}".into());
+        Ok(l)
+    }
+
     fn handle_rep(&mut self, insn: &Insn, base: &str) -> R<Vec<String>> {
         let seg = self.string_source_segment(insn);
         match base {
+            "insb" => self.rep_port_string(insn, base, 1),
+            "insw" => self.rep_port_string(insn, base, 2),
+            "outsb" => self.rep_port_string(insn, base, 1),
+            "outsw" => self.rep_port_string(insn, base, 2),
             "movsb" => Ok(vec![format!("rep_movsb_block(es(), {seg}());")]),
             "movsw" => Ok(vec![format!("rep_movsw_block(es(), {seg}());")]),
             "stosb" => Ok(vec!["rep_stosb_block(es());".into()]),
@@ -966,11 +1060,24 @@ impl RRenderer {
                 "    }".into(),
                 "}".into(),
             ]),
+            // Every iteration but the last is overwritten by the next, so the
+            // observable effect of a rep lods is the final element and the walked
+            // si/cx — no loop needed. (Memory is not re-read, but nothing can
+            // observe that: a lods reads guest RAM, not a port.)
             "lodsb" => Ok(vec![
                 "if cx() != 0 {".into(),
                 "    JIT_BUDGET(cx() as u32); // rep iterations debit virtual time".into(),
                 "    let delta: i32 = if DF() != 0 { -1 } else { 1 };".into(),
                 format!("    set_al(memb({seg}(), ((si() as i32 + (cx() as i32 - 1) * delta) & 0xFFFF) as u16));"),
+                "    set_si(((si() as i32 + cx() as i32 * delta) & 0xFFFF) as u16);".into(),
+                "    set_cx(0);".into(),
+                "}".into(),
+            ]),
+            "lodsw" => Ok(vec![
+                "if cx() != 0 {".into(),
+                "    JIT_BUDGET(cx() as u32); // rep iterations debit virtual time".into(),
+                "    let delta: i32 = if DF() != 0 { -2 } else { 2 };".into(),
+                format!("    set_ax(memw({seg}(), ((si() as i32 + (cx() as i32 - 1) * delta) & 0xFFFF) as u16));"),
                 "    set_si(((si() as i32 + cx() as i32 * delta) & 0xFFFF) as u16);".into(),
                 "    set_cx(0);".into(),
                 "}".into(),
@@ -1767,13 +1874,28 @@ impl RRenderer {
         Ok(l)
     }
 
+    /// Is this string op one whose repeat can end early on ZF? Only the compares
+    /// set flags, so only they test one. On every other string op the F2 and F3
+    /// prefixes mean the same thing — repeat CX times — because there is no ZF
+    /// for the repeat to look at. MechWarrior clears a buffer with `repne stosw`,
+    /// which is `rep stosw`, and refusing it was refusing a plain REP.
+    fn rep_tests_zf(base: &str) -> bool {
+        matches!(base, "cmpsb" | "cmpsw" | "scasb" | "scasw")
+    }
+
     /// repe/repz cmpsb/cmpsw/scasb/scasw — repeat while equal (ZF=1).
     fn handle_repe(&mut self, insn: &Insn, base: &str) -> R<Vec<String>> {
+        if !Self::rep_tests_zf(base) {
+            return self.handle_rep(insn, base);
+        }
         self.handle_rep_cmp(insn, base, false)
     }
 
     /// repne/repnz cmpsb/cmpsw/scasb/scasw — repeat while not equal (ZF=0).
     fn handle_repne(&mut self, insn: &Insn, base: &str) -> R<Vec<String>> {
+        if !Self::rep_tests_zf(base) {
+            return self.handle_rep(insn, base);
+        }
         if base != "scasb" {
             return self.handle_rep_cmp(insn, base, true);
         }
@@ -2173,6 +2295,10 @@ impl RRenderer {
             "cmpsb" => self.h_cmpsb(insn),
             "scasb" => self.h_cmp_str("al()", "es", 1),
             "scasw" => self.h_cmp_str("ax()", "es", 2),
+            "insb" => self.h_ins(1),
+            "insw" => self.h_ins(2),
+            "outsb" => self.h_outs(insn, 1),
+            "outsw" => self.h_outs(insn, 2),
             "xlatb" => self.h_xlatb(insn),
             "ret" | "retn" | "retf" => self.handle_ret(insn),
             "mov" => self.handle_mov(insn),
@@ -2269,7 +2395,6 @@ impl RRenderer {
         let mut lines: Vec<String> = Vec::new();
         let insns = &block.instructions;
         let n = insns.len();
-        let succs = |a: i64| succ.get(&a).cloned().unwrap_or_default();
 
         for (idx, insn) in insns.iter().enumerate() {
             let ip = (i64f(insn, "address").unwrap_or(0) + self.cs_base) & 0xFFFF;
@@ -2283,117 +2408,159 @@ impl RRenderer {
                 lines.push(format!("{indent}JIT_BUDGET({cost});"));
             }
 
-            let is_last = idx == n - 1;
-            let mnem = s(insn, "mnemonic").to_string();
-            let op_str = decode_variables(s(insn, "op_str"));
-
-            if is_last && insn.get("op").and_then(Value::as_str) == Some("INDIRECT_NEAR_JMP") {
-                let expr = self.indirect_jump_target(insn)?;
-                lines.push(format!(
-                    "{indent}jump_table_((((cs() as u32) << 4).wrapping_add(({expr}) as u32)) & 0xFFFFF, expected_retip);"
-                ));
-                lines.push(format!("{indent}return -1;"));
-                return Ok(lines);
-            }
-            if is_last
-                && mnem == "jmp"
-                && ["ax", "bx", "cx", "dx", "si", "di", "bp", "sp"]
-                    .contains(&op_str.to_lowercase().trim())
-            {
-                let op = op_str.to_lowercase();
-                let op = op.trim();
-                lines.push(format!(
-                    "{indent}jump_table_((((cs() as u32) << 4).wrapping_add({op}() as u32)) & 0xFFFFF, expected_retip);"
-                ));
-                lines.push(format!("{indent}return -1;"));
-                return Ok(lines);
-            }
-            if is_last && mnem == "jmp" {
-                match parse_hex16(&op_str) {
-                    Some(target) => {
-                        lines.push(format!("{indent}return 0x{target:04X};"));
+            match self.render_insn(insn, idx, n, block, succ) {
+                Ok((out, block_ends)) => {
+                    lines.extend(out);
+                    if block_ends {
                         return Ok(lines);
                     }
-                    None => return uns(format!("jmp {op_str}")),
                 }
-            }
-            // Conditional jcc (ends the block).
-            if is_last && mnem.starts_with('j') && mnem != "jmp" {
-                let target = match parse_hex16(&op_str) {
-                    Some(t) => t,
-                    None => return uns(format!("{mnem} {op_str}")),
-                };
-                let cond_c = jcc_condition(
-                    &mnem,
-                    insn.get("cond_prev").and_then(|v| v.as_object()),
-                    i64f(insn, "address"),
-                );
-                let cond = match rustify_cond(&cond_c) {
-                    Some(c) => c,
-                    None => return uns(format!("jcc-cond:{cond_c}")),
-                };
-                let ss = succs(block.start);
-                let fall = ss.iter().find(|&&x| x != target).cloned();
-                match fall {
-                    Some(f) => {
-                        lines.push(format!("{indent}if {cond} {{"));
-                        lines.push(format!("{indent}    return 0x{target:04X};"));
-                        lines.push(format!("{indent}}} else {{"));
-                        lines.push(format!("{indent}    return 0x{f:04X};"));
-                        lines.push(format!("{indent}}}"));
-                    }
-                    None => {
-                        lines.push(format!("{indent}if {cond} {{"));
-                        lines.push(format!("{indent}    return 0x{target:04X};"));
-                        lines.push(format!("{indent}}}"));
-                        lines.push(format!("{indent}return -1;"));
-                    }
-                }
-                return Ok(lines);
-            }
-            if is_last && matches!(mnem.as_str(), "ret" | "retn" | "retf") {
-                let body = self.format_instruction(insn)?;
-                let mut last = String::new();
-                for l in &body {
-                    lines.push(format!("{indent}{l}"));
-                    last = l.trim().to_string();
-                }
-                if !last.starts_with("return") && !last.ends_with('}') {
+                Err(Unsupported(what)) => {
+                    // Bytes the translator cannot express. They may well never
+                    // execute — a packed game's CFG runs into its own ciphertext,
+                    // which the stub rewrites into real code before jumping there —
+                    // so the chunk still compiles and the gap becomes a *run-time*
+                    // one, paid only if control actually arrives. set_ip is already
+                    // emitted above, so the crash names the exact instruction.
+                    self.unsupported.push(what.clone());
+                    lines.push(format!(
+                        "{indent}jit_unsupported_instruction({});",
+                        c_string_literal(&what)
+                    ));
                     lines.push(format!("{indent}return -1;"));
-                }
-                return Ok(lines);
-            }
-
-            let body = self.format_instruction(insn)?;
-            let mut last = String::new();
-            for l in &body {
-                lines.push(format!("{indent}{l}"));
-                if !l.trim().is_empty() {
-                    last = l.trim().to_string();
-                }
-            }
-
-            // A noreturn call (call_table_/jump_table_/dos_exit/...) transfers
-            // control and returns via the trampoline: emit `return;` and end the
-            // block, mirroring the C state machine's `terminates` check. Without
-            // this the block would wrongly fall through to the next pc.
-            if terminates(&last) {
-                if !last.starts_with("return") {
-                    lines.push(format!("{indent}return -1;"));
-                }
-                return Ok(lines);
-            }
-
-            if is_last {
-                let ss = succs(block.start);
-                if let Some(&first) = ss.first() {
-                    lines.push(format!("{indent}return 0x{first:04X};"));
-                } else {
-                    lines.push(format!("{indent}return -1;"));
+                    return Ok(lines);
                 }
             }
         }
         Ok(lines)
+    }
+
+    /// Render one instruction of a block. The bool is "this instruction ended
+    /// the block" — it transferred control and already emitted its `return`.
+    fn render_insn(
+        &mut self,
+        insn: &Insn,
+        idx: usize,
+        n: usize,
+        block: &BasicBlock,
+        succ: &HashMap<i64, Vec<i64>>,
+    ) -> R<(Vec<String>, bool)> {
+        let indent = "    ";
+        let mut out: Vec<String> = Vec::new();
+        let succs = |a: i64| succ.get(&a).cloned().unwrap_or_default();
+        let is_last = idx == n - 1;
+        let mnem = s(insn, "mnemonic").to_string();
+        let op_str = decode_variables(s(insn, "op_str"));
+
+        if is_last && insn.get("op").and_then(Value::as_str) == Some("INDIRECT_NEAR_JMP") {
+            let expr = self.indirect_jump_target(insn)?;
+            out.push(format!(
+                "{indent}jump_table_((((cs() as u32) << 4).wrapping_add(({expr}) as u32)) & 0xFFFFF, expected_retip);"
+            ));
+            out.push(format!("{indent}return -1;"));
+            return Ok((out, true));
+        }
+        if is_last
+            && mnem == "jmp"
+            && ["ax", "bx", "cx", "dx", "si", "di", "bp", "sp"]
+                .contains(&op_str.to_lowercase().trim())
+        {
+            let op = op_str.to_lowercase();
+            let op = op.trim();
+            out.push(format!(
+                "{indent}jump_table_((((cs() as u32) << 4).wrapping_add({op}() as u32)) & 0xFFFFF, expected_retip);"
+            ));
+            out.push(format!("{indent}return -1;"));
+            return Ok((out, true));
+        }
+        if is_last && mnem == "jmp" {
+            match parse_hex16(&op_str) {
+                Some(target) => {
+                    out.push(format!("{indent}return 0x{target:04X};"));
+                    return Ok((out, true));
+                }
+                None => return uns(format!("jmp {op_str}")),
+            }
+        }
+        // Conditional jcc (ends the block).
+        if is_last && mnem.starts_with('j') && mnem != "jmp" {
+            let target = match parse_hex16(&op_str) {
+                Some(t) => t,
+                None => return uns(format!("{mnem} {op_str}")),
+            };
+            let cond_c = jcc_condition(
+                &mnem,
+                insn.get("cond_prev").and_then(|v| v.as_object()),
+                i64f(insn, "address"),
+            );
+            let cond = match rustify_cond(&cond_c) {
+                Some(c) => c,
+                None => return uns(format!("jcc-cond:{cond_c}")),
+            };
+            let ss = succs(block.start);
+            let fall = ss.iter().find(|&&x| x != target).cloned();
+            match fall {
+                Some(f) => {
+                    out.push(format!("{indent}if {cond} {{"));
+                    out.push(format!("{indent}    return 0x{target:04X};"));
+                    out.push(format!("{indent}}} else {{"));
+                    out.push(format!("{indent}    return 0x{f:04X};"));
+                    out.push(format!("{indent}}}"));
+                }
+                None => {
+                    out.push(format!("{indent}if {cond} {{"));
+                    out.push(format!("{indent}    return 0x{target:04X};"));
+                    out.push(format!("{indent}}}"));
+                    out.push(format!("{indent}return -1;"));
+                }
+            }
+            return Ok((out, true));
+        }
+        if is_last && matches!(mnem.as_str(), "ret" | "retn" | "retf") {
+            let body = self.format_instruction(insn)?;
+            let mut last = String::new();
+            for l in &body {
+                out.push(format!("{indent}{l}"));
+                last = l.trim().to_string();
+            }
+            if !last.starts_with("return") && !last.ends_with('}') {
+                out.push(format!("{indent}return -1;"));
+            }
+            return Ok((out, true));
+        }
+
+        let body = self.format_instruction(insn)?;
+        let mut last = String::new();
+        for l in &body {
+            out.push(format!("{indent}{l}"));
+            if !l.trim().is_empty() {
+                last = l.trim().to_string();
+            }
+        }
+
+        // A noreturn call (call_table_/jump_table_/dos_exit/...) transfers
+        // control and returns via the trampoline: emit `return;` and end the
+        // block, mirroring the C state machine's `terminates` check. Without
+        // this the block would wrongly fall through to the next pc.
+        if terminates(&last) {
+            if !last.starts_with("return") {
+                out.push(format!("{indent}return -1;"));
+            }
+            return Ok((out, true));
+        }
+
+        // The block's last instruction was not a control transfer: fall through to
+        // the single successor (or leave the dispatcher if there is none).
+        if is_last {
+            let ss = succs(block.start);
+            if let Some(&first) = ss.first() {
+                out.push(format!("{indent}return 0x{first:04X};"));
+            } else {
+                out.push(format!("{indent}return -1;"));
+            }
+            return Ok((out, true));
+        }
+        Ok((out, false))
     }
 
     fn render_function(&mut self, func: &Value) -> R<()> {
@@ -2524,6 +2691,20 @@ pub fn emit_chunk(ir: &Value, prefix: &str, image_base: Option<i64>, rt_path: &s
     emit_chunk_known(ir, prefix, image_base, rt_path, &BTreeSet::new())
 }
 
+/// emit_chunk, plus the constructs it could not translate. Each of those became a
+/// run-time trap instead of failing the compile (a packed game's decode runs into
+/// its own ciphertext, and refusing the chunk would throw away the real code that
+/// decrypts it) — but they are still the gap frontier, so callers that want to
+/// *see* the gaps ask for them here rather than by catching an error.
+pub fn emit_chunk_gaps(
+    ir: &Value,
+    prefix: &str,
+    image_base: Option<i64>,
+    rt_path: &str,
+) -> R<(String, Vec<String>)> {
+    emit_chunk_inner(ir, prefix, image_base, rt_path, &BTreeSet::new())
+}
+
 /// emit_chunk with extra known-function addresses beyond the IR's own function
 /// starts. Test seam: unit tests render a single function while declaring
 /// sibling call targets "known" so direct calls render as intra-chunk transfers.
@@ -2534,6 +2715,16 @@ pub fn emit_chunk_known(
     rt_path: &str,
     extra_known: &BTreeSet<i64>,
 ) -> R<String> {
+    emit_chunk_inner(ir, prefix, image_base, rt_path, extra_known).map(|(text, _gaps)| text)
+}
+
+fn emit_chunk_inner(
+    ir: &Value,
+    prefix: &str,
+    image_base: Option<i64>,
+    rt_path: &str,
+    extra_known: &BTreeSet<i64>,
+) -> R<(String, Vec<String>)> {
     let empty = Vec::new();
     let functions = ir
         .get("functions")
@@ -2572,6 +2763,7 @@ pub fn emit_chunk_known(
         block_fns: Vec::new(),
         seen_cases: BTreeSet::new(),
         known_funcs,
+        unsupported: Vec::new(),
     };
 
     let binary_name = prefix.trim_end_matches('_').to_string();
@@ -2635,5 +2827,5 @@ pub fn emit_chunk_known(
     out.push(String::new());
     out.extend(r.block_fns.iter().cloned());
     out.extend(wrappers);
-    Ok(out.join("\n"))
+    Ok((out.join("\n"), r.unsupported.clone()))
 }

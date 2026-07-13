@@ -104,8 +104,17 @@ fn gap_sweep() {
         for f in &funcs {
             total += 1;
             let one = json!({ "functions": [f.clone()], "relocations": relocs });
-            match codegen::emit_chunk(&one, "sweep_", Some(img_base), "saisei_rt.rs") {
-                Ok(_) => ok += 1,
+            // An untranslatable instruction no longer fails the chunk — it becomes
+            // a run-time trap — so the frontier is read from the reported gaps,
+            // not from an Err. A function is "ok" only if it has none.
+            match codegen::emit_chunk_gaps(&one, "sweep_", Some(img_base), "saisei_rt.rs") {
+                Ok((_, found)) if found.is_empty() => ok += 1,
+                Ok((_, found)) => {
+                    for u in found {
+                        let e = gaps.entry(normalize(&u)).or_insert((0, u.clone()));
+                        e.0 += 1;
+                    }
+                }
                 Err(u) => {
                     let e = gaps.entry(normalize(&u.0)).or_insert((0, u.0.clone()));
                     e.0 += 1;

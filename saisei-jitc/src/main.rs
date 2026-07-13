@@ -6,6 +6,7 @@
 //! — writes DIR/program.ir.json.
 
 use saisei_jitc::{codegen, disassemble};
+use std::collections::BTreeSet;
 
 use std::path::PathBuf;
 use std::process::exit;
@@ -725,17 +726,40 @@ fn cmd_jit_compile(mut it: std::vec::IntoIter<String>) {
     // Emit under a placeholder name, hash the name-independent text, then
     // stamp the real (content-addressed) name in.
     const PLACEHOLDER: &str = "SAISEI_CHUNKNAME";
-    let rs_ph = match codegen::emit_chunk(&ir, &format!("{PLACEHOLDER}_"), Some(image_base), "saisei_rt.rs")
-    {
+    let (rs_ph, gaps) = match codegen::emit_chunk_gaps(
+        &ir,
+        &format!("{PLACEHOLDER}_"),
+        Some(image_base),
+        "saisei_rt.rs",
+    ) {
         Ok(t) => t,
         Err(u) => die(&format!(
-            "could not compile chunk {base} (seg-base 0x{image_base:X}): unsupported construct: {}. \
+            "could not compile chunk {base} (seg-base 0x{image_base:X}): {}. \
              Add the missing construct to saisei-jitc/src/codegen.rs. Use \
              `saisei-jitc emit` on the segment, or the offline `gap_sweep` test, \
              to reproduce the reason.",
             u.0
         )),
     };
+    // Constructs we could not translate are traps in the emitted chunk, not a
+    // failed compile — most of them are bytes the decode only *reached*, never
+    // bytes the game runs (a packed image's CFG walks into its own ciphertext).
+    // They are still the gap frontier, so say so rather than swallowing them: if
+    // one of these ever executes, the chunk aborts and names it.
+    if !gaps.is_empty() {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for g in &gaps {
+            seen.insert(g.as_str());
+        }
+        let list: Vec<&str> = seen.into_iter().collect();
+        eprintln!(
+            "saisei-jitc: chunk {base} (seg-base 0x{image_base:X}) has {} untranslatable \
+             instruction(s), each emitted as a trap: {}. If one is reached at run time the \
+             chunk aborts and names it; add it to saisei-jitc/src/codegen.rs.",
+            gaps.len(),
+            list.join(", ")
+        );
+    }
     let rs_sha = sha_hex16(rs_ph.as_bytes());
     let name = format!("{base}_{rs_sha}");
     let so = outdir.join(format!("{name}.so"));
