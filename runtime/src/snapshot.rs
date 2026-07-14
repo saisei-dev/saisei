@@ -22,129 +22,24 @@ use crate::save_manager::sr_log;
 use core::ffi::{c_char, c_int, c_uint, c_ulonglong, c_void};
 
 // ============================================================================
-// C-ABI structs mirrored byte-exactly (layouts FROZEN — snapshots serialize them).
+// The structs the snapshot serializes.
+//
+// These are shims' own types, used directly — NOT re-declared here. snapshot.c
+// mirrored them because it was a separate translation unit reading shims.h; in
+// one Rust crate a mirror buys nothing and costs correctness. It drifted, and
+// silently: `shim_runtime_state_capture` writes shims' struct through a `*mut`
+// into a buffer this module sized from its own copy, so when shims' `VgaState`
+// grew a Sequencer register file (the EGA is a chip, not a byte array) and the
+// mirror did not, the write ran 16 bytes off the end of the buffer and the read
+// took 16 bytes of stack garbage back — landing in the tail of `irq_pending[]`,
+// which is a table of *interrupt vectors to deliver*. A restored game raised a
+// vector nobody had scheduled (0xFA), the IVT sent it to the unhandled-interrupt
+// ISR, and every save died on load. One definition, so it cannot happen again.
 // ============================================================================
-
-// ---- video.h ---------------------------------------------------------------
-#[repr(C)]
-struct VgaState {
-    palette: [u8; 256 * 3],
-    palette_write_index: u8,
-    palette_component: u8,
-    palette_read_index: u8,
-    palette_mask: u8,
-    attr_palette: [u8; 16],
-    border_color: u8,
-    blink_mode: u8,
-    dac_paging_mode: u8,
-    dac_current_page: u8,
-    misc_output: u8,
-    feature_control: u8,
-    graphics_index: u8,
-    graphics_regs: [u8; 16],
-}
-
-#[repr(C)]
-struct CgaState {
-    crtc_index: u8,
-    crtc_regs: [u8; 0x20],
-    hsync_base: u8,
-    horiz_scroll: i32,
-    hsync_initialized: u8,
-}
-
-#[repr(C)]
-struct BiosVideoState {
-    video_mode: u8,
-    cursor_row: [u8; 8],
-    cursor_col: [u8; 8],
-    cursor_attr: [u8; 8],
-    active_page: u8,
-    cga_palette_select: u8,
-    cga_border_color: u8,
-}
-
-// ---- audio.h ---------------------------------------------------------------
-#[repr(C)]
-struct Opl2State {
-    address: u8,
-    registers: [u8; 256],
-    status: u8,
-    busy_until_us: u64,
-    timer1_expire_us: u64,
-    timer2_expire_us: u64,
-}
-
-// ---- timer.h ---------------------------------------------------------------
-#[repr(C)]
-struct PITState {
-    reload: u32,
-    temp_reload: u16,
-    expect_high: u8,
-    access_mode: u8,
-}
-
-// ---- shims.h: ShimRuntimeState (SHIM_RUNTIME_STATE_VERSION 6) ---------------
-#[repr(C)]
-struct ShimRuntimeState {
-    version: u32,
-
-    bios_video: BiosVideoState,
-    cga: CgaState,
-    current_display_width: i32,
-    current_display_height: i32,
-    virtual_display_buffer: i32,
-
-    vga: VgaState,
-
-    opl2: Opl2State,
-
-    pit: PITState,
-    pit_reload_value: u32,
-    pit_latched_value: u16,
-    pit_latch_valid: u8,
-    pit_read_buffer: u16,
-    pit_read_expect_high: u8,
-    pit_read_buffer_is_latch: u8,
-    bios_timer_tick_backlog: u32,
-    bios_timer_tick_preincremented: u8,
-    pit_cycle_accum: u64,
-    pit_cycle_fraction_accum: u64,
-
-    next_free_seg: u16,
-    program_min_block_paras: u16,
-    null_guard_initial: [u8; 16],
-    a20_enabled: u8,
-
-    irq0_pending: u8,
-    irq_pending: [u8; 256],
-    last_int_no: u8,
-}
-
-// ---- shims.h: ShimKbdState (SHIM_KBD_BUFFER_SIZE 64) ------------------------
-const SHIM_KBD_BUFFER_SIZE: usize = 64;
-#[repr(C)]
-struct ShimKbdState {
-    q_ascii: [u8; SHIM_KBD_BUFFER_SIZE],
-    q_scan: [u8; SHIM_KBD_BUFFER_SIZE],
-    head: c_int,
-    tail: c_int,
-    count: c_int,
-    cur_ascii: u8,
-    cur_scan: u8,
-    last_scan: u8,
-    ready: u8,
-}
-
-// ---- shims.h: ShimFileMappingView ------------------------------------------
-#[repr(C)]
-struct ShimFileMappingView {
-    base: u32,
-    len: usize,
-    file_offset: usize,
-    canonical_cs: u16,
-    path: *const c_char, /* not owned by caller; valid for process lifetime */
-}
+use crate::shims::{
+    BiosVideoState, CgaState, Opl2State, PITState, ShimFileMappingView, ShimKbdState,
+    ShimRuntimeState, VgaState, SHIM_KBD_BUFFER_SIZE,
+};
 
 // ---- shims.h: ShimDispatchFn -----------------------------------------------
 type ShimDispatchFn = Option<
@@ -190,13 +85,18 @@ struct SnapCpu {
     active_binary: [c_char; 16],
 }
 
-// Byte-exactness assertions (layouts frozen at the original C sizes).
-const _: () = assert!(core::mem::size_of::<VgaState>() == 811);
+// The on-disk layout, pinned. These are the sizes the snapshot files are written
+// at, so a struct that changes shape trips this at COMPILE time — which is the
+// point: the failure it replaces was silent. Growing one of these is allowed, but
+// it is a format change: update the number here AND bump
+// `SHIM_RUNTIME_STATE_VERSION`, so a bundle written by an older binary is refused
+// on sight instead of being reinterpreted through the new shape.
+const _: () = assert!(core::mem::size_of::<VgaState>() == 820);
 const _: () = assert!(core::mem::size_of::<CgaState>() == 44);
 const _: () = assert!(core::mem::size_of::<BiosVideoState>() == 28);
 const _: () = assert!(core::mem::size_of::<Opl2State>() == 288);
 const _: () = assert!(core::mem::size_of::<PITState>() == 8);
-const _: () = assert!(core::mem::size_of::<ShimRuntimeState>() == 1520);
+const _: () = assert!(core::mem::size_of::<ShimRuntimeState>() == 1528);
 const _: () = assert!(core::mem::size_of::<ShimKbdState>() == 144);
 const _: () = assert!(core::mem::size_of::<ShimFileMappingView>() == 40);
 const _: () = assert!(core::mem::size_of::<SnapCpu>() == 208);

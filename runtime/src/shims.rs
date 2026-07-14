@@ -207,7 +207,11 @@ pub struct Opl2State {
     pub timer2_expire_us: u64,
 }
 
-const SHIM_RUNTIME_STATE_VERSION: u32 = 6;
+/// v7: `VgaState` carries the Sequencer register file. A v6 bundle is one byte
+/// layout, a v7 bundle another, and the two are the same *length* in the places
+/// that matter — so there is no honest way to tell them apart from the bytes.
+/// Refuse v6 rather than guess which era wrote it.
+const SHIM_RUNTIME_STATE_VERSION: u32 = 7;
 
 #[repr(C)]
 pub struct ShimRuntimeState {
@@ -246,7 +250,7 @@ pub struct ShimTailDispatchState {
     pub expected: u16,
 }
 
-const SHIM_KBD_BUFFER_SIZE: usize = 64;
+pub const SHIM_KBD_BUFFER_SIZE: usize = 64;
 #[repr(C)]
 pub struct ShimKbdState {
     pub q_ascii: [u8; SHIM_KBD_BUFFER_SIZE],
