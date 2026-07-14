@@ -8007,6 +8007,15 @@ pub unsafe extern "C" fn shim_boot_machine() {
     cga.horiz_scroll = 0;
     cga.hsync_initialized = 0;
 
+    // This is a reset, so it has to reset the things a boot leaves behind, and
+    // both of these are new enough to have been added after the rule was written.
+    // The display planes are memory the guest can read back (they answer at
+    // 0xA000), and the arena is DOS's record of who owns what — carried into a
+    // second boot, the next program starts life looking at the last one's screen
+    // and being told its heap is already taken.
+    crate::vga_mem::power_on_reset();
+    crate::dos::arena_reset();
+
     set_ds(psp_seg);
     set_es(psp_seg);
     set_cs(psp_seg.wrapping_add(0x10));
