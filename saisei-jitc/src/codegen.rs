@@ -2604,7 +2604,14 @@ impl RRenderer {
                 None => return uns(format!("jcc-cond:{cond_c}")),
             };
             let ss = succs(block.start);
-            let fall = ss.iter().find(|&&x| x != target).cloned();
+            // The not-taken edge continues at the next instruction — computed
+            // from the instruction itself, never by elimination from the
+            // successor list: a jcc aimed at its own fallthrough (`jz $+0`,
+            // the two-byte settle-delay idiom) has one successor serving both
+            // edges, and "whichever successor isn't the target" reads that as
+            // no fallthrough at all — emitted as a dispatcher exit with ip
+            // still on the jcc, which can never advance.
+            let fall = self.fallthrough_off(insn).filter(|f| ss.contains(f));
             match fall {
                 Some(f) => {
                     out.push(format!("{indent}if {cond} {{"));
@@ -2617,6 +2624,13 @@ impl RRenderer {
                     out.push(format!("{indent}if {cond} {{"));
                     out.push(format!("{indent}    return 0x{:04X};", target & 0xFFFF));
                     out.push(format!("{indent}}}"));
+                    // No decoded block at the fallthrough: leave the
+                    // dispatcher, but with ip advanced to where control
+                    // actually flows, so run_machine resolves (and JITs)
+                    // the next instruction instead of re-running this one.
+                    if let Some(f) = self.fallthrough_off(insn) {
+                        out.push(format!("{indent}set_ip(0x{:04X});", f & 0xFFFF));
+                    }
                     out.push(format!("{indent}return -1;"));
                 }
             }
