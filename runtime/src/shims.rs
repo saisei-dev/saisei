@@ -9608,7 +9608,15 @@ unsafe extern "C" fn int10h_impl(
     line: c_int,
 ) {
     shim_log(cstr!("int10h_impl"), file, func, line, ptr::null());
-    shim_log_stdout(cstr!("Trace: int 10h AX=0x%04X\n"), ax() as c_uint);
+    // BX and CX are the arguments to half of this interrupt's functions (AH=12h
+    // selects on BL, AH=10h and AH=01h carry theirs in BX/CX), so an AX-only trace
+    // cannot say what was actually asked for.
+    shim_log_stdout(
+        cstr!("Trace: int 10h AX=0x%04X BX=0x%04X CX=0x%04X\n"),
+        ax() as c_uint,
+        bx() as c_uint,
+        cx() as c_uint,
+    );
     if ah() == 0x00 {
         bios_set_video_mode_impl(al(), file, func, line);
     } else if ah() == 0x01 {
