@@ -19,7 +19,11 @@ use core::ffi::{c_char, c_int, c_void};
 const MAX_DOS_HANDLES: usize = 20;
 const MEMORY_SIZE: usize = 1 << 21;
 const CONVENTIONAL_TOP_SEG: u32 = 0xA000;
-const DEFAULT_PSP_SEG: u16 = 0x1000;
+/// Shims' constant, not a second copy of it. Two definitions of one number is how
+/// `ShimRuntimeState` and its mirror drifted apart and made every save unloadable;
+/// a DOS that disagreed with the loader about where the program starts would be
+/// the same bug wearing different clothes.
+use crate::shims::DEFAULT_PSP_SEG;
 const PATH_MAX_USIZE: usize = libc::PATH_MAX as usize;
 
 // ---- shims.c-owned globals dos.c touches -----------------------------------
@@ -345,6 +349,49 @@ pub(crate) unsafe fn forget_open_files_for_test() {
             hoset(i, false);
             hmset(i, HANDLE_MODE_READ);
         }
+    }
+}
+
+// ---- the DOS memory arena, across a restore -------------------------------
+//
+// Which paragraphs are handed out, and to whom, is guest-programmable state (INT
+// 21h AH=48h/49h/4Ah) — a device register in every sense that matters here. It
+// used to ride along for free: the whole allocator was a bump pointer, and its
+// one variable, `next_free_seg`, lives in the frozen ShimRuntimeState. The block
+// chain that replaced it does not, and a restore is a fresh process, so DOS came
+// back believing the arena was untouched — while the guest's own pointers into it
+// came back from RAM, still pointing at blocks DOS was now free to hand out
+// again. The next allocation lands on top of the guest's live heap.
+//
+// Own block, not an extension of DOSS, for the reason the container is tagged at
+// all: a save written before this existed simply lacks the tag and restores as it
+// always did.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DosMemSnap {
+    count: u16,
+    blocks: [MemBlock; DOS_MEM_BLOCK_MAX],
+}
+
+pub(crate) unsafe fn mem_capture(out: &mut Vec<u8>) {
+    // Zeroed, then assigned: a struct literal leaves padding undefined and
+    // `pod_capture` copies the bytes. See devices::pod_capture.
+    let mut s: DosMemSnap = core::mem::zeroed();
+    s.count = dos_mem_block_count;
+    s.blocks = dos_mem_blocks;
+    crate::devices::pod_capture(&s, out);
+}
+
+pub(crate) unsafe fn mem_restore(b: &[u8]) -> bool {
+    match crate::devices::pod_restore::<DosMemSnap>(b) {
+        Some(s) => {
+            dos_mem_block_count = s.count.min(DOS_MEM_BLOCK_MAX as u16);
+            dos_mem_blocks = s.blocks;
+            // A non-zero count is what stops `arena_init_if_needed` rebuilding a
+            // virgin arena over the top of the one just restored.
+            true
+        }
+        None => false,
     }
 }
 
@@ -2377,6 +2424,14 @@ pub static mut dos_mem_blocks: [MemBlock; DOS_MEM_BLOCK_MAX] = [MemBlock {
 #[no_mangle]
 pub static mut dos_mem_block_count: u16 = 0;
 
+/// Drop the arena, so the next program to ask for memory gets a fresh one built
+/// around *its* image. Called from `shim_boot_machine`: booting a second program
+/// into this process with the first one's block chain still standing would hand
+/// it a heap that DOS already believes is spoken for.
+pub(crate) unsafe fn arena_reset() {
+    dos_mem_block_count = 0;
+}
+
 /// Build the arena the first time anyone asks for memory. It cannot be built at
 /// boot: the program's own block is not sized until `load_executable` has read
 /// the MZ header, and `next_free_seg` is where that lands it.
@@ -2470,6 +2525,11 @@ unsafe fn arena_largest_free() -> u16 {
 }
 
 /// First fit, which is what DOS uses unless a program asks for another strategy.
+///
+/// `owner` is the PSP of the process the block belongs to — **not** whichever
+/// program was loaded first. DOS stamps every block with its owner and hands the
+/// lot back when that PSP terminates, so an owner that names the wrong process is
+/// a block that is never freed. Passing 0 means "the process running now".
 pub unsafe fn arena_alloc(parags: u16, owner: u16) -> Option<u16> {
     arena_init_if_needed();
     for i in 0..dos_mem_block_count as usize {
@@ -2479,11 +2539,23 @@ pub unsafe fn arena_alloc(parags: u16, owner: u16) -> Option<u16> {
         if !arena_split(i, parags) {
             continue;
         }
-        dos_mem_blocks[i].owner = if owner == 0 { psp_seg } else { owner };
+        dos_mem_blocks[i].owner = if owner == 0 { dos_current_psp } else { owner };
         arena_sync_next_free();
         return Some(dos_mem_blocks[i].seg);
     }
     None
+}
+
+/// Re-stamp a block's owner. EXEC needs this: a child's block belongs to the
+/// child's PSP, and the child's PSP *is* the first paragraph of the block — so
+/// the owner is not known until the block has been allocated.
+unsafe fn arena_set_owner(seg: u16, owner: u16) {
+    for i in 0..dos_mem_block_count as usize {
+        if dos_mem_blocks[i].seg == seg {
+            dos_mem_blocks[i].owner = owner;
+            return;
+        }
+    }
 }
 
 /// What DOS does when a program terminates: every block it owns goes back.
@@ -2525,7 +2597,10 @@ pub extern "C" fn dos_alloc_mem_impl(
             line,
             core::ptr::null(),
         );
-        match arena_alloc(parags, psp_seg) {
+        // Owned by whoever is asking — `dos_current_psp`, not the first program
+        // that ever ran. A child's allocations are the child's, and they go back
+        // when it terminates.
+        match arena_alloc(parags, dos_current_psp) {
             Some(seg) => {
                 dos_last_alloc_seg = seg;
                 set_ax(seg);
@@ -2876,11 +2951,22 @@ pub extern "C" fn dos_exec_impl(
     }
     // DOS gives the child the largest free block it has. Taking `next_free_seg`
     // instead only works while nothing is ever freed.
+    //
+    // The block belongs to the CHILD — its own PSP is the first paragraph of it —
+    // and that is what lets `arena_free_owner(child_psp)` below hand the memory
+    // back when the child dies. Stamping the parent's PSP here (or, worse, the
+    // first program's) leaks the block: nothing ever names it again. Dungeon
+    // Master's launcher EXECs four children before it starts the dungeon, and with
+    // each one's memory leaked there was none left to start it with — so it gave
+    // up and terminated, which is what "clean exit, status 5" was.
     let (child_psp, child_block) = unsafe {
         arena_init_if_needed();
         let want = arena_largest_free();
-        match arena_alloc(want, psp_seg) {
-            Some(seg) => (seg, want),
+        match arena_alloc(want, 0) {
+            Some(seg) => {
+                arena_set_owner(seg, seg);
+                (seg, want)
+            }
             None => {
                 set_CF(1);
                 set_ax(8); // insufficient memory

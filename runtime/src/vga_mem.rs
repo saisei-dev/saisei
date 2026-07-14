@@ -52,6 +52,19 @@ pub static mut vga_latches: [u8; 4] = [0; 4];
 #[no_mangle]
 pub static mut vga_planar_active: u8 = 0;
 
+/// Back to power-on: blank planes, empty latches, no planar mode. Called from
+/// `shim_boot_machine`, which is a reset — the planes are guest-readable memory
+/// and would otherwise survive into the next program booted in this process.
+pub unsafe fn power_on_reset() {
+    libc::memset(
+        core::ptr::addr_of_mut!(vga_planes) as *mut core::ffi::c_void,
+        0,
+        4 * PLANE_SIZE,
+    );
+    vga_latches = [0; 4];
+    vga_planar_active = 0;
+}
+
 pub unsafe fn refresh_planar_active(mode: u8) {
     let now = is_planar_graphics_mode_pub(mode) as u8;
     if now == vga_planar_active {

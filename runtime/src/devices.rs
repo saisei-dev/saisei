@@ -96,6 +96,14 @@ pub static DEVICE_BLOCKS: &[DeviceBlock] = &[
         capture: dos::files_capture,
         restore: dos::files_restore,
     },
+    // Who owns which paragraphs. See the note above `DosMemSnap` in dos.rs: the
+    // bump pointer this replaced rode along inside the frozen ShimRuntimeState,
+    // and the block chain that replaced it had nothing carrying it at all.
+    DeviceBlock {
+        tag: *b"DOSM",
+        capture: dos::mem_capture,
+        restore: dos::mem_restore,
+    },
     DeviceBlock {
         tag: *b"SN76",
         capture: audio::sn76489::state_capture,

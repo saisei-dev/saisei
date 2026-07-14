@@ -593,7 +593,28 @@ extern "C" {
 // Compile-time constants mirrored from shims.h
 // ============================================================================
 
-const DEFAULT_PSP_SEG: u16 = 0x1000;
+/// Where the first program is loaded — and therefore how much of the 640K a game
+/// actually gets, since everything below the PSP is DOS's.
+///
+/// **It must stay at or above 0x1000 (the 64K line).** Nothing our own DOS needs
+/// is down there — the IVT and the BIOS data area are a page and a half, and this
+/// DOS is a shim with no resident code at all — so 64K looks like waste, and 0x0800
+/// looks like a free 32K for the games that are tight on memory. It is not. A
+/// program packed with Microsoft EXEPACK computes a segment from its load address
+/// and *underflows* when loaded in the first 64K, and the unpacker stub notices and
+/// refuses: "Packed file is corrupt". This is the real bug in the real tool, and it
+/// is the entire reason DOS 5 shipped `LOADFIX`. Popcorn is EXEPACK'd and died on
+/// exactly that message at 0x0800; a real DOS box never triggers it because DOS
+/// itself, its buffers and COMMAND.COM already fill the first 64K.
+///
+/// So the memory a game gets is 576K, and that is what a game of the era expects.
+/// If one does not fit, the shortfall is ours and not the base: Dungeon Master
+/// looked like it needed 585K — its image and overlays, a 344K cache, then the 174K
+/// engine it EXECs — and it did not. It needed EXEC to give the children's memory
+/// back (see `arena_alloc`'s owner in dos.rs); each of the four it runs before the
+/// dungeon was leaking its block, and the engine had nowhere left to load. Lowering
+/// the base "fixed" that by hiding it, and broke Popcorn to do it.
+pub const DEFAULT_PSP_SEG: u16 = 0x1000;
 const MEMORY_SIZE: usize = 1 << 21;
 const MEMORY_MASK: u32 = (MEMORY_SIZE - 1) as u32;
 const CONVENTIONAL_TOP_SEG: u16 = 0xA000;
@@ -1933,9 +1954,60 @@ const BIOS_MEMSIZE_ISR_OFF: u16 = (BIOS_MEMSIZE_ISR_LINEAR & 0xF) as u16;
 const DOS_MULTIPLEX_ISR_LINEAR: u32 = 0x000F0E00;
 const DOS_MULTIPLEX_ISR_SEG: u16 = (DOS_MULTIPLEX_ISR_LINEAR >> 4) as u16;
 const DOS_MULTIPLEX_ISR_OFF: u16 = (DOS_MULTIPLEX_ISR_LINEAR & 0xF) as u16;
-const BIOS_SYSTEM_ISR_LINEAR: u32 = 0x000F0A00;
+const BIOS_SYSTEM_ISR_LINEAR: u32 = 0x000F1000;
 const BIOS_SYSTEM_ISR_SEG: u16 = (BIOS_SYSTEM_ISR_LINEAR >> 4) as u16;
 const BIOS_SYSTEM_ISR_OFF: u16 = (BIOS_SYSTEM_ISR_LINEAR & 0xF) as u16;
+
+// The F000 segment, and who has which page of it.
+//
+// An interrupt is dispatched by the ADDRESS its vector points at, so two stubs
+// that share an address are one interrupt wearing two numbers: whichever entry
+// `base_call_targets` lists first answers for both. INT 15h was given 0x000F0A00
+// while INT 33h already lived there, and INT 15h is the earlier entry — so every
+// `int 33h` a game made ran the BIOS system handler, `mouse_int33_impl` was never
+// once called, and Dungeon Master's hardware probe drew `[ ] Mouse`.
+//
+// The BIOS data tables share this segment and are guest-*readable* (INT 15h AH=C0h
+// hands out a pointer to the config table), so a stub must not sit on one either.
+// This is a set of distinct addresses with no natural key — exactly the kind of
+// table that silently gains a duplicate — so it is checked here, at compile time,
+// instead of by whoever next adds an interrupt.
+const F000_RESERVATIONS: [u32; 18] = [
+    DEFAULT_ISR_LINEAR,         // 0x0000
+    BIOS_VIDEO_ISR_LINEAR,      // 0x0100
+    BIOS_KBD_ISR_LINEAR,        // 0x0200
+    DOS_TERM_ISR_LINEAR,        // 0x0300
+    DOS_API_ISR_LINEAR,         // 0x0400
+    BIOS_TIMER_ISR_LINEAR,      // 0x0500
+    BIOS_IRQ0_ISR_LINEAR,       // 0x0600
+    BIOS_EQUIPMENT_ISR_LINEAR,  // 0x0700
+    BIOS_TIMER_TICK_ISR_LINEAR, // 0x0800
+    BIOS_IRQ1_ISR_LINEAR,       // 0x0900
+    MOUSE_ISR_LINEAR,           // 0x0A00
+    BIOS_DISK_ISR_LINEAR,       // 0x0B00
+    DOS_ABS_READ_ISR_LINEAR,    // 0x0C00
+    BIOS_MEMSIZE_ISR_LINEAR,    // 0x0D00
+    DOS_MULTIPLEX_ISR_LINEAR,   // 0x0E00
+    0x000F_0F00,                // BIOS config table (data — see BIOS_CONFIG_TABLE_LINEAR)
+    0x000F_0F10,                // BIOS static functionality table (data — see bios.rs)
+    BIOS_SYSTEM_ISR_LINEAR,     // 0x1000
+];
+const _: () = {
+    let mut i = 0;
+    while i < F000_RESERVATIONS.len() {
+        let mut j = i + 1;
+        while j < F000_RESERVATIONS.len() {
+            assert!(
+                F000_RESERVATIONS[i] != F000_RESERVATIONS[j],
+                "two things share an address in the F000 segment: an interrupt stub \
+                 that collides with another is unreachable, and one that collides with \
+                 a BIOS data table is pointed at bytes the guest also reads"
+            );
+            j += 1;
+        }
+        i += 1;
+    }
+};
 /// Conventional memory, in KB — the RAM below the 0xA000 video window, which is
 /// the same 640K the memory manager hands out. INT 12h reports it, out of the BDA
 /// word where the BIOS leaves it.
