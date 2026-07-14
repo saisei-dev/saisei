@@ -125,6 +125,8 @@ extern "C" {
         line: c_int,
     );
     fn bios_get_cursor(page: u8);
+    fn bios_set_cursor_shape(start: u8, end: u8);
+    fn bios_reset_cursor_shape();
     fn bios_read_char_attr() -> u16;
     fn bios_write_pixel(color: u8, x: u16, y: u16);
     fn bios_read_pixel(x: u16, y: u16);
@@ -615,8 +617,32 @@ extern "C" {
 /// dungeon was leaking its block, and the engine had nowhere left to load. Lowering
 /// the base "fixed" that by hiding it, and broke Popcorn to do it.
 pub const DEFAULT_PSP_SEG: u16 = 0x1000;
-const MEMORY_SIZE: usize = 1 << 21;
-const MEMORY_MASK: u32 = (MEMORY_SIZE - 1) as u32;
+/// How much RAM this machine has: 8MB.
+///
+/// 640K of it is the conventional memory below the video window; the rest is the
+/// *extended* memory above the 1MB line, which is what the A20 gate gates and what
+/// the XMS driver hands out (see `xms.rs`). It was 2MB, which left 960K of
+/// extended memory — less than the machine's own conventional memory, and less
+/// than any program that troubles to ask for an extended-memory manager expects to
+/// find. Might & Magic asks XMS how much there is, is told 960K, and gives up:
+/// "Might and Magic IV ran out of low memory!" — it sizes what it must keep *low*
+/// against what it can put *high*, and there was nowhere near enough high.
+///
+/// 8MB is what a 486 of this machine's class shipped with, and it is the number
+/// the rest of the model already implies: a VGA, a 486-class instruction clock,
+/// and a game era that assumed several megabytes behind HIMEM.
+///
+/// **This is the machine's address mask.** `MEMORY_MASK` derives from it, and
+/// every place that folds a linear address must use that one constant — `mask_addr`
+/// here, and `linear_addr` in cpu.rs and keyboard.rs, which used to carry the
+/// 2MB mask as a literal each. Three copies of a number that must never disagree:
+/// change the size and the accessors would fold at 2MB while the dispatcher folded
+/// at 8MB, and the same address would be two different bytes depending on who
+/// asked.
+pub const MEMORY_SIZE: usize = 1 << 23;
+pub const MEMORY_MASK: u32 = (MEMORY_SIZE - 1) as u32;
+/// Below the 1MB line, with A20 shut, an address wraps — that is what the gate is.
+pub const REAL_MODE_MASK: u32 = 0xFFFFF;
 const CONVENTIONAL_TOP_SEG: u16 = 0xA000;
 const MAX_DOS_HANDLES: usize = 20;
 const PATH_MAX: usize = 4096;
@@ -1957,6 +1983,12 @@ const DOS_MULTIPLEX_ISR_OFF: u16 = (DOS_MULTIPLEX_ISR_LINEAR & 0xF) as u16;
 const BIOS_SYSTEM_ISR_LINEAR: u32 = 0x000F1000;
 const BIOS_SYSTEM_ISR_SEG: u16 = (BIOS_SYSTEM_ISR_LINEAR >> 4) as u16;
 const BIOS_SYSTEM_ISR_OFF: u16 = (BIOS_SYSTEM_ISR_LINEAR & 0xF) as u16;
+/// The XMS driver's control function. Unlike every other entry in this segment
+/// it is not an interrupt: the guest gets this address from INT 2Fh AX=4310h and
+/// **far-calls** it. So it returns with a RETF, not an IRET — see `xms_entry_impl`.
+const XMS_ENTRY_LINEAR: u32 = 0x000F1100;
+const XMS_ENTRY_SEG: u16 = (XMS_ENTRY_LINEAR >> 4) as u16;
+const XMS_ENTRY_OFF: u16 = (XMS_ENTRY_LINEAR & 0xF) as u16;
 
 // The F000 segment, and who has which page of it.
 //
@@ -1972,7 +2004,7 @@ const BIOS_SYSTEM_ISR_OFF: u16 = (BIOS_SYSTEM_ISR_LINEAR & 0xF) as u16;
 // This is a set of distinct addresses with no natural key — exactly the kind of
 // table that silently gains a duplicate — so it is checked here, at compile time,
 // instead of by whoever next adds an interrupt.
-const F000_RESERVATIONS: [u32; 18] = [
+const F000_RESERVATIONS: [u32; 19] = [
     DEFAULT_ISR_LINEAR,         // 0x0000
     BIOS_VIDEO_ISR_LINEAR,      // 0x0100
     BIOS_KBD_ISR_LINEAR,        // 0x0200
@@ -1991,6 +2023,7 @@ const F000_RESERVATIONS: [u32; 18] = [
     0x000F_0F00,                // BIOS config table (data — see BIOS_CONFIG_TABLE_LINEAR)
     0x000F_0F10,                // BIOS static functionality table (data — see bios.rs)
     BIOS_SYSTEM_ISR_LINEAR,     // 0x1000
+    XMS_ENTRY_LINEAR,           // 0x1100 (far-called, not an interrupt)
 ];
 const _: () = {
     let mut i = 0;
@@ -4211,6 +4244,10 @@ unsafe fn init_bios_data_area() {
     memw_raw_write(0x40, 0x6E, 0);
     *seg_off(0x40, 0x66) = 0;
     *seg_off(0x40, 0x62) = 0;
+    // The cursor shape is a CRTC register pair with a BDA copy, and the memset
+    // above left both saying "scan line 0 to scan line 0". Power on at the shape
+    // the mode's own CRTC program would have set.
+    bios_reset_cursor_shape();
     bios_video.cga_palette_select = 0;
     bios_video.cga_border_color = 0;
     video_invalidate_palette_cache();
@@ -4263,9 +4300,9 @@ unsafe fn find_file_mapping_mut(addr: u32) -> *mut FileMapping {
 unsafe fn linear_addr(seg: u16, off: u16) -> u32 {
     let addr = ((seg as u32) << 4) + off as u32;
     if a20_enabled {
-        addr & 0x1FFFFF
+        addr & MEMORY_MASK
     } else {
-        addr & 0xFFFFF
+        addr & REAL_MODE_MASK
     }
 }
 
@@ -6682,6 +6719,37 @@ pub unsafe fn shim_test_init_memory() {
     }
 }
 
+#[cfg(test)]
+mod machine_size_tests {
+    /// The JIT chunk prelude folds guest addresses itself — it is compiled into
+    /// every chunk, upstream of this crate, so it cannot import `MEMORY_MASK` and
+    /// carries the number as a literal instead. Translated game code reaches memory
+    /// through *that* mask; the shims it calls reach the same memory through *this*
+    /// one. Let them disagree and one linear address means two different bytes
+    /// depending on who is asking — and it would stay invisible, because every
+    /// real-mode address is below 0x110000 and folds the same under either.
+    ///
+    /// So the two are checked against each other here, which is the same thing
+    /// `rcb_prelude_consts_match` does for the RCB layout.
+    #[test]
+    fn the_chunk_prelude_agrees_with_the_machine_it_runs_on() {
+        let prelude = include_str!("../../saisei-jitc/rt/saisei_rt.rs");
+        let decl = format!("const MEMORY_MASK: u32 = 0x{:X};", super::MEMORY_MASK);
+        assert!(
+            prelude.contains(&decl),
+            "saisei-jitc/rt/saisei_rt.rs must declare `{decl}` — the machine has \
+             {} bytes of RAM, and the chunks must fold addresses at the same place \
+             the runtime does",
+            super::MEMORY_SIZE
+        );
+        let real = format!("const REAL_MODE_MASK: u32 = 0x{:X};", super::REAL_MODE_MASK);
+        assert!(
+            prelude.contains(&real),
+            "saisei-jitc/rt/saisei_rt.rs must declare `{real}`"
+        );
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn memw_raw_read(seg: u16, off: u16) -> u16 {
     let addr = linear_addr(seg, off);
@@ -9000,7 +9068,14 @@ pub unsafe extern "C" fn outb(port: u16, value: u8) {
             vga.sequencer_index = value & 0x07;
         }
         0x3C5 => {
-            vga.sequencer_regs[(vga.sequencer_index & 0x07) as usize] = value;
+            let idx = (vga.sequencer_index & 0x07) as usize;
+            vga.sequencer_regs[idx] = value;
+            // SR4 carries chain-4, and a game enters Mode X by clearing it while
+            // already in mode 13h. Nothing else will tell the memory controller
+            // that the 0xA0000 window just became planar.
+            if idx == 4 {
+                crate::vga_mem::sequencer_memory_mode_written();
+            }
         }
         0x3CE => {
             vga.graphics_index = value & 0x0F;
@@ -9261,6 +9336,17 @@ unsafe fn init_bios_config_table() {
     }
 }
 
+/// One descriptor of the six-entry GDT an INT 15h AH=87h caller builds at ES:SI.
+///
+/// The 8 bytes are a 286 segment descriptor: a 16-bit limit, a **24-bit** linear
+/// base (the AT's address bus), an access byte, then two bytes the 286 required to
+/// be zero and the 386 BIOS reuses as base bits 24-31. Reading those two costs
+/// nothing on a caller that zeroed them and is right on one that did not.
+unsafe fn gdt_descriptor_base(seg: u16, off: u16) -> u32 {
+    let b = |i: u16| *seg_off(seg, off.wrapping_add(i)) as u32;
+    b(2) | (b(3) << 8) | (b(4) << 16) | (b(7) << 24)
+}
+
 /// INT 15h — the AT BIOS system services.
 ///
 /// The one that matters is AH=C0h, get configuration: it is how a program asks
@@ -9268,8 +9354,14 @@ unsafe fn init_bios_config_table() {
 /// The rest of the function space is answered the way a real AT BIOS answers a
 /// service it does not have — CF=1, AH=86h — which is a real answer, not a stub:
 /// "this BIOS does not implement that", which every caller is written to handle.
-/// AH=88h is the exception worth stating outright: extended memory is 0 KB,
-/// because there is none above the 1MB line on this machine.
+///
+/// **The carry goes back through the stack, not the live flags.** This handler
+/// returns with an IRET, and IRET pops the FLAGS word the INT pushed — so a
+/// `set_CF` here is overwritten on the way out and the caller reads the carry it
+/// had *before* the call. Every status below therefore goes through
+/// `set_iret_carry`, which patches the word IRET is about to pop. (This was the
+/// bug that made "no such service" unreportable: the AH=86h landed, the CF=1 did
+/// not, and a caller testing the carry saw success.)
 unsafe extern "C" fn int15h_impl(
     _expected_retip: u16,
     file: *const c_char,
@@ -9282,17 +9374,62 @@ unsafe extern "C" fn int15h_impl(
             set_es(BIOS_CONFIG_TABLE_SEG);
             set_bx(BIOS_CONFIG_TABLE_OFF);
             set_ah(0x00);
-            set_CF(0);
+            set_iret_carry(0);
+        }
+        // AH=87h — move a block to or from extended memory.
+        //
+        // This is how a *real-mode* program uses memory above the 1MB line, and it
+        // is why a game bothers to lock an XMS block and read back its linear
+        // address: it cannot form a segment that reaches there, so it hands the
+        // address to the BIOS and has the BIOS do the copy. The caller builds a
+        // six-descriptor GDT at ES:SI — dummy, GDT, source, destination, then the
+        // BIOS's own CS and SS — and asks for CX *words*.
+        //
+        // Might & Magic locks its 960K XMS block, and every byte it ever puts in
+        // there or takes back out goes through this one call. Refusing it (the old
+        // "no such service") left the game holding a block it had no way to reach,
+        // so it fell back to conventional memory and ran out of it: "Might and
+        // Magic IV ran out of low memory!".
+        0x87 => {
+            let gdt_seg = es();
+            let gdt_off = si();
+            let src = gdt_descriptor_base(gdt_seg, gdt_off.wrapping_add(0x10));
+            let dst = gdt_descriptor_base(gdt_seg, gdt_off.wrapping_add(0x18));
+            // CX counts words, and the AT's own limit is 0x8000 of them (64K).
+            let bytes = (cx() as u32) * 2;
+            let end_src = src as u64 + bytes as u64;
+            let end_dst = dst as u64 + bytes as u64;
+            if end_src > MEMORY_SIZE as u64 || end_dst > MEMORY_SIZE as u64 {
+                // A descriptor naming memory this machine does not have. The AT
+                // reports that as an exception during the move, not as success.
+                set_ah(0x02);
+                set_iret_carry(1);
+            } else {
+                // The copy is made against linear memory directly, so it is
+                // indifferent to the A20 gate — exactly as the real service is,
+                // which opens the gate for the move and closes it again after.
+                libc::memmove(
+                    virtual_memory.add(dst as usize) as *mut c_void,
+                    virtual_memory.add(src as usize) as *const c_void,
+                    bytes as usize,
+                );
+                set_ah(0x00);
+                set_iret_carry(0);
+            }
         }
         0x88 => {
-            // Extended memory size in KB above 1MB. There is none.
+            // Extended memory size in KB above 1MB. This machine has plenty (see
+            // MEMORY_SIZE), but it is the XMS driver that owns it and hands it out
+            // — and a driver that owns extended memory is precisely one that stops
+            // answering this call, so that nothing takes memory behind its back.
+            // HIMEM.SYS reports zero here for that reason, and so do we.
             set_ax(0x0000);
-            set_CF(0);
+            set_iret_carry(0);
         }
         0x86 => {
             // Wait CX:DX microseconds. Virtual time is instruction-driven, and
             // the caller is about to spend it: let the safepoint pump advance it.
-            set_CF(0);
+            set_iret_carry(0);
         }
         _ => {
             shim_log_stdout(
@@ -9300,10 +9437,27 @@ unsafe extern "C" fn int15h_impl(
                 ax() as c_uint,
             );
             set_ah(0x86);
-            set_CF(1);
+            set_iret_carry(1);
         }
     }
     iret_impl(file, func, line);
+}
+
+/// The XMS driver's control function, as handed out by INT 2Fh AX=4310h.
+///
+/// This is a **far call**, not an interrupt: the guest pushed a return cs:ip and
+/// nothing else, so the way back is a RETF and the flags it leaves are the ones
+/// the driver set. (An IRET here would pop the caller's cs:ip *and* a FLAGS word
+/// that was never pushed, unwinding the stack one word too far.)
+unsafe extern "C" fn xms_entry_impl(
+    _expected_retip: u16,
+    file: *const c_char,
+    func: *const c_char,
+    line: c_int,
+) {
+    shim_log(cstr!("xms_entry_impl"), file, func, line, ptr::null());
+    crate::xms::control();
+    retf_impl(file, func, line);
 }
 
 /// INT 2Fh — the DOS multiplex.
@@ -9315,12 +9469,19 @@ unsafe extern "C" fn int15h_impl(
 /// installed**, because a caller zeroes AL and an installed handler is the thing
 /// that makes it non-zero.
 ///
-/// This machine boots DOS with no TSRs and no drivers: no HIMEM, no EMS, no
-/// SHARE, no APPEND, and it is not running under Windows. So there is nothing
-/// here to hook the vector, and returning unchanged is not a stub — it is the
-/// truth about the machine, and every ID gets the same honest "nobody is home".
-/// Might & Magic asks AX=4300h (is XMS installed?) and, hearing nothing, uses
-/// conventional memory, which is exactly what it should do.
+/// This machine boots DOS with no EMS board, no SHARE and no APPEND, and it is
+/// not running under Windows. So for all but one ID there is nothing here to hook
+/// the vector, and returning unchanged is not a stub — it is the truth about the
+/// machine, and every such ID gets the same honest "nobody is home".
+///
+/// The one that *is* home is **43h, the XMS driver** (see `xms.rs`). This used to
+/// answer "nobody" too, on the reasoning that a game hearing no XMS would fall
+/// back to conventional memory — and Might & Magic was named here as the game that
+/// did. It does not. It prints *"Not Enough Available Memory! Swords of Xeen
+/// requires an Extended or Expanded memory manager to run"* and exits, which is
+/// the correct behaviour for a program on a machine that has 640K and no way to
+/// reach a byte past it. The machine was the thing that was wrong: it has 2MB of
+/// RAM and an A20 gate, and nothing was installed to hand the top 1.4MB of it out.
 unsafe extern "C" fn int2Fh_impl(
     _expected_retip: u16,
     file: *const c_char,
@@ -9328,10 +9489,23 @@ unsafe extern "C" fn int2Fh_impl(
     line: c_int,
 ) {
     shim_log(cstr!("int2Fh_impl"), file, func, line, ptr::null());
-    shim_log_stdout(
-        cstr!("Trace: int 2Fh multiplex AX=0x%04X — nothing is installed to answer it\n"),
-        ax() as c_uint,
-    );
+    match ax() {
+        // 4300h — XMS installation check. AL=80h is the driver saying it is here.
+        0x4300 if crate::xms::installed() => {
+            set_al(0x80);
+        }
+        // 4310h — hand back the far entry point of the control function.
+        0x4310 if crate::xms::installed() => {
+            set_es(XMS_ENTRY_SEG);
+            set_bx(XMS_ENTRY_OFF);
+        }
+        _ => {
+            shim_log_stdout(
+                cstr!("Trace: int 2Fh multiplex AX=0x%04X — nothing is installed to answer it\n"),
+                ax() as c_uint,
+            );
+        }
+    }
     iret_impl(file, func, line);
 }
 
@@ -9437,6 +9611,9 @@ unsafe extern "C" fn int10h_impl(
     shim_log_stdout(cstr!("Trace: int 10h AX=0x%04X\n"), ax() as c_uint);
     if ah() == 0x00 {
         bios_set_video_mode_impl(al(), file, func, line);
+    } else if ah() == 0x01 {
+        // Set cursor shape. CH = first scan line (bit 5 = hide it), CL = last.
+        bios_set_cursor_shape(ch(), cl());
     } else if ah() == 0x02 {
         bios_set_cursor_position_impl(bh(), dh(), dl(), file, func, line);
     } else if ah() == 0x03 {
@@ -9643,7 +9820,7 @@ unsafe extern "C" fn int33h_impl(
     iret_impl(file, func, line);
 }
 
-static mut base_call_targets: [CallTarget; 16] = [
+static mut base_call_targets: [CallTarget; 17] = [
     CallTarget {
         addr: DEFAULT_ISR_LINEAR,
         file: ptr::null(),
@@ -9724,8 +9901,15 @@ static mut base_call_targets: [CallTarget; 16] = [
         file: ptr::null(),
         fn_: Some(int33h_impl),
     },
+    // Not an interrupt: the guest far-calls this one. It is resolved the same way
+    // — by the address control reaches — so it belongs in the same table.
+    CallTarget {
+        addr: XMS_ENTRY_LINEAR,
+        file: ptr::null(),
+        fn_: Some(xms_entry_impl),
+    },
 ];
-const base_call_target_count: usize = 16;
+const base_call_target_count: usize = 17;
 
 unsafe fn is_builtin_call_target(addr: u32) -> c_int {
     for i in 0..base_call_target_count {

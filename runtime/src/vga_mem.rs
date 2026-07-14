@@ -65,8 +65,20 @@ pub unsafe fn power_on_reset() {
     vga_planar_active = 0;
 }
 
+/// Whether the 0xA0000 window is steered through the planes right now.
+///
+/// Two ways in, and the second is not a mode at all: an EGA planar mode
+/// (0x0D/0x0E/0x10/0x12), or **mode 13h with chain-4 switched off** — Mode X. The
+/// chain is a Sequencer bit a game clears at will, long after the BIOS set the
+/// mode, so this cannot be answered from the mode number alone and
+/// `refresh_planar_active` has to be re-run when SR4 is written as well as when
+/// the mode changes.
+unsafe fn planes_are_live(mode: u8) -> bool {
+    is_planar_graphics_mode_pub(mode) || crate::video::is_unchained_256(mode)
+}
+
 pub unsafe fn refresh_planar_active(mode: u8) {
-    let now = is_planar_graphics_mode_pub(mode) as u8;
+    let now = planes_are_live(mode) as u8;
     if now == vga_planar_active {
         return;
     }
@@ -74,6 +86,14 @@ pub unsafe fn refresh_planar_active(mode: u8) {
     // Writes are routed by the page-flag table (which the chunks' inline write
     // fast path already consults), so the window's flags must follow the mode.
     crate::shims::mem_page_flags_recompute();
+}
+
+/// The Sequencer's Memory Mode register was written, and chain-4 lives in it: the
+/// window may have just become planar (or stopped being). Called from the port
+/// write, because a game enters Mode X *while already in* mode 13h — nothing else
+/// would notice.
+pub unsafe fn sequencer_memory_mode_written() {
+    refresh_planar_active(crate::video::current_video_mode());
 }
 
 /// Is this linear address steered through the planes right now?

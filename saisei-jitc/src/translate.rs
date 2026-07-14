@@ -119,6 +119,15 @@ fn mem_ptr_re() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"(?i)^(byte|word) ptr (?:(cs|ds|es|ss):)?\[(.+)\]$").unwrap())
 }
 
+/// Does the text run up to an operand's `[` end in an explicit segment override?
+/// (`word ptr cs:` does; `word ptr ` does not.)
+fn overridden_segment(prefix: &str) -> bool {
+    let p = prefix.trim_end().to_lowercase();
+    ["cs:", "ds:", "es:", "ss:", "fs:", "gs:"]
+        .iter()
+        .any(|s| p.ends_with(s))
+}
+
 /// _decode_variables — rewrite bp/sp-relative operands to var_X pseudo-names.
 pub fn decode_variables(op_str: &str) -> String {
     fn bp_name(sign: &str, num: &str) -> String {
@@ -159,7 +168,25 @@ pub fn decode_variables(op_str: &str) -> String {
                     j += 1;
                 }
                 let segment = &expr[i..j];
-                if let Some(c) = bp_var_re().captures(segment) {
+                // A `var_N` says "the stack slot N bytes below BP", and it says it
+                // by *name* — the segment is gone from the text, and what reads it
+                // back later (`rewrite_operands`) has only the name to go on. That
+                // is sound exactly when the operand takes BP's default segment, SS.
+                //
+                // `cs:[bp - 0x7f14]` is not that operand. It is a read from the code
+                // segment that merely computes its offset from BP, and calling it a
+                // stack variable renames it into a different address. So an operand
+                // wearing an explicit segment override is left as the memory operand
+                // it is: `mem_ptr_re` matches it, and `rewrite_mem_op` gives the
+                // override priority over the BP-means-SS default. (M&M reaches
+                // `mov ds, cs:[bp - 0x7f14]`; before this it became `cs:var_7F14`,
+                // which named no operand the emitter knew and stopped the game.)
+                // Verbatim, brackets and all: recursing would re-enter the same
+                // BP-to-variable rewrite on the inner expression and reintroduce the
+                // very name this branch exists to avoid.
+                if overridden_segment(&result) {
+                    result.push_str(segment);
+                } else if let Some(c) = bp_var_re().captures(segment) {
                     let sign = c.get(1).unwrap().as_str();
                     if sign == "-" {
                         result.push_str(&bp_name(sign, c.get(2).unwrap().as_str()));
@@ -932,6 +959,38 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `[bp-N]` operand is a stack slot because BP's default segment is SS. Put
+    /// a segment override on it and it is not one any more — it is a read from
+    /// *that* segment which merely uses BP to compute an offset.
+    ///
+    /// The `var_N` name carries no segment, so collapsing an overridden operand
+    /// into one silently reseats it on the stack. Might & Magic reaches
+    /// `mov ds, cs:[bp - 0x7f14]` while starting up, which became `cs:var_7F14` —
+    /// an operand the emitter could not name at all, so the game stopped there
+    /// rather than reading the wrong address. Both outcomes are wrong; this is the
+    /// one that must hold.
+    #[test]
+    fn a_segment_override_is_not_a_stack_variable() {
+        // No override: BP means SS, and this really is a stack variable.
+        assert_eq!(decode_variables("word ptr [bp - 0x10]"), "word ptr var_10");
+
+        // Overridden: stays a memory operand, so the segment survives to codegen.
+        for seg in ["cs", "ds", "es", "ss"] {
+            let op = format!("word ptr {seg}:[bp - 0x7f14]");
+            assert_eq!(
+                decode_variables(&op),
+                op,
+                "{seg}:[bp-N] must stay a memory operand, not become a var_N"
+            );
+            // And it must lower to a read of that segment — never SS by default.
+            let lowered = rewrite_mem_op(&decode_variables(&op), None);
+            assert!(
+                lowered.starts_with(&format!("memw({seg},")),
+                "{op} lowered to {lowered}, which reads the wrong segment"
+            );
+        }
+    }
 
     /// RCB_FIELDS is the translator's copy of the RCB layout; the chunk
     /// prelude (rt/saisei_rt.rs) carries the same fields as `pub const`s the

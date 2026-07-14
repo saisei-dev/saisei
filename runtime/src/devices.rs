@@ -104,6 +104,13 @@ pub static DEVICE_BLOCKS: &[DeviceBlock] = &[
         capture: dos::mem_capture,
         restore: dos::mem_restore,
     },
+    // The allocation strategy (INT 21h AH=58h) — a word the guest sets and reads
+    // back, and which decides where the *next* allocation lands.
+    DeviceBlock {
+        tag: *b"DOSA",
+        capture: dos::strategy_capture,
+        restore: dos::strategy_restore,
+    },
     DeviceBlock {
         tag: *b"SN76",
         capture: audio::sn76489::state_capture,
@@ -126,6 +133,15 @@ pub static DEVICE_BLOCKS: &[DeviceBlock] = &[
         tag: *b"VGAM",
         capture: crate::vga_mem::state_capture,
         restore: crate::vga_mem::state_restore,
+    },
+    // Who holds which XMS handle. The blocks' *contents* are guest RAM and ride in
+    // the snapshot's linear image already; what a fresh process would forget is
+    // what the handle numbers the guest is still holding *mean* — the same way it
+    // would forget what a DOS file handle meant (see DOSF).
+    DeviceBlock {
+        tag: *b"XMSM",
+        capture: crate::xms::state_capture,
+        restore: crate::xms::state_restore,
     },
 ];
 

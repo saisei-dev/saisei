@@ -21,13 +21,15 @@ extern "C" {
     fn shim_mark_irq_pending(int_no: u8);
 }
 
+/// As in cpu.rs: the fold comes from the machine's one size constant, never a
+/// literal copy of it.
 #[inline(always)]
 fn linear_addr(seg: u16, off: u16) -> usize {
     let addr = ((seg as u32) << 4).wrapping_add(off as u32);
     (if unsafe { a20_enabled } != 0 {
-        addr & 0x1FFFFF
+        addr & crate::shims::MEMORY_MASK
     } else {
-        addr & 0xFFFFF
+        addr & crate::shims::REAL_MODE_MASK
     }) as usize
 }
 /// `&memb_raw(seg, off)` — a raw pointer to the byte in virtual memory.

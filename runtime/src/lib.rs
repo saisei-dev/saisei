@@ -35,3 +35,4 @@ pub mod snapshot;
 pub mod timer;
 pub mod vga_mem;
 pub mod video;
+pub mod xms;

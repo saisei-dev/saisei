@@ -134,13 +134,16 @@ flag!(OF, set_OF, OF);
 flag!(IF, set_IF, IF);
 flag!(DF, set_DF, DF);
 
+/// The one address fold, from the one constant. Carrying the mask as a literal
+/// here is what would let this accessor disagree with `shims::mask_addr` about
+/// where memory ends the moment the machine's RAM size changed.
 #[inline(always)]
 fn linear_addr(seg: u16, off: u16) -> usize {
     let addr = ((seg as u32) << 4).wrapping_add(off as u32);
     (if unsafe { a20_enabled } != 0 {
-        addr & 0x1FFFFF
+        addr & crate::shims::MEMORY_MASK
     } else {
-        addr & 0xFFFFF
+        addr & crate::shims::REAL_MODE_MASK
     }) as usize
 }
 /// `seg_off(seg, off)` — a raw pointer into virtual memory.

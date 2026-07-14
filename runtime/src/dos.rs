@@ -373,6 +373,35 @@ struct DosMemSnap {
     blocks: [MemBlock; DOS_MEM_BLOCK_MAX],
 }
 
+/// The allocation strategy (INT 21h AH=58h), in a block of its own.
+///
+/// Not folded into `DosMemSnap`: that struct's length is what a saved `DOSM` block
+/// is checked against, so growing it would turn every existing save's arena chain
+/// into a refused block — losing the whole MCB chain to carry one word. A save
+/// written before this simply has no `DOSA` tag and restores at DOS's own default,
+/// which is the strategy it was running under anyway.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DosStrategySnap {
+    strategy: u16,
+}
+
+pub(crate) unsafe fn strategy_capture(out: &mut Vec<u8>) {
+    let mut s: DosStrategySnap = core::mem::zeroed();
+    s.strategy = dos_alloc_strategy;
+    crate::devices::pod_capture(&s, out);
+}
+
+pub(crate) unsafe fn strategy_restore(b: &[u8]) -> bool {
+    match crate::devices::pod_restore::<DosStrategySnap>(b) {
+        Some(s) => {
+            dos_alloc_strategy = s.strategy;
+            true
+        }
+        None => false,
+    }
+}
+
 pub(crate) unsafe fn mem_capture(out: &mut Vec<u8>) {
     // Zeroed, then assigned: a struct literal leaves padding undefined and
     // `pod_capture` copies the bytes. See devices::pod_capture.
@@ -2608,7 +2637,51 @@ unsafe fn arena_largest_free() -> u16 {
     best
 }
 
-/// First fit, which is what DOS uses unless a program asks for another strategy.
+/// Split block `i` so the *allocation* is the top `parags` of it and the free
+/// remainder is left below. The mirror of `arena_split`, and what last fit means:
+/// a program asks for last fit precisely to be placed as high as it can go, so
+/// carving its block off the bottom of the highest free run would answer the
+/// letter of the strategy and miss the point of it.
+///
+/// Returns the index the allocated block ended up at.
+unsafe fn arena_split_high(i: usize, parags: u16) -> Option<usize> {
+    let cur = dos_mem_blocks[i].parags;
+    if parags >= cur {
+        return Some(i); // takes the whole block; nothing left to leave behind
+    }
+    if dos_mem_block_count as usize >= DOS_MEM_BLOCK_MAX {
+        return Some(i); // no room to describe the remainder: keep the block whole
+    }
+    // The paragraph between the two is the new block's own MCB, exactly as in
+    // `arena_split` — the low block gives up one paragraph to house it.
+    let low = cur - parags - 1;
+    let mut j = dos_mem_block_count as usize;
+    while j > i + 1 {
+        dos_mem_blocks[j] = dos_mem_blocks[j - 1];
+        j -= 1;
+    }
+    dos_mem_blocks[i + 1] = MemBlock {
+        seg: dos_mem_blocks[i].seg.wrapping_add(low).wrapping_add(1),
+        parags,
+        owner: 0,
+    };
+    dos_mem_blocks[i].parags = low;
+    dos_mem_block_count += 1;
+    Some(i + 1)
+}
+
+/// DOS's memory allocation strategy (INT 21h AH=58h). First fit until a program
+/// says otherwise, which is what DOS boots with.
+pub static mut dos_alloc_strategy: u16 = 0;
+
+/// Allocate, by whichever strategy the program has asked DOS for.
+///
+/// The three fits are not interchangeable and a program picks one on purpose:
+/// **first fit** takes the lowest run that fits, **best fit** the tightest, and
+/// **last fit** the highest — which is how a program keeps a big allocation out
+/// of the way of the low memory it is about to need. Storing the strategy and
+/// then allocating first-fit regardless would let a program believe it had
+/// arranged its memory when it had not.
 ///
 /// `owner` is the PSP of the process the block belongs to — **not** whichever
 /// program was loaded first. DOS stamps every block with its owner and hands the
@@ -2616,18 +2689,41 @@ unsafe fn arena_largest_free() -> u16 {
 /// a block that is never freed. Passing 0 means "the process running now".
 pub unsafe fn arena_alloc(parags: u16, owner: u16) -> Option<u16> {
     arena_init_if_needed();
-    for i in 0..dos_mem_block_count as usize {
-        if dos_mem_blocks[i].owner != 0 || dos_mem_blocks[i].parags < parags {
-            continue;
-        }
+
+    // The high-memory bits (0x40/0x80) select the *upper memory blocks* to try,
+    // and this machine has no UMB provider — nothing is linked in above the 640K
+    // line, so there is no high region for them to name and every strategy
+    // allocates out of conventional memory. Only the fit survives the mask.
+    let fit = dos_alloc_strategy & 0x03;
+
+    let fits =
+        |i: usize| -> bool { dos_mem_blocks[i].owner == 0 && dos_mem_blocks[i].parags >= parags };
+
+    let chosen: Option<usize> = match fit {
+        // Best fit: the smallest run that still fits, so the big ones survive.
+        1 => (0..dos_mem_block_count as usize)
+            .filter(|&i| fits(i))
+            .min_by_key(|&i| dos_mem_blocks[i].parags),
+        // Last fit: the highest run that fits.
+        2 => (0..dos_mem_block_count as usize)
+            .filter(|&i| fits(i))
+            .next_back(),
+        // First fit (0), and anything DOS would not have accepted as a strategy.
+        _ => (0..dos_mem_block_count as usize).find(|&i| fits(i)),
+    };
+
+    let i = chosen?;
+    let at = if fit == 2 {
+        arena_split_high(i, parags)?
+    } else {
         if !arena_split(i, parags) {
-            continue;
+            return None;
         }
-        dos_mem_blocks[i].owner = if owner == 0 { dos_current_psp } else { owner };
-        arena_sync_next_free();
-        return Some(dos_mem_blocks[i].seg);
-    }
-    None
+        i
+    };
+    dos_mem_blocks[at].owner = if owner == 0 { dos_current_psp } else { owner };
+    arena_sync_next_free();
+    Some(dos_mem_blocks[at].seg)
 }
 
 /// Re-stamp a block's owner. EXEC needs this: a child's block belongs to the
@@ -2689,6 +2785,12 @@ pub extern "C" fn dos_alloc_mem_impl(
         match arena_alloc(parags, dos_current_psp) {
             Some(seg) => {
                 dos_last_alloc_seg = seg;
+                shim_log_stdout(
+                    c"Trace: dos_alloc_mem: parags=0x%04X strategy=%u -> seg=0x%04X\n".as_ptr(),
+                    parags as core::ffi::c_uint,
+                    dos_alloc_strategy as core::ffi::c_uint,
+                    seg as core::ffi::c_uint,
+                );
                 set_ax(seg);
                 set_CF(0);
                 0
@@ -2697,9 +2799,17 @@ pub extern "C" fn dos_alloc_mem_impl(
                 // The documented failure: AX=8 (insufficient memory), BX = the
                 // size of the largest block there is. A program that asked for
                 // 0xFFFF to size the arena reads its answer out of BX.
+                let largest = arena_largest_free();
+                shim_log_stdout(
+                    c"Trace: dos_alloc_mem: parags=0x%04X strategy=%u -> FAILED (largest free 0x%04X)\n"
+                        .as_ptr(),
+                    parags as core::ffi::c_uint,
+                    dos_alloc_strategy as core::ffi::c_uint,
+                    largest as core::ffi::c_uint,
+                );
                 set_CF(1);
                 set_ax(8);
-                set_bx(arena_largest_free());
+                set_bx(largest);
                 1
             }
         }
@@ -3573,6 +3683,50 @@ pub extern "C" fn dos_api_impl(file: *const c_char, func: *const c_char, line: c
             func,
             line,
         )),
+        // AH=58h — the memory allocation strategy, and the UMB link state.
+        //
+        // A program sets the strategy to place a block deliberately (see
+        // `arena_alloc`) and sets it back afterwards, so the value it reads must be
+        // the value it wrote. The UMB half is the honest half: nothing is linked in
+        // above the 640K line on this machine, so the link state is "not linked"
+        // and an attempt to link fails with DOS's own "there are no UMBs" error
+        // rather than pretending to a region that does not exist.
+        0x58 => match al() {
+            // AL=00h — get strategy.
+            0x00 => {
+                set_ax(unsafe { dos_alloc_strategy });
+                set_CF(0);
+            }
+            // AL=01h — set strategy. DOS accepts the three fits, each optionally
+            // aimed at upper memory, and rejects anything else.
+            0x01 => {
+                let want = bx();
+                let valid = matches!(want & !0xC0, 0x00 | 0x01 | 0x02)
+                    && matches!(want & 0xC0, 0x00 | 0x40 | 0x80);
+                if valid {
+                    unsafe { dos_alloc_strategy = want };
+                    set_CF(0);
+                } else {
+                    set_ax(0x0001); // invalid function
+                    set_CF(1);
+                }
+            }
+            // AL=02h — get the UMB link state. There are none, so they are not
+            // linked into the chain.
+            0x02 => {
+                set_al(0x00);
+                set_CF(0);
+            }
+            // AL=03h — set the UMB link state. DOS's error when no UMBs exist.
+            0x03 => {
+                set_ax(0x0001);
+                set_CF(1);
+            }
+            _ => {
+                set_ax(0x0001);
+                set_CF(1);
+            }
+        },
         0x4B => {
             if al() == 0x03 {
                 // AL=03h Load Overlay: param block is {word load_seg, word reloc_factor}.

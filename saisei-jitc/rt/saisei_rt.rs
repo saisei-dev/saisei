@@ -350,10 +350,24 @@ flag!(DF, set_DF, DF);
 
 // ---- static-inline helpers (reimplemented; not dynamic symbols) -------------
 
+/// The machine's address mask, and the **fourth** copy of it: the runtime has it
+/// as `shims::MEMORY_MASK`, and cpu.rs and keyboard.rs now take it from there. This
+/// one cannot — the prelude is compiled standalone into every chunk, upstream of
+/// the runtime crate — so it is a literal, and a literal that must equal the
+/// runtime's or the *same address* is two different bytes depending on whether the
+/// translated game code or the shim it called reached for it.
+///
+/// `the_chunk_prelude_agrees_with_the_machine_it_runs_on` (runtime/src/shims.rs)
+/// fails if these two ever drift. Nothing else would notice: every real-mode
+/// address a chunk can form is under 0x110000 and folds identically under either
+/// mask, so the disagreement is invisible right up until it isn't.
+const MEMORY_MASK: u32 = 0x7FFFFF; // 8MB - 1
+const REAL_MODE_MASK: u32 = 0xFFFFF;
+
 #[inline(always)]
 pub fn linear_addr(seg: u16, off: u16) -> u32 {
     let addr = ((seg as u32) << 4).wrapping_add(off as u32);
-    if unsafe { a20_enabled } != 0 { addr & 0x1FFFFF } else { addr & 0xFFFFF }
+    if unsafe { a20_enabled } != 0 { addr & MEMORY_MASK } else { addr & REAL_MODE_MASK }
 }
 
 #[inline(always)]
@@ -368,7 +382,7 @@ pub fn memb_raw(seg: u16, off: u16) -> u8 {
 
 #[inline(always)]
 fn mask_addr_rt(addr: u32) -> u32 {
-    if unsafe { a20_enabled } != 0 { addr & 0x1FFFFF } else { addr & 0xFFFFF }
+    if unsafe { a20_enabled } != 0 { addr & MEMORY_MASK } else { addr & REAL_MODE_MASK }
 }
 
 /// Byte-identical to the runtime's `memw_raw_read`: little-endian word with the

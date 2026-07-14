@@ -256,6 +256,38 @@ pub fn is_planar_graphics_mode_pub(mode: u8) -> bool {
     is_planar_graphics_mode(mode)
 }
 
+/// Sequencer Memory Mode (SR4), bit 3: **chain 4**. With it set, the four planes
+/// are chained so that consecutive CPU addresses walk plane 0,1,2,3,0,… — which is
+/// what makes mode 13h look like 64K of flat 8-bit pixels. Clear it and the chain
+/// comes apart: the planes go back to answering the *same* addresses as each other,
+/// and which one a write lands in is the Map Mask's business again.
+const SR4_CHAIN4: u8 = 0x08;
+
+/// Is the 256-colour mode running **unchained** — "Mode X"?
+///
+/// The BIOS sets mode 13h chained, and a game that wants Mode X clears chain-4
+/// itself, afterwards. So this is not a property of the mode number and cannot be
+/// answered by one: it is a live register, and a game flips it *while* in mode 13h.
+/// That is exactly what Might & Magic does — its title screen is drawn 80 bytes to
+/// a row across four planes, and decoded as chained it comes out as four squashed
+/// copies of itself in the top quarter of the screen.
+///
+/// The prize for unchaining is what every Mode X game is after: all 256K of VGA
+/// memory instead of the 64K the chain can reach, hence page flipping, and the
+/// latch-blitter for free.
+pub unsafe fn is_unchained_256(mode: u8) -> bool {
+    mode == 0x13 && ((*vs()).sequencer_regs[4] & SR4_CHAIN4) == 0
+}
+
+/// Bytes per plane per row: the 320-pixel line is spread a byte at a time across
+/// the four planes, so each holds a quarter of it.
+const MODEX_ROW_BYTES: i32 = 80;
+
+/// The mode the machine is in now, for the callers that must ask it live.
+pub unsafe fn current_video_mode() -> u8 {
+    (*bv()).video_mode
+}
+
 fn planar_mode_width(mode: u8) -> i32 {
     match mode {
         0x0E | 0x10 | 0x12 => 640,
@@ -678,6 +710,47 @@ unsafe fn decode_planar_mode(mode: u8, dst: *mut u8) {
     }
 }
 
+/// Decode unchained 256-colour (Mode X) out of the four planes.
+///
+/// The planar *memory* is the same chip either way — `vga_mem` already models the
+/// Map Mask, the latches and the ALU, and a Mode X write goes through all of it.
+/// What differs is the **decode**: an EGA planar mode holds one *bit* of a
+/// 4-bit colour in each plane (see `decode_planar_mode`), while Mode X holds a
+/// whole 8-bit pixel in each plane's *byte*. Plane `x & 3` owns pixel column `x`,
+/// so the four planes interleave a pixel at a time along the row.
+///
+/// The row's start comes from the CRTC start-address pair, which is what a Mode X
+/// game changes to flip pages — it has four 64K planes to flip between, which is
+/// the whole reason it gave up the chain.
+unsafe fn decode_modex(dst: *mut u8) {
+    let width = 320i32;
+    let height = 200i32;
+    let start = ((*cs()).crtc_regs[0x0C] as usize) << 8 | ((*cs()).crtc_regs[0x0D] as usize);
+
+    for y in 0..height {
+        let row_off = start + (y * MODEX_ROW_BYTES) as usize;
+        let row = dst.add((y * width) as usize);
+        for x in 0..width {
+            let byte = crate::vga_mem::plane_byte((x & 3) as usize, row_off + (x >> 2) as usize);
+            *row.add(x as usize) = byte;
+        }
+    }
+}
+
+unsafe fn stage_and_present_modex() {
+    let staging = staging_other();
+    decode_modex(staging);
+    ensure_display_geometry(320, 200);
+    crate::sdl::virtual_display_present(
+        staging,
+        320,
+        320,
+        200,
+        (*vs()).palette.as_ptr(),
+        (*vs()).palette_mask,
+    );
+}
+
 unsafe fn stage_and_present_planar_mode() {
     const MAX_W: i32 = 640;
     const MAX_H: i32 = 480;
@@ -731,6 +804,15 @@ pub extern "C" fn stage_and_present_current_buffer() {
         if is_planar_graphics_mode(mode) {
             LAST_STAGE_PRESENT_BRANCH = STAGE_PRESENT_BRANCH_PLANAR;
             stage_and_present_planar_mode();
+            return;
+        }
+        // Mode 13h with the chain broken: the pixels are in the planes, not in the
+        // 0xA0000 page, and reading that page instead shows four squashed copies of
+        // the picture. Must be tested before the linear branch below, which *is*
+        // that page.
+        if is_unchained_256(mode) {
+            LAST_STAGE_PRESENT_BRANCH = STAGE_PRESENT_BRANCH_PLANAR;
+            stage_and_present_modex();
             return;
         }
 
@@ -831,6 +913,7 @@ pub extern "C" fn apply_video_mode_state(mode: u8) {
             memw_raw_write(0x40, 0x50 + page * 2, 0);
         }
         (*bv()).active_page = 0;
+        crate::bios::bios_reset_cursor_shape();
     }
 }
 
@@ -880,6 +963,11 @@ pub extern "C" fn shim_render_screenshot_png(path: *const c_char) -> c_int {
             } else {
                 if is_planar_graphics_mode(mode) {
                     decode_planar_mode(mode, indices.as_mut_ptr());
+                } else if is_unchained_256(mode) {
+                    // Mode X: the pixels are in the planes. Reading the 0xA0000
+                    // page here instead is what makes a screenshot of a machine
+                    // nobody is running — see the note at the top of this function.
+                    decode_modex(indices.as_mut_ptr());
                 } else {
                     let src = seg_off(0xA000, 0);
                     core::ptr::copy_nonoverlapping(

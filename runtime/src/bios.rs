@@ -167,6 +167,54 @@ fn bios_store_cursor(page: u8, row: u8, col: u8) {
     }
 }
 
+/// The cursor shape lives in the BDA as a word at 0040:0060 — ending scan line
+/// at 40:60, starting scan line at 40:61 — which little-endian is exactly the CX
+/// that INT 10h AH=01h was handed and AH=03h hands back.
+const BIOS_CURSOR_SHAPE_OFF: u16 = 0x0060;
+
+/// Scan lines 6-7 of an 8-line cell: the bottom-two-rows underline every BIOS
+/// draws in a text mode whose character cell is 8 pixels tall, which is what this
+/// machine's font is.
+const BIOS_DEFAULT_CURSOR_SHAPE: u16 = 0x0607;
+
+/// INT 10h AH=01h — set the text-mode cursor shape. CH is the starting scan line
+/// and CL the ending one, and CH bit 5 means *no cursor at all*.
+///
+/// Two places hold this, and both are the guest's to read: the 6845/VGA CRTC pair
+/// (index 0x0A cursor-start, 0x0B cursor-end, reachable through port 0x3D4 with no
+/// BIOS in the way), and the BDA word the BIOS keeps beside them. The CRTC's own
+/// cursor-start register carries the disable bit in bit 5 — the same bit, in the
+/// same place, as CH's — so CH and CL go into the registers as they arrived,
+/// unmasked. A game that hides the cursor through the BIOS and then reads the CRTC
+/// back directly must find it hidden there too.
+fn bios_store_cursor_shape(start: u8, end: u8) {
+    unsafe {
+        crate::video::cga.crtc_regs[0x0A] = start;
+        crate::video::cga.crtc_regs[0x0B] = end;
+        memw_raw_write(
+            0x40,
+            BIOS_CURSOR_SHAPE_OFF,
+            ((start as u16) << 8) | end as u16,
+        );
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn bios_set_cursor_shape(start: u8, end: u8) {
+    bios_store_cursor_shape(start, end);
+}
+
+/// Setting a video mode re-programs the CRTC, so the cursor comes back at the
+/// mode's default shape — including its *visibility*. A game that hid the cursor
+/// and then switched modes gets it back, because the hardware got it back.
+#[no_mangle]
+pub extern "C" fn bios_reset_cursor_shape() {
+    bios_store_cursor_shape(
+        (BIOS_DEFAULT_CURSOR_SHAPE >> 8) as u8,
+        BIOS_DEFAULT_CURSOR_SHAPE as u8,
+    );
+}
+
 fn bios_cursor_offset(page: u8) -> u32 {
     let cols = bios_video_columns() as u32;
     let stride = bios_page_stride() as u32;
@@ -359,6 +407,9 @@ pub extern "C" fn bios_write_char_only(glyph: u8, page: u8, count: u16) {
     }
 }
 
+/// INT 10h AH=03h — read back the cursor: DX its position, CX its *shape*. The
+/// shape is whatever AH=01h last stored, not a constant: a game that hides the
+/// cursor and asks is entitled to be told it is hidden.
 #[no_mangle]
 pub extern "C" fn bios_get_cursor(page: u8) {
     let page = page % 8;
@@ -367,8 +418,8 @@ pub extern "C" fn bios_get_cursor(page: u8) {
             ((*bv()).cursor_row[page as usize] as u16) << 8
                 | (*bv()).cursor_col[page as usize] as u16,
         );
+        set_cx(memw_raw_read(0x40, BIOS_CURSOR_SHAPE_OFF));
     }
-    set_cx(0x0607);
 }
 
 #[no_mangle]
