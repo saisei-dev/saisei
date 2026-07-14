@@ -308,7 +308,7 @@ pub fn run(root: &Path) -> ! {
             }
             Action::RunFile { game, exe } => run_file(root, &ui, game, exe),
             // Nothing to resume into: the library is all there is.
-            Action::Resume | Action::Save | Action::ToLibrary | Action::None => {}
+            Action::Resume | Action::Save | Action::None => {}
         }
         // Keep the slider on the game the player is actually looking at. Only on
         // a *change* of game — re-seeding every frame would fight a drag.
@@ -406,6 +406,13 @@ fn run_file(root: &Path, ui: &Ui, game: usize, exe: usize) -> ! {
 /// The runtime calls this with the machine frozen at a resting point. Everything
 /// the player does here happens while the guest is stopped; returning resumes it
 /// exactly where it was.
+///
+/// The library is *inside* this loop, not out through the door. It used to be a
+/// `ToLibrary` action that re-execed the player — which threw the running game
+/// away for the crime of wanting to look at the list. The guest is frozen at a
+/// safepoint the whole time we are here, so a screen that only browses costs it
+/// nothing: the one thing that cannot be undone is starting another game, and
+/// that is the one thing the UI asks about first.
 unsafe extern "C" fn overlay_entry(can_save: bool) {
     let Some((root, key)) = RUNNING.get() else {
         return;
@@ -415,28 +422,35 @@ unsafe extern "C" fn overlay_entry(can_save: bool) {
         return;
     };
     // Never a save of a setup filed under the game's name. Everything else the
-    // overlay does still works here — not least Library, which is the way out of a
-    // setup you opened by mistake.
+    // menu does still works here — not least the library, which is the way out of
+    // a setup you opened by mistake.
     ui.open_overlay(idx, can_save && !one_off());
-    // Show the slider where this game actually is, not where a fresh Ui guessed.
-    ui.volume = crate::settings::volume_for(key);
 
     let mut p = Painter::new();
     let mut dirty = true;
+    // Whose volume the slider is showing. The library is reachable from here, and
+    // so is another game's page — and a slider that silently belonged to the game
+    // you had paused while you were looking at a different game's settings would
+    // be a trap. It is the same rule the library's own loop follows.
+    let mut volume_of: Option<String> = None;
     loop {
         let (act, touched) = pump(&mut ui);
         match act {
             // Back to the game, exactly where it was.
             Action::Resume => return,
             Action::SetVolume(v) => {
-                // Applied now so it is already right when the guest resumes, and
-                // written now so it survives the player being killed rather than
-                // quit. The preview is what makes the slider usable at all: the
-                // guest is frozen while the menu is up, so without it you would be
-                // setting a level you cannot hear until you close the menu.
-                saisei_runtime::audio::saisei_audio_set_volume(v);
-                saisei_runtime::audio::saisei_audio_preview();
-                crate::settings::set_volume_for(key, v);
+                if let Some(g) = ui.games.get(ui.game) {
+                    // Heard now, if it is the running game's — the guest is frozen
+                    // while the menu is up, so without the preview you would be
+                    // setting a level you cannot hear until you close the menu.
+                    // Written now either way, so it survives the player being
+                    // killed rather than quit.
+                    if ui.running == Some(ui.game) {
+                        saisei_runtime::audio::saisei_audio_set_volume(v);
+                        saisei_runtime::audio::saisei_audio_preview();
+                    }
+                    crate::settings::set_volume_for(&g.key, v);
+                }
                 dirty = true;
             }
             Action::Save => {
@@ -448,11 +462,11 @@ unsafe extern "C" fn overlay_entry(can_save: bool) {
                 ui.games = games_view(root);
                 dirty = true;
             }
-            // Leaving the game, or loading a save, or starting over: all of these
-            // need clean host state, which only a fresh process gives. The guest
-            // has run — its memory, its DOS file table and the JIT registry are
-            // all populated, and there is no honest way to unwind that in place.
-            Action::ToLibrary => crate::relaunch::exec_player(&[]),
+            // Loading a save, starting over, or starting another game: all of them
+            // end the game that is paused, and all of them need clean host state,
+            // which only a fresh process gives. The guest has run — its memory, its
+            // DOS file table and the JIT registry are all populated, and there is
+            // no honest way to unwind that in place. The UI has already asked.
             Action::Launch { game, restore } => {
                 let g = &ui.games[game];
                 // --no-logo: we came out of a menu, not off a cold start.
@@ -466,10 +480,11 @@ unsafe extern "C" fn overlay_entry(can_save: bool) {
                 crate::relaunch::exec_player(&args);
             }
             Action::Quit => std::process::exit(0),
-            // Library-only, all of them: the overlay never paints the grid those
-            // are raised from. (Adding a game, removing one, or running a setup
-            // while a game is mid-frame is not a thing to make reachable — leaving
-            // for the library first is.)
+            // The library here is browse-only, so none of these can be raised: it
+            // paints no Add button, no card menu and no drop target while a game is
+            // paused behind it (`can_edit_library`). Adding or removing a game
+            // renumbers the very list the paused game is identified by, and none of
+            // it is work that cannot wait until the game has been left.
             Action::AddPath(_)
             | Action::AddUrl(_)
             | Action::PickExe(_)
@@ -477,6 +492,16 @@ unsafe extern "C" fn overlay_entry(can_save: bool) {
             | Action::DeleteGame(_)
             | Action::RunFile { .. }
             | Action::None => {}
+        }
+        // Keep the slider on the game the player is actually looking at. Only on a
+        // *change* of game — re-seeding every frame would fight a drag.
+        let cur = ui.games.get(ui.game).map(|g| g.key.clone());
+        if cur != volume_of {
+            if let Some(k) = &cur {
+                ui.volume = crate::settings::volume_for(k);
+                dirty = true;
+            }
+            volume_of = cur;
         }
         if touched || dirty || p.resize_to_window() {
             p.paint(&mut ui, true);

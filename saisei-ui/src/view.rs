@@ -1,8 +1,12 @@
 //! Painting the interface.
 //!
-//! The game page is drawn into a rect, which is what lets the library show it
-//! full-window and the overlay show it inside a panel over the frozen game
-//! without a second implementation.
+//! Every screen is laid out in the same rect — the window, less a margin — and
+//! wears the same bar at the top: a way back, and a title saying where you are.
+//! That is what lets the library, a game's page, the settings and the pause menu
+//! be one interface rather than four, and it is what makes walking between them
+//! hold still. Nothing here resizes, moves or reflows because of *where* it was
+//! opened from; when a game is paused behind the page, the only thing that
+//! changes is what is behind it.
 
 use crate::canvas::{Canvas, Color, Rect};
 use crate::font::Weight;
@@ -16,205 +20,249 @@ fn scale(cv: &Canvas) -> f32 {
     (cv.h as f32 / 800.0).clamp(0.62, 2.4)
 }
 
+/// The height of the bar's button row. The title sits below it, and the page
+/// below that — the same distances on every screen, so the page never jumps.
+const BAR_H: f32 = 40.0;
+const TITLE_DROP: f32 = 18.0;
+const SUB_DROP: f32 = 38.0;
+const CONTENT_DROP: f32 = 30.0;
+
 pub fn paint(ui: &mut Ui, cv: &mut Canvas, over_game: bool) {
     let s = scale(cv);
     let pad = 44.0 * s;
-
-    if over_game {
-        // The frozen frame is already on screen underneath; lay a scrim over it so
-        // the menu is unmistakably in front, but you can still see where you were.
-        cv.clear(Color(0, 0, 0, 0));
-        cv.fill(Rect::new(0.0, 0.0, cv.w as f32, cv.h as f32), t::SCRIM);
-    } else {
-        cv.clear(t::BG);
-        // A slow wash of petal colour off the top-left, so the page is not a flat
-        // black field.
-        cv.gradient_v(
-            Rect::new(0.0, 0.0, cv.w as f32, cv.h as f32 * 0.55),
-            t::ACCENT_DEEP.alpha(26),
-            t::BG.alpha(0),
-        );
-    }
+    backdrop(cv, over_game);
 
     let full = Rect::new(pad, pad, cv.w as f32 - 2.0 * pad, cv.h as f32 - 2.0 * pad);
+    match ui.screen {
+        Screen::Library => paint_library(ui, cv, full, s),
+        Screen::Game => paint_game(ui, cv, full, s),
+        Screen::Settings => paint_settings(ui, cv, full, s),
+        Screen::AddGame => paint_add(ui, cv, full, s),
+    }
 
-    // The three things that open over the library. Each is modal: everything
-    // behind it stops being clickable, not just stops being drawn. The library's
-    // hit rects are pushed as it paints, so they are dropped again after — or a
-    // click meant for the sheet could fall through onto a card.
-    if ui.deleting.is_some() || ui.menu.is_some() || ui.picking.is_some() {
-        paint_library(ui, cv, full, s);
+    // The sheets, over whatever screen raised them. Each is modal: everything
+    // behind it stops being clickable, not just stops being drawn. The page's hit
+    // rects are pushed as it paints, so they are dropped again here — or a click
+    // meant for the sheet could fall through onto a card.
+    if ui.confirm.is_some() || ui.menu.is_some() || ui.picking.is_some() {
         ui.hot.clear();
         let screen = cv_rect(cv);
-        if ui.deleting.is_some() {
-            paint_confirm_delete(ui, cv, screen, s);
+        if ui.confirm.is_some() {
+            paint_confirm(ui, cv, screen, s);
         } else if ui.menu.is_some() {
             paint_card_menu(ui, cv, screen, s);
         } else {
             paint_pick_program(ui, cv, screen, s);
         }
-        return;
-    }
-
-    match ui.screen {
-        Screen::Library => paint_library(ui, cv, full, s),
-        // The game page and settings are two pages of one surface. In the overlay
-        // they share a single panel, drawn once, here — stepping into Settings
-        // must not resize the thing you are looking at underneath your cursor.
-        Screen::Game | Screen::Settings => {
-            let inner = if over_game {
-                overlay_panel(cv, full, s)
-            } else {
-                full
-            };
-            if ui.screen == Screen::Game {
-                paint_game(ui, cv, inner, s);
-            } else {
-                paint_settings(ui, cv, inner, s);
-            }
-        }
-        Screen::AddGame => paint_add(ui, cv, full, s),
     }
 }
 
-/// The overlay's panel, and the rect its contents get.
+/// What is behind the page — and the *only* thing that differs between a screen
+/// with a game paused behind it and the same screen without.
 ///
-/// The scrim over the frozen game is deliberately light, so the panel has to
-/// carry the separation itself: a soft shadow and an opaque face, rather than
-/// washing out the whole window.
-fn overlay_panel(cv: &mut Canvas, full: Rect, s: f32) -> Rect {
-    let w = (1080.0 * s).min(full.w);
-    let h = (620.0 * s).min(full.h);
-    let panel = Rect::new((cv.w as f32 - w) / 2.0, (cv.h as f32 - h) / 2.0, w, h);
-    shadow(cv, panel, t::RADIUS * 1.6, 18.0 * s);
-    cv.rounded(panel, t::RADIUS * 1.6, t::SURFACE);
-    cv.stroke(panel, t::RADIUS * 1.6, 1.0, t::BORDER);
-    panel.inset(32.0 * s)
+/// The page is full-bleed either way, so the scrim has to carry all the contrast
+/// that a floating panel used to carry with an opaque face: heavy enough to read
+/// against, thin enough that the frame you paused is still visibly there.
+fn backdrop(cv: &mut Canvas, over_game: bool) {
+    let all = cv_rect(cv);
+    if over_game {
+        cv.clear(Color(0, 0, 0, 0));
+        cv.fill(all, t::SCRIM);
+    } else {
+        cv.clear(t::BG);
+    }
+    // The same slow wash of petal colour off the top in both, so the two
+    // backdrops read as one interface with different things behind it.
+    cv.gradient_v(
+        Rect::new(0.0, 0.0, all.w, all.h * 0.55),
+        t::ACCENT_DEEP.alpha(26),
+        t::BG.alpha(0),
+    );
 }
 
 fn cv_rect(cv: &Canvas) -> Rect {
     Rect::new(0.0, 0.0, cv.w as f32, cv.h as f32)
 }
 
-// ---- removing a game --------------------------------------------------------
+// ---- the bar every screen wears ---------------------------------------------
 
-/// The question asked before a game is removed.
+/// The way back, the title, and the room they take. Returns the rect the screen's
+/// own content gets, below it.
 ///
-/// It names what will go — the bundle *and* the saves — because both do, and
-/// because a library is the only record you have of either. Cancel holds the
-/// focus: the answer that destroys something should never be the one a stray
-/// Enter gives you.
-fn paint_confirm_delete(ui: &mut Ui, cv: &mut Canvas, screen: Rect, s: f32) {
-    let Some(i) = ui.deleting else { return };
-    let Some(g) = ui.games.get(i) else { return };
-    let title = g.title.clone();
-    let saves = g.saves.len();
+/// The back button is drawn, not implied. Escape does the same thing, but a key
+/// you have to be told about is not an interface — and the line of grey hints
+/// this replaces ("Arrows move  Enter choose  Esc back") was exactly that: the
+/// exits, printed at the foot of the page, for anyone still reading.
+fn nav(
+    ui: &mut Ui,
+    cv: &mut Canvas,
+    r: Rect,
+    s: f32,
+    title: &str,
+    sub: Option<(&str, bool)>,
+) -> Rect {
+    if ui.has_back() {
+        // "‹" rather than a drawn chevron: it is one glyph in the font we already
+        // ship, and `back_arrow_has_a_glyph` keeps it honest.
+        let label = "‹   Back";
+        let bh = BAR_H * s;
+        let bw = ui.fonts.width(label, Weight::Bold, 15.0 * s) + 32.0 * s;
+        let btn = Rect::new(r.x, r.y, bw, bh);
+        cv.rounded(btn, bh / 2.0, t::SURFACE_HI);
+        cv.stroke(btn, bh / 2.0, 1.0, t::BORDER);
+        ui.fonts.draw_centered(
+            cv,
+            label,
+            btn.x,
+            btn.w,
+            btn.y + (bh - 20.0 * s) / 2.0,
+            Weight::Bold,
+            15.0 * s,
+            t::TEXT,
+        );
+        ui.push_hot(btn, Hit::Back);
+    }
+
+    let ty = r.y + (BAR_H + TITLE_DROP) * s;
+    let title = ui.fonts.elide(title, Weight::Bold, 30.0 * s, r.w * 0.7);
+    ui.fonts
+        .draw_top(cv, &title, r.x, ty, Weight::Bold, 30.0 * s, t::TEXT);
+    if let Some((text, accent)) = sub {
+        let text = ui.fonts.elide(text, Weight::Regular, 14.5 * s, r.w * 0.8);
+        ui.fonts.draw_top(
+            cv,
+            &text,
+            r.x,
+            ty + SUB_DROP * s,
+            Weight::Regular,
+            14.5 * s,
+            if accent { t::ACCENT } else { t::TEXT_DIM },
+        );
+    }
+
+    // The content starts at the same y whether or not there was a subtitle: a
+    // page that shifted up when its subtitle went away would be a page that moves
+    // for no reason the player can see.
+    let top = ty + (SUB_DROP + CONTENT_DROP) * s;
+    Rect::new(r.x, top, r.w, (r.y + r.h - top).max(0.0))
+}
+
+// ---- the question asked before anything cannot be undone ---------------------
+
+fn paint_confirm(ui: &mut Ui, cv: &mut Canvas, screen: Rect, s: f32) {
+    let Some(c) = ui.confirm.clone() else { return };
 
     cv.fill(screen, t::SCRIM);
 
-    let w = (520.0 * s).min(screen.w - 40.0 * s);
-    let h = 230.0 * s;
+    let w = (540.0 * s).min(screen.w - 40.0 * s);
+    let h = 232.0 * s;
     let d = Rect::new((screen.w - w) / 2.0, (screen.h - h) / 2.0, w, h);
     shadow(cv, d, t::RADIUS * 1.6, 20.0 * s);
     cv.rounded(d, t::RADIUS * 1.6, t::SURFACE);
     cv.stroke(d, t::RADIUS * 1.6, 1.0, t::BORDER);
 
     let x = d.x + 28.0 * s;
+    let inner = d.w - 56.0 * s;
+    let title = ui.fonts.elide(&c.title, Weight::Bold, 22.0 * s, inner);
     ui.fonts.draw_top(
         cv,
-        &format!("Remove {title}?"),
+        &title,
         x,
-        d.y + 26.0 * s,
+        d.y + 28.0 * s,
         Weight::Bold,
         22.0 * s,
         t::TEXT,
     );
-    let detail = match saves {
-        0 => "The game and its files will be deleted.".to_string(),
-        1 => "The game, its files and 1 save will be deleted.".to_string(),
-        n => format!("The game, its files and {n} saves will be deleted."),
-    };
+    let detail = ui.fonts.elide(&c.detail, Weight::Regular, 14.5 * s, inner);
     ui.fonts.draw_top(
         cv,
         &detail,
         x,
-        d.y + 62.0 * s,
+        d.y + 66.0 * s,
         Weight::Regular,
         14.5 * s,
         t::TEXT_DIM,
     );
-    ui.fonts.draw_top(
-        cv,
-        "This cannot be undone.",
-        x,
-        d.y + 84.0 * s,
-        Weight::Regular,
-        14.5 * s,
-        t::TEXT_OFF,
-    );
+    if let Some(note) = &c.note {
+        let note = ui.fonts.elide(note, Weight::Regular, 14.5 * s, inner);
+        ui.fonts.draw_top(
+            cv,
+            &note,
+            x,
+            d.y + 90.0 * s,
+            Weight::Regular,
+            14.5 * s,
+            t::TEXT_OFF,
+        );
+    }
 
-    // Buttons, bottom-right: Cancel then Remove, so the safe one is nearer.
-    let bh = 42.0 * s;
-    let by = d.y + d.h - bh - 24.0 * s;
-    let rm_w = ui.fonts.width("Remove", Weight::Bold, 15.0 * s) + 40.0 * s;
-    let ca_w = ui.fonts.width("Cancel", Weight::Bold, 15.0 * s) + 40.0 * s;
-    let rm = Rect::new(d.x + d.w - 28.0 * s - rm_w, by, rm_w, bh);
-    let ca = Rect::new(rm.x - 10.0 * s - ca_w, by, ca_w, bh);
+    // Buttons, bottom-right: Cancel then the answer, so the safe one is nearer.
+    let bh = 44.0 * s;
+    let by = d.y + d.h - bh - 26.0 * s;
+    let yes_w = ui.fonts.width(&c.yes, Weight::Bold, 15.0 * s) + 44.0 * s;
+    let no_w = ui.fonts.width("Cancel", Weight::Bold, 15.0 * s) + 44.0 * s;
+    let yes = Rect::new(d.x + d.w - 28.0 * s - yes_w, by, yes_w, bh);
+    let no = Rect::new(yes.x - 10.0 * s - no_w, by, no_w, bh);
 
-    let yes = ui.delete_yes;
-    // The destructive button carries the warning colour only when it is the one
-    // that is actually armed.
-    cv.rounded(rm, 8.0, if yes { t::DANGER } else { t::SURFACE_HI });
-    cv.stroke(rm, 8.0, 1.0, if yes { t::DANGER } else { t::BORDER });
-    ui.fonts.draw_centered(
+    // Whichever button holds the focus is the filled one — and the destructive
+    // answer wears the warning colour only when it is the one that is armed.
+    let on = c.yes_focused;
+    let hot = if c.danger { t::DANGER } else { t::ACCENT };
+    let ink = if c.danger {
+        Color::rgb(0xFF, 0xF2, 0xF5)
+    } else {
+        Color::rgb(0x1A, 0x0C, 0x14)
+    };
+    button(ui, cv, yes, s, &c.yes, on, hot, ink);
+    ui.push_hot(yes, Hit::ConfirmYes);
+    button(
+        ui,
         cv,
-        "Remove",
-        rm.x,
-        rm.w,
-        rm.y + 11.0 * s,
-        Weight::Bold,
-        15.0 * s,
-        if yes {
-            Color::rgb(0xFF, 0xF2, 0xF5)
-        } else {
-            t::TEXT
-        },
-    );
-    ui.push_hot(rm, Hit::ConfirmYes);
-
-    cv.rounded(ca, 8.0, if yes { t::SURFACE_HI } else { t::ACCENT });
-    cv.stroke(ca, 8.0, 1.0, if yes { t::BORDER } else { t::ACCENT });
-    ui.fonts.draw_centered(
-        cv,
+        no,
+        s,
         "Cancel",
-        ca.x,
-        ca.w,
-        ca.y + 11.0 * s,
+        !on,
+        t::ACCENT,
+        Color::rgb(0x1A, 0x0C, 0x14),
+    );
+    ui.push_hot(no, Hit::ConfirmNo);
+}
+
+/// A pill with a label: filled and inked when it holds the focus, quiet when it
+/// does not.
+#[allow(clippy::too_many_arguments)]
+fn button(
+    ui: &mut Ui,
+    cv: &mut Canvas,
+    r: Rect,
+    s: f32,
+    label: &str,
+    on: bool,
+    fill: Color,
+    ink: Color,
+) {
+    cv.rounded(r, 8.0, if on { fill } else { t::SURFACE_HI });
+    cv.stroke(r, 8.0, 1.0, if on { fill } else { t::BORDER });
+    ui.fonts.draw_centered(
+        cv,
+        label,
+        r.x,
+        r.w,
+        r.y + (r.h - 20.0 * s) / 2.0,
         Weight::Bold,
         15.0 * s,
-        if yes {
-            t::TEXT
-        } else {
-            Color::rgb(0x1A, 0x0C, 0x14)
-        },
-    );
-    ui.push_hot(ca, Hit::ConfirmNo);
-
-    ui.fonts.draw_top(
-        cv,
-        "Arrows choose    Enter confirm    Esc cancel",
-        x,
-        d.y + 116.0 * s,
-        Weight::Regular,
-        13.0 * s,
-        t::TEXT_OFF,
+        if on { ink } else { t::TEXT },
     );
 }
 
 // ---- the card menu, and the programs on a game's disk -----------------------
 
-/// A centred sheet: a title, a list of rows, a hint. The "…" menu and the list of
-/// programs are both this, and there is no reason for them to be two layouts.
+/// A centred sheet: a title, a list of rows, and its own way out. The "…" menu
+/// and the list of programs are both this, and there is no reason for them to be
+/// two layouts.
+///
+/// The way out is a *button*. A sheet covers the page's back button, so it has to
+/// bring one of its own — otherwise the only exit is a key nobody mentioned.
 /// Returns the row rects, in order, for the caller to hang its hits on.
 #[allow(clippy::too_many_arguments)]
 fn sheet(
@@ -226,7 +274,7 @@ fn sheet(
     subtitle: Option<&str>,
     rows: &[String],
     sel: usize,
-    hint: &str,
+    cancel: &str,
 ) -> Vec<Rect> {
     cv.fill(screen, t::SCRIM);
 
@@ -236,8 +284,9 @@ fn sheet(
     } else {
         70.0 * s
     };
+    let foot = 72.0 * s; // the way out
     let w = (480.0 * s).min(screen.w - 40.0 * s);
-    let h = top + rows.len() as f32 * rh + 54.0 * s;
+    let h = top + rows.len() as f32 * rh + foot;
     let d = Rect::new((screen.w - w) / 2.0, (screen.h - h) / 2.0, w, h);
     shadow(cv, d, t::RADIUS * 1.6, 20.0 * s);
     cv.rounded(d, t::RADIUS * 1.6, t::SURFACE);
@@ -297,15 +346,11 @@ fn sheet(
         out.push(r);
     }
 
-    ui.fonts.draw_top(
-        cv,
-        hint,
-        x,
-        d.y + d.h - 32.0 * s,
-        Weight::Regular,
-        13.0 * s,
-        t::TEXT_OFF,
-    );
+    let bh = 40.0 * s;
+    let bw = ui.fonts.width(cancel, Weight::Bold, 15.0 * s) + 40.0 * s;
+    let btn = Rect::new(d.x + d.w - 24.0 * s - bw, d.y + d.h - bh - 18.0 * s, bw, bh);
+    button(ui, cv, btn, s, cancel, false, t::ACCENT, t::TEXT);
+    ui.push_hot(btn, Hit::SheetCancel);
     out
 }
 
@@ -317,17 +362,7 @@ fn paint_card_menu(ui: &mut Ui, cv: &mut Canvas, screen: Rect, s: f32) {
     let rows: Vec<String> = ui.menu_items(i).into_iter().map(str::to_string).collect();
     let sel = ui.menu_idx.min(rows.len().saturating_sub(1));
 
-    let hits = sheet(
-        ui,
-        cv,
-        screen,
-        s,
-        &title,
-        None,
-        &rows,
-        sel,
-        "Enter choose    Esc close",
-    );
+    let hits = sheet(ui, cv, screen, s, &title, None, &rows, sel, "Close");
     for (i, r) in hits.into_iter().enumerate() {
         ui.push_hot(r, Hit::MenuItem(i));
     }
@@ -346,6 +381,8 @@ fn paint_pick_program(ui: &mut Ui, cv: &mut Canvas, screen: Rect, s: f32) {
     let rows = g.programs.clone();
     let sel = ui.pick_idx.min(rows.len().saturating_sub(1));
 
+    // "Back", not "Close": this opened from the card menu, and that is where
+    // leaving it lands.
     let hits = sheet(
         ui,
         cv,
@@ -355,16 +392,16 @@ fn paint_pick_program(ui: &mut Ui, cv: &mut Canvas, screen: Rect, s: f32) {
         Some(&sub),
         &rows,
         sel,
-        "Enter run    Esc back",
+        "Back",
     );
     for (i, r) in hits.into_iter().enumerate() {
         ui.push_hot(r, Hit::Program(i));
     }
 }
 
-/// Three dots — the button that means "and the rest". Drawn, like the trash, from
-/// rectangles: there is no icon font here, and two glyphs are not worth becoming a
-/// reason to add one.
+/// Three dots — the button that means "and the rest". Drawn from rectangles:
+/// there is no icon font here, and one glyph is not worth becoming a reason to
+/// add one.
 fn dots_icon(cv: &mut Canvas, r: Rect, c: Color) {
     let d = (r.w * 0.16).max(1.5);
     let y = r.y + r.h / 2.0 - d / 2.0;
@@ -377,8 +414,7 @@ fn dots_icon(cv: &mut Canvas, r: Rect, c: Color) {
 /// A soft drop shadow under `r`: concentric rounded rects, fading outward.
 ///
 /// Cheap, and enough — at these sizes nobody can tell it from a real blur, and it
-/// is what lifts the menu off the game now that the game behind it is bright
-/// enough to see.
+/// is what lifts a sheet off the page behind it.
 fn shadow(cv: &mut Canvas, r: Rect, radius: f32, spread: f32) {
     let steps = 8;
     for i in (1..=steps).rev() {
@@ -395,78 +431,75 @@ fn shadow(cv: &mut Canvas, r: Rect, radius: f32, spread: f32) {
 // ---- library ----------------------------------------------------------------
 
 fn paint_library(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
-    ui.fonts
-        .draw_top(cv, "Saisei", r.x, r.y, Weight::Bold, 30.0 * s, t::TEXT);
-    let sub = if ui.games.is_empty() {
-        "No games yet".to_string()
-    } else if ui.games.len() == 1 {
-        "1 game".to_string()
-    } else {
-        format!("{} games", ui.games.len())
+    let n = ui.games.len();
+    let count = match n {
+        0 => "No games yet".to_string(),
+        1 => "1 game".to_string(),
+        n => format!("{n} games"),
     };
-    ui.fonts.draw_top(
-        cv,
-        &sub,
-        r.x,
-        r.y + 38.0 * s,
-        Weight::Regular,
-        15.0 * s,
-        t::TEXT_DIM,
-    );
+    // With a game paused behind it, say so — this is the list you switch games
+    // from, and the one you came from is still sitting there.
+    let sub = match ui.running {
+        Some(i) => format!("{count}  ·  {} is paused", ui.games[i].title),
+        None => count,
+    };
+    let inner = nav(ui, cv, r, s, "Saisei", Some((&sub, ui.in_game())));
 
-    // Add game: a real button, in the header, always on screen.
+    // Add game: a real button, in the bar, always on screen.
     //
     // It used to be the last tile of the grid, which meant that the more games you
     // had the further it slid down — and past a screenful it was off the bottom
     // entirely, so the one way to add a game was the one thing you couldn't see.
     // Up here it is never scrolled away and never competes with the games.
-    let add_sel = ui.game == ui.games.len();
-    let label = "+  Add game";
-    let bw = ui.fonts.width(label, Weight::Bold, 15.0 * s) + 34.0 * s;
-    let btn = Rect::new(r.x + r.w - bw, r.y + 2.0 * s, bw, 42.0 * s);
-    cv.rounded(
-        btn,
-        21.0 * s,
-        if add_sel { t::ACCENT } else { t::SURFACE_HI },
-    );
-    cv.stroke(
-        btn,
-        21.0 * s,
-        1.0,
-        if add_sel { t::ACCENT } else { t::BORDER },
-    );
-    ui.fonts.draw_centered(
-        cv,
-        label,
-        btn.x,
-        btn.w,
-        btn.y + 11.0 * s,
-        Weight::Bold,
-        15.0 * s,
-        if add_sel {
-            Color::rgb(0x1A, 0x0C, 0x14)
-        } else {
-            t::TEXT
-        },
-    );
-    ui.push_hot(btn, Hit::Add);
+    if ui.can_edit_library() {
+        let add_sel = ui.game == n;
+        let label = "+  Add game";
+        let bh = BAR_H * s;
+        let bw = ui.fonts.width(label, Weight::Bold, 15.0 * s) + 34.0 * s;
+        let btn = Rect::new(r.x + r.w - bw, r.y, bw, bh);
+        cv.rounded(
+            btn,
+            bh / 2.0,
+            if add_sel { t::ACCENT } else { t::SURFACE_HI },
+        );
+        cv.stroke(
+            btn,
+            bh / 2.0,
+            1.0,
+            if add_sel { t::ACCENT } else { t::BORDER },
+        );
+        ui.fonts.draw_centered(
+            cv,
+            label,
+            btn.x,
+            btn.w,
+            btn.y + (bh - 20.0 * s) / 2.0,
+            Weight::Bold,
+            15.0 * s,
+            if add_sel {
+                Color::rgb(0x1A, 0x0C, 0x14)
+            } else {
+                t::TEXT
+            },
+        );
+        ui.push_hot(btn, Hit::Add);
+    }
 
-    let top = r.y + 84.0 * s;
+    let top = inner.y;
     let gap = 22.0 * s;
     let card_w = 250.0 * s;
     let cover_h = card_w * 0.625; // 16:10
     let card_h = cover_h + 52.0 * s;
 
-    let cols = (((r.w + gap) / (card_w + gap)).floor() as usize).max(1);
+    let cols = (((inner.w + gap) / (card_w + gap)).floor() as usize).max(1);
     ui.cols = cols;
 
-    let n = ui.games.len();
     if n == 0 {
         ui.fonts.draw_top(
             cv,
             "Nothing here yet.",
-            r.x,
-            top + 20.0 * s,
+            inner.x,
+            top + 10.0 * s,
             Weight::Bold,
             20.0 * s,
             t::TEXT_DIM,
@@ -474,20 +507,18 @@ fn paint_library(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
         ui.fonts.draw_top(
             cv,
             "Drop a game's zip on this window, or choose Add game.",
-            r.x,
-            top + 52.0 * s,
+            inner.x,
+            top + 42.0 * s,
             Weight::Regular,
             15.0 * s,
             t::TEXT_OFF,
         );
-        hint(ui, cv, r, s, "Enter add a game    Esc quit");
         return;
     }
     let rows = n.div_ceil(cols);
 
     // Scroll by whole rows, keeping the cursor on screen.
-    let avail = (r.y + r.h - 30.0 * s) - top; // 30: the hint line at the foot
-    let per_screen = (((avail + gap) / (card_h + gap)).floor() as usize).clamp(1, rows);
+    let per_screen = (((inner.h + gap) / (card_h + gap)).floor() as usize).clamp(1, rows);
     // Only follow the cursor while it is in the grid. On the Add button it is not
     // in any row, and dragging the grid to wherever the last game happens to be
     // would scroll the library for no reason the player can see.
@@ -506,7 +537,7 @@ fn paint_library(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
         if row < ui.scroll || row >= ui.scroll + per_screen {
             continue;
         }
-        let x = r.x + col as f32 * (card_w + gap);
+        let x = inner.x + col as f32 * (card_w + gap);
         let y = top + (row - ui.scroll) as f32 * (card_h + gap);
         let card = Rect::new(x, y, card_w, card_h);
         paint_card(ui, cv, card, i, ui.game == i, s, cover_h);
@@ -519,21 +550,13 @@ fn paint_library(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
         ui.fonts.draw_top(
             cv,
             &of,
-            r.x + r.w - w,
-            r.y + 54.0 * s,
+            inner.x + inner.w - w,
+            top - 22.0 * s,
             Weight::Regular,
             12.5 * s,
             t::TEXT_OFF,
         );
     }
-
-    hint(
-        ui,
-        cv,
-        r,
-        s,
-        "Arrows move    Enter open    Esc quit    \u{2022}    or drop a game's zip on this window",
-    );
 }
 
 fn paint_card(ui: &mut Ui, cv: &mut Canvas, card: Rect, i: usize, sel: bool, s: f32, cover_h: f32) {
@@ -588,11 +611,15 @@ fn paint_card(ui: &mut Ui, cv: &mut Canvas, card: Rect, i: usize, sel: bool, s: 
         16.0 * s,
         if sel { t::TEXT } else { t::TEXT.alpha(220) },
     );
+    // The game you are in says so, wherever you have wandered off to. It is the
+    // one card here that is not an offer to start something.
+    let running = ui.running == Some(i);
     let saves = ui.games[i].saves.len();
-    let sub = match saves {
-        0 => "Not played".to_string(),
-        1 => "1 save".to_string(),
-        n => format!("{n} saves"),
+    let sub = match (running, saves) {
+        (true, _) => "Paused".to_string(),
+        (_, 0) => "Not played".to_string(),
+        (_, 1) => "1 save".to_string(),
+        (_, n) => format!("{n} saves"),
     };
     ui.fonts.draw_top(
         cv,
@@ -601,7 +628,7 @@ fn paint_card(ui: &mut Ui, cv: &mut Canvas, card: Rect, i: usize, sel: bool, s: 
         cover.y + cover.h + 30.0 * s,
         Weight::Regular,
         12.5 * s,
-        t::TEXT_DIM,
+        if running { t::ACCENT } else { t::TEXT_DIM },
     );
 
     if sel {
@@ -612,20 +639,20 @@ fn paint_card(ui: &mut Ui, cv: &mut Canvas, card: Rect, i: usize, sel: bool, s: 
         // card selects it, so with a mouse this is "on hover"; with the keyboard it
         // follows the selection, which is where Delete would act anyway.
         //
-        // One button, not two. It used to be a trash can, and adding a second icon
-        // beside it would have been exactly the row of little buttons that comment
-        // was written to prevent — so removing a game moved *into* the menu, where
-        // running a file also lives. Delete still opens the same question directly.
-        let d = 30.0 * s;
-        let btn = Rect::new(card.x + card.w - d - 8.0 * s, card.y + 8.0 * s, d, d);
-        cv.rounded(btn, d / 2.0, t::BG.alpha(235));
-        cv.stroke(btn, d / 2.0, 1.0, t::BORDER);
-        dots_icon(cv, btn, t::TEXT);
-        ui.push_hot(btn, Hit::Menu(i));
+        // Not while a game is paused: everything behind it renumbers the library,
+        // and none of it is work that cannot wait until you have left the game.
+        if ui.can_edit_library() {
+            let d = 30.0 * s;
+            let btn = Rect::new(card.x + card.w - d - 8.0 * s, card.y + 8.0 * s, d, d);
+            cv.rounded(btn, d / 2.0, t::BG.alpha(235));
+            cv.stroke(btn, d / 2.0, 1.0, t::BORDER);
+            dots_icon(cv, btn, t::TEXT);
+            ui.push_hot(btn, Hit::Menu(i));
+        }
     }
 }
 
-// ---- a game's page (and the overlay) ----------------------------------------
+// ---- a game's page (and, for the game you are in, the pause menu) ------------
 
 fn paint_game(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
     let Some(g) = ui.games.get(ui.game) else {
@@ -633,33 +660,24 @@ fn paint_game(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
     };
     let title = g.title.clone();
     let saves = g.saves.len();
+    let paused = ui.running == Some(ui.game);
 
-    let col_w = (300.0 * s).min(r.w * 0.42);
-    ui.fonts
-        .draw_top(cv, &title, r.x, r.y, Weight::Bold, 34.0 * s, t::TEXT);
-    let sub = if ui.in_game {
+    let sub = if paused {
         "Paused".to_string()
     } else if saves == 0 {
         "Not played yet".to_string()
     } else {
         format!("{saves} save{}", if saves == 1 { "" } else { "s" })
     };
-    ui.fonts.draw_top(
-        cv,
-        &sub,
-        r.x,
-        r.y + 42.0 * s,
-        Weight::Regular,
-        14.5 * s,
-        if ui.in_game { t::ACCENT } else { t::TEXT_DIM },
-    );
+    let inner = nav(ui, cv, r, s, &title, Some((&sub, paused)));
 
     // Actions.
-    let mut y = r.y + 86.0 * s;
+    let col_w = (300.0 * s).min(inner.w * 0.42);
+    let mut y = inner.y;
     let bh = 46.0 * s;
     let labels = ui.actions();
     for (i, label) in labels.iter().enumerate() {
-        let row = Rect::new(r.x, y, col_w, bh);
+        let row = Rect::new(inner.x, y, col_w, bh);
         let enabled = ui.action_enabled(i);
         let sel = ui.focus == Focus::Actions && ui.action == i;
         let (bg, fg) = match (enabled, sel) {
@@ -688,7 +706,7 @@ fn paint_game(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
         ui.fonts.draw_top(
             cv,
             &msg,
-            r.x,
+            inner.x,
             y + 6.0 * s,
             Weight::Regular,
             14.0 * s,
@@ -697,24 +715,18 @@ fn paint_game(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
     }
 
     // Saves.
-    let px = r.x + col_w + 34.0 * s;
-    let pw = r.x + r.w - px;
+    let px = inner.x + col_w + 34.0 * s;
+    let pw = inner.x + inner.w - px;
     if pw > 120.0 * s {
-        paint_saves(ui, cv, Rect::new(px, r.y + 4.0, pw, r.h - 4.0), s);
+        paint_saves(ui, cv, Rect::new(px, inner.y, pw, inner.h), s);
     }
-
-    let h = if ui.in_game {
-        "Arrows move    Enter choose    F12 or Esc resume"
-    } else {
-        "Arrows move    Enter choose    Esc back"
-    };
-    hint(ui, cv, r, s, h);
 }
 
 fn paint_saves(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
     ui.fonts
         .draw_top(cv, "Saves", r.x, r.y, Weight::Bold, 15.0 * s, t::TEXT_DIM);
 
+    let paused = ui.running == Some(ui.game);
     let saves = ui.games[ui.game].saves.len();
     if saves == 0 {
         ui.fonts.draw_top(
@@ -728,7 +740,7 @@ fn paint_saves(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
         );
         ui.fonts.draw_top(
             cv,
-            if ui.in_game {
+            if paused {
                 "Choose Save to keep this moment."
             } else {
                 "Start a new game, then press F12 to save."
@@ -825,66 +837,50 @@ fn paint_saves(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
 // ---- settings ---------------------------------------------------------------
 
 fn paint_settings(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
-    let title = ui
+    // Volume is per game, so say whose. A slider that silently meant something
+    // different depending on where you opened it from would be a trap.
+    let game = ui
         .games
         .get(ui.game)
         .map(|g| g.title.clone())
         .unwrap_or_default();
-    ui.fonts
-        .draw_top(cv, "Settings", r.x, r.y, Weight::Bold, 30.0 * s, t::TEXT);
-    // Volume is per game, so say whose. A slider that silently meant something
-    // different depending on where you opened it from would be a trap.
-    ui.fonts.draw_top(
-        cv,
-        &title,
-        r.x,
-        r.y + 42.0 * s,
-        Weight::Regular,
-        14.5 * s,
-        t::ACCENT,
-    );
+    let inner = nav(ui, cv, r, s, "Settings", Some((&game, true)));
 
-    let col_w = (380.0 * s).min(r.w);
-    paint_volume(ui, cv, Rect::new(r.x, r.y + 90.0 * s, col_w, 44.0 * s), s);
+    let col_w = (380.0 * s).min(inner.w);
+    paint_volume(ui, cv, Rect::new(inner.x, inner.y, col_w, 44.0 * s), s);
 
     ui.fonts.draw_top(
         cv,
         "Remembered for this game.",
-        r.x,
-        r.y + 152.0 * s,
+        inner.x,
+        inner.y + 62.0 * s,
         Weight::Regular,
         13.0 * s,
         t::TEXT_OFF,
     );
-
-    hint(ui, cv, r, s, "Left/Right or wheel adjusts    Esc back");
 }
 
 // ---- add a game -------------------------------------------------------------
 
 fn paint_add(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
-    ui.fonts
-        .draw_top(cv, "Add a game", r.x, r.y, Weight::Bold, 30.0 * s, t::TEXT);
-
     // Once a bundle is unpacked, the only question left is which file is the game.
-    if !ui.add.exes.is_empty() {
-        ui.fonts.draw_top(
-            cv,
-            "Which one starts the game?",
-            r.x,
-            r.y + 46.0 * s,
-            Weight::Regular,
-            15.0 * s,
-            t::TEXT_DIM,
-        );
+    let picking = !ui.add.exes.is_empty();
+    let sub = if picking {
+        "Which one starts the game?"
+    } else {
+        "Drop a game's zip or folder anywhere on this window."
+    };
+    let inner = nav(ui, cv, r, s, "Add a game", Some((sub, false)));
+
+    if picking {
         let row_h = 40.0 * s;
-        let w = (460.0 * s).min(r.w);
+        let w = (460.0 * s).min(inner.w);
         for i in 0..ui.add.exes.len() {
-            let y = r.y + 86.0 * s + i as f32 * (row_h + 6.0 * s);
-            if y + row_h > r.y + r.h - 40.0 * s {
+            let y = inner.y + i as f32 * (row_h + 6.0 * s);
+            if y + row_h > inner.y + inner.h {
                 break;
             }
-            let row = Rect::new(r.x, y, w, row_h);
+            let row = Rect::new(inner.x, y, w, row_h);
             let sel = ui.add.exe_idx == i;
             cv.rounded(row, 8.0, if sel { t::ACCENT } else { t::SURFACE_HI });
             let name = ui.add.exes[i].clone();
@@ -903,22 +899,11 @@ fn paint_add(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
             );
             ui.push_hot(row, Hit::Exe(i));
         }
-        hint(ui, cv, r, s, "Arrows move    Enter choose    Esc cancel");
         return;
     }
 
-    ui.fonts.draw_top(
-        cv,
-        "Drop a game's zip or folder anywhere on this window.",
-        r.x,
-        r.y + 46.0 * s,
-        Weight::Regular,
-        15.0 * s,
-        t::TEXT_DIM,
-    );
-
-    // The drop target: a dashed-looking well that says what it wants.
-    let well = Rect::new(r.x, r.y + 90.0 * s, (620.0 * s).min(r.w), 150.0 * s);
+    // The drop target: a well that says what it wants.
+    let well = Rect::new(inner.x, inner.y, (620.0 * s).min(inner.w), 150.0 * s);
     cv.rounded(well, t::RADIUS, t::SURFACE.alpha(150));
     cv.stroke(well, t::RADIUS, 1.0, t::BORDER);
     ui.fonts.draw_centered(
@@ -937,7 +922,7 @@ fn paint_add(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
     ui.fonts.draw_top(
         cv,
         "or paste a link to one",
-        r.x,
+        inner.x,
         fy,
         Weight::Regular,
         14.0 * s,
@@ -947,7 +932,7 @@ fn paint_add(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
     // are most likely to have on the clipboard rather than in your head, and a
     // chord you have to know about is not an interface.
     let paste_w = ui.fonts.width("Paste", Weight::Bold, 14.5 * s) + 30.0 * s;
-    let field = Rect::new(r.x, fy + 26.0 * s, well.w - paste_w - 8.0 * s, 44.0 * s);
+    let field = Rect::new(inner.x, fy + 26.0 * s, well.w - paste_w - 8.0 * s, 44.0 * s);
     let paste = Rect::new(field.x + field.w + 8.0 * s, field.y, paste_w, field.h);
     cv.rounded(paste, 8.0, t::SURFACE_HI);
     cv.stroke(paste, 8.0, 1.0, t::BORDER);
@@ -995,15 +980,13 @@ fn paint_add(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
         ui.fonts.draw_top(
             cv,
             &st,
-            r.x,
+            inner.x,
             field.y + field.h + 18.0 * s,
             Weight::Regular,
             14.5 * s,
             if ui.add.busy { t::TEXT_DIM } else { t::ACCENT },
         );
     }
-
-    hint(ui, cv, r, s, "Ctrl+V paste    Enter fetch    Esc back");
 }
 
 // ---- shared -----------------------------------------------------------------
@@ -1059,23 +1042,12 @@ fn paint_volume(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
     ui.push_hot(grab, Hit::Volume(track));
 }
 
-fn hint(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32, text: &str) {
-    ui.fonts.draw_top(
-        cv,
-        text,
-        r.x,
-        r.y + r.h - 20.0 * s,
-        Weight::Regular,
-        13.0 * s,
-        t::TEXT_OFF,
-    );
-}
-
 #[cfg(test)]
-mod volume_tests {
-    use crate::{Action, Canvas, GameView, Image, Key, Screen, Ui};
+mod tests {
+    use crate::font::Weight;
+    use crate::{Action, Canvas, Fonts, GameView, Image, Key, Screen, Ui};
 
-    /// The overlay, stepped into its Settings page — where the slider lives.
+    /// The pause menu, stepped into its Settings page — where the slider lives.
     fn ui() -> Ui {
         let logo = Image {
             w: 1,
@@ -1106,6 +1078,26 @@ mod volume_tests {
     }
 
     #[test]
+    fn the_back_arrow_has_a_glyph() {
+        // The back button is a font glyph, not a drawn icon. If the bundled face
+        // ever loses it, the way out of every screen quietly becomes a blank.
+        let mut f = Fonts::new();
+        assert!(f.width("‹", Weight::Bold, 20.0) > 0.0, "no advance");
+        let mut cv = Canvas::new(40, 40);
+        f.draw_top(
+            &mut cv,
+            "‹",
+            8.0,
+            4.0,
+            Weight::Bold,
+            24.0,
+            crate::Color::rgb(255, 255, 255),
+        );
+        let ink = cv.px.chunks_exact(4).filter(|p| p[0] > 40).count();
+        assert!(ink > 8, "the chevron rasterized to nothing ({ink} px)");
+    }
+
+    #[test]
     fn dragging_the_knob_sets_the_volume() {
         let mut ui = ui();
         let cv = painted(&mut ui);
@@ -1118,7 +1110,7 @@ mod volume_tests {
                 crate::Hit::Volume(t) => Some(*t),
                 _ => None,
             })
-            .expect("the overlay must have a volume slider");
+            .expect("the pause menu must have a volume slider");
 
         let act = ui.click(track.x + track.w, track.y + track.h / 2.0);
         assert_eq!(act, Action::SetVolume(1.0));
@@ -1161,41 +1153,10 @@ mod volume_tests {
         // Settings holds one control, so the arrows go straight to it.
         assert_eq!(ui.key(Key::Right), Action::SetVolume(0.55));
         assert_eq!(ui.key(Key::Left), Action::SetVolume(0.5));
-        // Esc leaves, and does not move the value on the way out.
+        // Back leaves, and does not move the value on the way out.
         ui.key(Key::Escape);
         assert_eq!(ui.screen, Screen::Game);
         assert_eq!(ui.volume, 0.5);
-    }
-
-    /// The overlay and its Settings page must be the same panel: stepping between
-    /// them cannot resize the thing under the player's cursor.
-    #[test]
-    fn settings_shares_the_overlays_panel() {
-        let mut ui = ui();
-        ui.screen = Screen::Game;
-        let mut a = Canvas::new(1280, 800);
-        ui.paint(&mut a, true);
-
-        ui.screen = Screen::Settings;
-        let mut b = Canvas::new(1280, 800);
-        ui.paint(&mut b, true);
-
-        // The panel's face is opaque SURFACE; find its extent on the centre row
-        // of each and require them to match.
-        let extent = |cv: &Canvas| {
-            let y = cv.h / 2;
-            let row: Vec<bool> = (0..cv.w)
-                .map(|x| cv.px[(y * cv.w + x) * 4 + 3] > 200)
-                .collect();
-            let l = row.iter().position(|&o| o);
-            let r = row.iter().rposition(|&o| o);
-            (l, r)
-        };
-        assert_eq!(
-            extent(&a),
-            extent(&b),
-            "Settings must not resize the overlay panel"
-        );
     }
 
     #[test]

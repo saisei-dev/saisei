@@ -27,14 +27,22 @@ pub const TEXT_DIM: Color = Color::rgb(0x9A, 0x86, 0x94);
 /// Text on something that cannot be chosen.
 pub const TEXT_OFF: Color = Color::rgb(0x5A, 0x4C, 0x56);
 
-/// The scrim the in-game overlay lays over the frozen frame.
+/// The scrim the menus lay over the frozen frame.
 ///
-/// Light. The game you paused is the thing you are coming back to, and the point
-/// of showing it at all is that you can see where you were — a scrim heavy enough
-/// to make it a texture behind the menu may as well not be there. The menu reads
-/// in front because its panel is opaque and its edge is drawn, not because the
-/// game has been drowned.
-pub const SCRIM: Color = Color(0x0B, 0x07, 0x0B, 0x73);
+/// Heavy, and deliberately so. The menus used to float in a panel over a lightly
+/// dimmed game, which let the panel's opaque face carry the contrast — but a
+/// panel is a different size and shape from the library, so every step between
+/// them resized the thing under the player's cursor. Now every screen is the same
+/// full-bleed page whether a game is behind it or not, and the *backdrop* is the
+/// only thing that changes. So this has to do the work the panel's face did: dark
+/// enough to read a page against, thin enough that the frame you paused is still
+/// visibly the thing you are going back to.
+///
+/// The number is set by the loudest thing it has to sit on, which is a CGA game:
+/// Alley Cat's magenta is (0xFF, 0x00, 0xFF), and anything that leaves more than
+/// about a tenth of it standing comes through brighter than the interface's own
+/// surfaces and turns the page into a menu printed on a fence.
+pub const SCRIM: Color = Color(0x0B, 0x07, 0x0B, 0xE8);
 
 /// Corner radius for cards and buttons.
 pub const RADIUS: f32 = 10.0;

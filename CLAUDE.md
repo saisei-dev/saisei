@@ -36,9 +36,10 @@ Build once with `cargo build --release`. That produces two binaries in
 **`saisei` — the player.** With no arguments it opens its window: the logo, then
 your library, then the game you pick, then the in-game overlay, all in the *same*
 window and the *same* process. Games are added by dropping a zip on the window or
-pasting a link. F12 pauses the running game and brings up the overlay (save /
-load / switch game / resume). `saisei --play <name>` boots straight into a game,
-which is what the CLI and the save-load re-exec both use.
+pasting a link. F12 pauses the running game and brings up its menu (save / load /
+settings / the library / back into the game — and going to the library does *not*
+end the game: it is a screen over the pause). `saisei --play <name>` boots
+straight into a game, which is what the CLI and the save-load re-exec both use.
 
 **`saisei-cli` — everything else.** The dev/automation surface:
 
@@ -133,10 +134,28 @@ relaunching — remove `build/<game>/` to reseed.
 
 **Player (`saisei-player/` = the `saisei` binary, `saisei-ui/` = its interface):**
 one window and one process for a whole session — logo, library, the game itself,
-the overlay. `saisei-ui` is a *pure* software compositor (RGBA in, actions out):
-no SDL, no runtime, no machine, so the whole interface unit-tests with no window
-on screen, and the same code paints the library and the in-game overlay. The
-runtime owns the SDL surface it paints onto (`saisei_ui_*` in `runtime/src/sdl.rs`).
+the pause menu. `saisei-ui` is a *pure* software compositor (RGBA in, actions
+out): no SDL, no runtime, no machine, so the whole interface unit-tests with no
+window on screen, and the same code paints the library standing alone and the
+same library over a paused game. The runtime owns the SDL surface it paints onto
+(`saisei_ui_*` in `runtime/src/sdl.rs`).
+
+- **One page, one size, one place.** Every screen is laid out in the same rect —
+  the window, less a margin — and wears the same bar: a **drawn** back button and
+  a title saying where you are. Between a screen with a game paused behind it and
+  the same screen without, the *only* difference is the backdrop (`t::SCRIM` over
+  the frozen frame, vs the page's own gradient). This is what killed the old
+  floating overlay panel: a panel is a different size and shape from the library,
+  so every step between them resized the thing under the player's cursor. Two
+  tests hold the line — `the_frame_never_moves_between_screens` and
+  `every_screen_but_the_root_library_draws_a_way_back`. Escape and F12 are
+  shortcuts for the back button, never the only way out: the line of grey hints
+  that used to sit at the foot of each page ("Arrows move  Enter choose  Esc
+  back") *was* the exits, printed for anyone still reading.
+- **Nothing irreversible happens without an answer** (`Ui::request_launch`,
+  `offer_delete` → one `Confirm`, which carries the `Action` it is asking about so
+  a yes cannot drift from the words on screen). Every confirmation opens with the
+  cursor on Cancel.
 
 - **Hosting.** The player installs the bundle's `GameConfig` at run time
   (`saisei_set_game_config`) and calls `shim_boot_machine` + `saisei_main`
@@ -144,22 +163,36 @@ runtime owns the SDL surface it paints onto (`saisei_ui_*` in `runtime/src/sdl.r
   *before main*, which is fine for a per-game binary (it knows its game at link
   time) and useless for a host that learns its game from argv — hence
   `shim_boot_machine`, written as a **reset**, not an increment.
-- **The overlay pauses by blocking in the safepoint**, exactly as `retire_splash`
-  already does. No new pause machinery: virtual time is instruction-driven, the
-  vclock is halted, and the pacer re-anchors instead of fast-forwarding — so a
-  menu left open costs the guest no time and no interrupt backlog. F12 is
-  swallowed in the key handler before any guest mapping; held keys are released
-  on entry.
+- **The pause menu pauses by blocking in the safepoint**, exactly as
+  `retire_splash` already does. No new pause machinery: virtual time is
+  instruction-driven, the vclock is halted, and the pacer re-anchors instead of
+  fast-forwarding — so a menu left open costs the guest no time and no interrupt
+  backlog. F12 is swallowed in the key handler before any guest mapping; held keys
+  are released on entry.
+- **The library is a screen inside that pause, not the way out of it.** It is
+  reached and left without the guest running an instruction (`overlay_entry` keeps
+  its loop; `Screen::Library` with `Ui::running` set). It used to be an
+  `Action::ToLibrary` that re-execed the player — which threw a running game away
+  for the crime of wanting to look at the list. There it is **browse-only**
+  (`Ui::can_edit_library`): no Add, no "…", no Delete, no drop, because adding or
+  removing a game renumbers the very list the paused game is identified by, and
+  none of it is work that cannot wait until the game has been left. `Ui::running`
+  is an *index*, not a flag, precisely because the page on screen need not be the
+  game you are in — Resume/Save belong to the paused game's page and nowhere else.
 - **It opens at a *savable* point, not on the spot.** A snapshot is only valid at
   a dispatcher resting point (`save_manager_can_save_now`: zero lcall/isr depth,
   `ip` a case key — restore refuses anything else). So F12 arms, the guest runs
   on to the next resting point, and *there* it stops. That is why Save is always
   live rather than mysteriously grey.
-- **Leaving a game re-execs** (`relaunch.rs`). The guest has run — memory, DOS
-  file table, JIT registry all populated — and there is no honest way to unwind
-  that in place. The runtime's own save-load path re-execs for the same reason,
-  and takes its argv from the host (`saisei_set_relaunch_argv`), since a GUI
-  launch's bare `saisei` cmdline names no game to come back into.
+- **Starting a game re-execs** (`relaunch.rs`) — and with one already paused, that
+  is the *only* thing left in the interface that ends it, whether it is called
+  loading a save, starting over, or switching games. The guest has run — memory,
+  DOS file table, JIT registry all populated — and there is no honest way to unwind
+  that in place. Hence one gate for all three: while `Ui::running` is set, no
+  `Action::Launch` leaves the UI until the player has answered for it. The
+  runtime's own save-load path re-execs for the same reason, and takes its argv
+  from the host (`saisei_set_relaunch_argv`), since a GUI launch's bare `saisei`
+  cmdline names no game to come back into.
 - **Player saves** live under XDG (`~/.local/share/saisei/saves/<game>/`), never
   overwrite, and carry a thumbnail of the *presented* frame — **not**
   `shim_render_screenshot_png`, which re-reads guest VRAM as a linear 320x200 at
@@ -178,8 +211,8 @@ runtime owns the SDL surface it paints onto (`saisei_ui_*` in `runtime/src/sdl.r
   window would stay blank forever; and the program must **come back to the
   library** when it terminates (a `libc::atexit` hook that re-execs, armed only for
   a windowed one-off and only on a *clean* DOS terminate — `machine_halted` — so a
-  crash stays a crash). The overlay does not offer **Save** during one: a snapshot
-  there would be a picture of SETUP.EXE filed under the game's name.
+  crash stays a crash). The pause menu does not offer **Save** during one: a
+  snapshot there would be a picture of SETUP.EXE filed under the game's name.
   Only `.EXE` MZ images are offered, which is DOS's own rule for what is runnable —
   it is what keeps DM's EGA/VGA/ANIM *overlays* (real MZ images, loaded by DM into
   its own memory, dead on a fresh PSP) off the list. `.COM` is off it too, and that

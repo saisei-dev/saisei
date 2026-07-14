@@ -2,9 +2,23 @@
 //!
 //! The same `Ui` serves both places a menu appears. Before a game is running it
 //! is the library, filling the window. While one is running and paused, it is the
-//! overlay, drawn over the frozen frame — the same screens, plus a Save button
-//! and a way back out. That is the whole reason this is a crate and not a pile of
-//! drawing code inside the player: there is exactly one interface, used twice.
+//! overlay — the same screens, at the same size, in the same place, over the
+//! frozen frame instead of over the page. That is the whole reason this is a
+//! crate and not a pile of drawing code inside the player: there is exactly one
+//! interface, used twice.
+//!
+//! Two rules the whole thing is built around.
+//!
+//! **Every screen carries its own way back.** A button in the corner, and a title
+//! saying where you are. Escape and F12 still work, but they are shortcuts for
+//! that button — not the only door, spelled out in a line of grey text at the
+//! foot of the page that you have to read before you can leave.
+//!
+//! **Nothing irreversible happens without an answer.** Going to the library from
+//! a paused game does not end it: the library is a screen *over* the game, the
+//! way the pause menu is, and coming back resumes exactly where you were. The
+//! only things that truly throw something away — removing a game, and starting
+//! any game over the one you have paused — ask first, with the cursor on Cancel.
 
 pub mod canvas;
 pub mod font;
@@ -40,6 +54,10 @@ pub enum Key {
 pub enum Action {
     None,
     /// Start `game`. `restore` indexes that game's saves; `None` starts it fresh.
+    ///
+    /// This is the one action that ends a game already in progress — the host can
+    /// only do it by replacing the process. So while a game is paused it is never
+    /// raised until the player has answered for it; see `request_launch`.
     Launch {
         game: usize,
         restore: Option<usize>,
@@ -48,8 +66,6 @@ pub enum Action {
     Resume,
     /// Snapshot the running game into a new save.
     Save,
-    /// Leave the running game; go back to the library.
-    ToLibrary,
     Quit,
     /// Add a game from a dropped zip / directory, or from a pasted URL.
     AddPath(String),
@@ -92,7 +108,7 @@ pub struct GameView {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Screen {
     Library,
-    /// A game's page: play it, or pick a save. Also the overlay's screen.
+    /// A game's page: play it, or pick a save. Paused, it is also the pause menu.
     Game,
     Settings,
     AddGame,
@@ -116,6 +132,28 @@ pub struct AddState {
     pub busy: bool,
 }
 
+/// A question that has to be answered before something that cannot be undone.
+///
+/// It carries the action it is asking about, so the one place that decides *what*
+/// needs an answer is also the only place that can raise it, and a `yes` cannot
+/// drift from the thing the words on screen described.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Confirm {
+    pub(crate) title: String,
+    pub(crate) detail: String,
+    pub(crate) note: Option<String>,
+    /// The affirmative button's label — "Remove", "Leave", "Start over".
+    pub(crate) yes: String,
+    /// Paint the affirmative button as a warning rather than an accent. Removal
+    /// is the only thing here that destroys a file.
+    pub(crate) danger: bool,
+    /// Raised if, and only if, the answer is yes.
+    pub(crate) act: Action,
+    /// Which button holds the focus. Starts on Cancel: the answer that throws
+    /// something away should never be the one a stray Enter gives.
+    pub(crate) yes_focused: bool,
+}
+
 /// Something the mouse can land on. Built during paint, so the layout is defined
 /// once and hit-testing cannot drift from what is on screen.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -133,6 +171,12 @@ enum Hit {
     Save(usize),
     Exe(usize),
     Paste,
+    /// The way back, in the corner of every screen that has somewhere to go back
+    /// to. The same thing Escape does.
+    Back,
+    /// A sheet's own way out — "Close", "Back". A sheet covers the back button,
+    /// so it has to carry one.
+    SheetCancel,
     ConfirmYes,
     ConfirmNo,
     /// The volume slider's track. Unlike every other hit, this one is
@@ -150,8 +194,11 @@ pub struct Ui {
     pub action: usize,
     pub save: usize,
     pub focus: Focus,
-    /// True when a game is running and paused behind us: the overlay.
-    pub in_game: bool,
+    /// The game that is running and paused behind us, if there is one. It is an
+    /// *index*, not a flag, because the library is reachable from a paused game:
+    /// the page you are looking at is not necessarily the game you are in, and
+    /// what a page offers depends entirely on which of the two it is.
+    pub running: Option<usize>,
     /// Whether a snapshot is possible at the instant we paused. The overlay opens
     /// at a savable resting point, so this is normally true; it is false only when
     /// a game never reached one and we opened anyway rather than trap the player.
@@ -159,12 +206,9 @@ pub struct Ui {
     pub add: AddState,
     /// A transient line under the actions ("Saved.", "Could not save.").
     pub message: Option<String>,
-    /// The game a delete has been offered for, and is waiting on an answer to.
-    /// Nothing is removed until this is answered yes.
-    pub deleting: Option<usize>,
-    /// Which button the confirmation has focus on. Starts on Cancel: the
-    /// dangerous answer should never be the one a stray Enter gives.
-    delete_yes: bool,
+    /// The question waiting on an answer. Nothing irreversible happens until one
+    /// is given.
+    pub confirm: Option<Confirm>,
 
     /// The game whose "…" menu is open, if one is.
     pub menu: Option<usize>,
@@ -200,12 +244,11 @@ impl Ui {
             action: 0,
             save: 0,
             focus: Focus::Actions,
-            in_game: false,
+            running: None,
             can_save: true,
             add: AddState::default(),
             message: None,
-            deleting: None,
-            delete_yes: false,
+            confirm: None,
             menu: None,
             menu_idx: 0,
             picking: None,
@@ -218,19 +261,44 @@ impl Ui {
         }
     }
 
-    /// Enter overlay mode for the game at `game`.
+    /// Open the pause menu for the game at `game`, which is running and frozen.
     pub fn open_overlay(&mut self, game: usize, can_save: bool) {
-        self.in_game = true;
+        self.running = Some(game);
         self.can_save = can_save;
-        self.screen = Screen::Game;
         self.game = game;
-        self.focus = Focus::Actions;
         self.message = None;
-        self.action = self.first_enabled_action();
+        self.open_game_page();
+    }
+
+    /// True when a game is running and paused behind whatever is on screen.
+    pub fn in_game(&self) -> bool {
+        self.running.is_some()
+    }
+
+    /// True when the page on screen is the paused game's own — the pause menu, as
+    /// against some other game's page browsed to from it.
+    fn on_running_game(&self) -> bool {
+        self.running == Some(self.game)
+    }
+
+    /// Whether the library is being browsed or edited.
+    ///
+    /// With a game paused behind it, it is a place to *switch* games from and
+    /// nothing else: no Add, no "…", no Delete. Adding or removing a game
+    /// renumbers the very list the paused game is identified by, and none of it is
+    /// work that cannot wait until you have left the game.
+    fn can_edit_library(&self) -> bool {
+        self.running.is_none()
     }
 
     /// Where the cursor goes when a game's page opens.
-    ///
+    fn open_game_page(&mut self) {
+        self.screen = Screen::Game;
+        self.save = 0;
+        self.focus = Focus::Actions;
+        self.action = self.first_enabled_action();
+    }
+
     /// Never onto a disabled action. A game with no saves opens with Continue
     /// dead, and a cursor resting there is a page whose Enter key does nothing —
     /// and, since a disabled action draws no selection, one that doesn't even look
@@ -241,13 +309,16 @@ impl Ui {
             .unwrap_or(0)
     }
 
-    /// The labels of the action column, which differ between "not started yet"
-    /// and "paused mid-game".
+    /// The labels of the action column.
+    ///
+    /// The paused game's own page is the pause menu, and offers what a pause menu
+    /// offers. Every other page — including another game's, browsed to while one
+    /// is paused — is a game you have not started.
     pub fn actions(&self) -> Vec<&'static str> {
-        if self.in_game {
+        if self.on_running_game() {
             vec!["Resume", "Save", "New game", "Settings", "Library"]
         } else {
-            vec!["Continue", "New game", "Settings", "Back"]
+            vec!["Continue", "New game", "Settings"]
         }
     }
 
@@ -269,6 +340,171 @@ impl Ui {
             .unwrap_or(&[])
     }
 
+    fn title_of(&self, game: usize) -> String {
+        self.games
+            .get(game)
+            .map(|g| g.title.clone())
+            .unwrap_or_default()
+    }
+
+    // ---- going back -------------------------------------------------------
+
+    /// Is there anywhere to go back to? The library, with no game behind it, is
+    /// where the app starts: it has no back button, because there is nothing
+    /// behind it to draw one for.
+    pub fn has_back(&self) -> bool {
+        self.screen != Screen::Library || self.in_game()
+    }
+
+    /// One step back: the button in the corner, and what Escape does.
+    ///
+    /// Nothing here destroys anything. Notably, backing out of a paused game's
+    /// page resumes it, and backing out of the library you reached *from* a paused
+    /// game returns you to that game's page — the game is still sitting there,
+    /// frozen, exactly as you left it.
+    pub fn back(&mut self) -> Action {
+        // Sheets first, innermost out: each is modal, and closing one must land on
+        // whatever opened it rather than skipping a level.
+        if self.confirm.is_some() {
+            self.confirm = None;
+            return Action::None;
+        }
+        if let Some(game) = self.picking.take() {
+            self.open_menu(game);
+            return Action::None;
+        }
+        if self.menu.is_some() {
+            self.menu = None;
+            return Action::None;
+        }
+        match self.screen {
+            // The bundle is unpacked and we are choosing which file is the game:
+            // back is back to the drop well, not out of adding altogether.
+            Screen::AddGame if !self.add.exes.is_empty() => {
+                self.add = AddState::default();
+                Action::None
+            }
+            Screen::AddGame => {
+                self.screen = Screen::Library;
+                Action::None
+            }
+            Screen::Settings => {
+                self.screen = Screen::Game;
+                Action::None
+            }
+            Screen::Game => {
+                if self.on_running_game() {
+                    // Behind this page is the game itself.
+                    Action::Resume
+                } else {
+                    self.screen = Screen::Library;
+                    Action::None
+                }
+            }
+            Screen::Library => match self.running {
+                // We came here from a paused game. It is still paused.
+                Some(r) => {
+                    self.game = r;
+                    self.open_game_page();
+                    Action::None
+                }
+                None => Action::Quit,
+            },
+        }
+    }
+
+    // ---- asking first -----------------------------------------------------
+
+    /// Every launch passes through here, and while a game is paused every launch
+    /// ends it — the host can only start a game by replacing the process, so
+    /// loading a save, starting over and switching games are all the same
+    /// irreversible thing wearing three labels. So: ask, once, in one place.
+    fn request_launch(&mut self, game: usize, restore: Option<usize>) -> Action {
+        let act = Action::Launch { game, restore };
+        let Some(running) = self.running else {
+            return act;
+        };
+        let paused = self.title_of(running);
+        let (title, detail, yes) = if game != running {
+            (
+                format!("Leave {paused}?"),
+                format!(
+                    "Starting {} will end the game you have paused.",
+                    self.title_of(game)
+                ),
+                "Leave",
+            )
+        } else if restore.is_some() {
+            (
+                "Load this save?".to_string(),
+                format!("{paused} is paused. Loading a save will end it."),
+                "Load",
+            )
+        } else {
+            (
+                "Start over?".to_string(),
+                format!("{paused} is paused. Starting a new game will end it."),
+                "Start over",
+            )
+        };
+        self.confirm = Some(Confirm {
+            title,
+            detail,
+            note: Some("Anything you have not saved is lost. Your saves are kept.".to_string()),
+            yes: yes.to_string(),
+            danger: false,
+            act,
+            yes_focused: false,
+        });
+        Action::None
+    }
+
+    /// Offer to remove the game at `game`. Answering is the only way anything is
+    /// actually deleted.
+    ///
+    /// It names what will go — the bundle *and* the saves — because both do, and a
+    /// library is the only record you have of either.
+    fn offer_delete(&mut self, game: usize) {
+        if game >= self.games.len() || !self.can_edit_library() {
+            return;
+        }
+        let saves = self.games[game].saves.len();
+        let detail = match saves {
+            0 => "The game and its files will be deleted.".to_string(),
+            1 => "The game, its files and 1 save will be deleted.".to_string(),
+            n => format!("The game, its files and {n} saves will be deleted."),
+        };
+        self.confirm = Some(Confirm {
+            title: format!("Remove {}?", self.title_of(game)),
+            detail,
+            note: Some("This cannot be undone.".to_string()),
+            yes: "Remove".to_string(),
+            danger: true,
+            act: Action::DeleteGame(game),
+            yes_focused: false,
+        });
+    }
+
+    fn key_confirm(&mut self, k: Key) -> Action {
+        match k {
+            Key::Left | Key::Right => {
+                if let Some(c) = self.confirm.as_mut() {
+                    c.yes_focused = !c.yes_focused;
+                }
+            }
+            // Either answer closes the question. Only one of them acts on it.
+            Key::Enter => {
+                if let Some(c) = self.confirm.take() {
+                    if c.yes_focused {
+                        return c.act;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
     // ---- input ------------------------------------------------------------
 
     /// What the "…" menu offers for the game at `game`.
@@ -287,17 +523,32 @@ impl Ui {
 
     pub fn key(&mut self, k: Key) -> Action {
         self.message = None;
+        // Escape is the back button, wherever you are — not a separate idea about
+        // what "cancel" means on each screen.
+        if k == Key::Escape {
+            return self.back();
+        }
+        // And F12, with a game paused, is the way back to the game from anywhere
+        // in the menus. It drops whatever sheet is open on the way — every one of
+        // them opens with the cursor on the harmless answer, so dropping one is
+        // always the safe reading of "put me back in my game".
+        if k == Key::Overlay && self.in_game() {
+            self.confirm = None;
+            self.menu = None;
+            self.picking = None;
+            return Action::Resume;
+        }
         // These are modal on purpose: while one is up, nothing behind it can be
         // reached, by key or by click. Innermost first — the program list opens
         // from the menu, and closing it must land back on the menu, not the grid.
+        if self.confirm.is_some() {
+            return self.key_confirm(k);
+        }
         if self.picking.is_some() {
             return self.key_pick(k);
         }
         if self.menu.is_some() {
             return self.key_menu(k);
-        }
-        if self.deleting.is_some() {
-            return self.key_confirm(k);
         }
         match self.screen {
             Screen::Library => self.key_library(k),
@@ -307,45 +558,16 @@ impl Ui {
             Screen::Settings => match k {
                 Key::Left => self.volume_from_key(-0.05),
                 Key::Right => self.volume_from_key(0.05),
-                Key::Escape | Key::Enter | Key::Overlay => {
-                    self.screen = Screen::Game;
-                    Action::None
-                }
+                Key::Enter => self.back(),
                 _ => Action::None,
             },
             Screen::AddGame => self.key_add(k),
         }
     }
 
-    fn key_confirm(&mut self, k: Key) -> Action {
-        match k {
-            Key::Left | Key::Right => self.delete_yes = !self.delete_yes,
-            Key::Escape => self.deleting = None,
-            Key::Enter => {
-                let game = self.deleting.take();
-                if self.delete_yes {
-                    if let Some(i) = game {
-                        return Action::DeleteGame(i);
-                    }
-                }
-            }
-            _ => {}
-        }
-        Action::None
-    }
-
-    /// Offer to remove the game at `game`. Answering is the only way anything is
-    /// actually deleted.
-    fn offer_delete(&mut self, game: usize) {
-        if game < self.games.len() {
-            self.deleting = Some(game);
-            self.delete_yes = false;
-        }
-    }
-
     /// Open the "…" menu on the game at `game`.
     pub fn open_menu(&mut self, game: usize) {
-        if game < self.games.len() {
+        if game < self.games.len() && self.can_edit_library() {
             self.game = game;
             self.menu = Some(game);
             self.menu_idx = 0;
@@ -360,7 +582,6 @@ impl Ui {
         match k {
             Key::Up => self.menu_idx = self.menu_idx.saturating_sub(1),
             Key::Down => self.menu_idx = (self.menu_idx + 1).min(n.saturating_sub(1)),
-            Key::Escape | Key::Overlay => self.menu = None,
             Key::Enter => return self.activate_menu(self.menu_idx),
             _ => {}
         }
@@ -396,12 +617,6 @@ impl Ui {
         match k {
             Key::Up => self.pick_idx = self.pick_idx.saturating_sub(1),
             Key::Down => self.pick_idx = (self.pick_idx + 1).min(n.saturating_sub(1)),
-            // Back to the menu it was opened from, not out to the grid.
-            Key::Escape => {
-                self.picking = None;
-                self.open_menu(game);
-            }
-            Key::Overlay => self.picking = None,
             Key::Enter if self.pick_idx < n => {
                 self.picking = None;
                 return Action::RunFile {
@@ -420,17 +635,22 @@ impl Ui {
         // Down comes back down — which is where it actually is on screen.
         let n = self.games.len();
         let add = n;
+        let last = if self.can_edit_library() {
+            add
+        } else {
+            n.saturating_sub(1)
+        };
         let cols = self.cols.max(1);
         match k {
             Key::Left => self.game = self.game.saturating_sub(1),
-            Key::Right => self.game = (self.game + 1).min(add),
+            Key::Right => self.game = (self.game + 1).min(last),
             Key::Up => {
-                if self.game != add {
-                    self.game = if self.game < cols {
-                        add
-                    } else {
-                        self.game - cols
-                    };
+                if self.game == add {
+                    // Already on the button; there is nothing above it.
+                } else if self.game >= cols {
+                    self.game -= cols;
+                } else if self.can_edit_library() {
+                    self.game = add;
                 }
             }
             Key::Down => {
@@ -441,26 +661,14 @@ impl Ui {
                 };
             }
             Key::Enter => {
-                if self.game >= self.games.len() {
+                if self.game >= n {
                     self.screen = Screen::AddGame;
                     self.add = AddState::default();
                 } else {
-                    self.screen = Screen::Game;
-                    self.save = 0;
-                    self.focus = Focus::Actions;
-                    self.action = self.first_enabled_action();
+                    self.open_game_page();
                 }
             }
             Key::Delete => self.offer_delete(self.game),
-            // In the library with a game paused behind us, Escape goes back to it
-            // rather than killing it.
-            Key::Escape | Key::Overlay => {
-                return if self.in_game {
-                    Action::Resume
-                } else {
-                    Action::Quit
-                }
-            }
             _ => {}
         }
         Action::None
@@ -470,13 +678,6 @@ impl Ui {
         let labels = self.actions();
         let saves = self.cur_saves().len();
         match k {
-            Key::Overlay if self.in_game => return Action::Resume,
-            Key::Escape => {
-                if self.in_game {
-                    return Action::Resume;
-                }
-                self.screen = Screen::Library;
-            }
             Key::Right if saves > 0 => self.focus = Focus::Saves,
             Key::Left => self.focus = Focus::Actions,
             Key::Up | Key::Down => {
@@ -516,10 +717,7 @@ impl Ui {
     fn activate(&mut self) -> Action {
         if self.focus == Focus::Saves {
             if self.save < self.cur_saves().len() {
-                return Action::Launch {
-                    game: self.game,
-                    restore: Some(self.save),
-                };
+                return self.request_launch(self.game, Some(self.save));
             }
             return Action::None;
         }
@@ -528,22 +726,17 @@ impl Ui {
         }
         match self.actions().get(self.action).copied() {
             // Continue picks up the newest save, which is the one at the top.
-            Some("Continue") => Action::Launch {
-                game: self.game,
-                restore: Some(0),
-            },
-            Some("New game") => Action::Launch {
-                game: self.game,
-                restore: None,
-            },
+            Some("Continue") => self.request_launch(self.game, Some(0)),
+            Some("New game") => self.request_launch(self.game, None),
             Some("Resume") => Action::Resume,
             Some("Save") => Action::Save,
             Some("Settings") => {
                 self.screen = Screen::Settings;
                 Action::None
             }
-            Some("Library") => Action::ToLibrary,
-            Some("Back") => {
+            // The library, over the paused game. It is a screen, not an exit: the
+            // game stays where it is, and coming back resumes it.
+            Some("Library") => {
                 self.screen = Screen::Library;
                 Action::None
             }
@@ -558,15 +751,11 @@ impl Ui {
                 Key::Up => self.add.exe_idx = self.add.exe_idx.saturating_sub(1),
                 Key::Down => self.add.exe_idx = (self.add.exe_idx + 1).min(self.add.exes.len() - 1),
                 Key::Enter => return Action::PickExe(self.add.exe_idx),
-                Key::Escape => {
-                    self.add = AddState::default();
-                }
                 _ => {}
             }
             return Action::None;
         }
         match k {
-            Key::Escape => self.screen = Screen::Library,
             Key::Backspace => {
                 self.add.url.pop();
             }
@@ -597,7 +786,11 @@ impl Ui {
     }
 
     /// A file dropped on the window — a bundle to add, from anywhere in the UI.
+    /// Except from inside a game: see `can_edit_library`.
     pub fn dropped(&mut self, path: &str) -> Action {
+        if !self.can_edit_library() {
+            return Action::None;
+        }
         self.screen = Screen::AddGame;
         self.add = AddState::default();
         Action::AddPath(path.to_string())
@@ -640,6 +833,9 @@ impl Ui {
                     Hit::Action(_) | Hit::Save(_) => self.activate(),
                     Hit::Exe(i) => Action::PickExe(i),
                     Hit::Paste => Action::Paste,
+                    // One idea of "back", whether it is pressed, pointed at, or
+                    // typed.
+                    Hit::Back | Hit::SheetCancel => self.back(),
                     // Clicking a slider anywhere jumps to that value and starts a
                     // drag from there — one gesture, not two.
                     Hit::Volume(track) => {
@@ -652,14 +848,8 @@ impl Ui {
                     }
                     Hit::MenuItem(i) => self.activate_menu(i),
                     Hit::Program(_) => self.key(Key::Enter),
-                    Hit::ConfirmYes => {
-                        self.delete_yes = true;
-                        self.key(Key::Enter)
-                    }
-                    Hit::ConfirmNo => {
-                        self.deleting = None;
-                        Action::None
-                    }
+                    Hit::ConfirmYes => self.key(Key::Enter),
+                    Hit::ConfirmNo => self.back(),
                 }
             }
             None => Action::None,
@@ -707,9 +897,13 @@ impl Ui {
             Hit::Menu(i) => self.game = i,
             Hit::MenuItem(i) => self.menu_idx = i,
             Hit::Program(i) => self.pick_idx = i,
-            Hit::ConfirmYes => self.delete_yes = true,
-            Hit::ConfirmNo => self.delete_yes = false,
-            Hit::Paste => {}
+            Hit::ConfirmYes | Hit::ConfirmNo => {
+                let yes = hit == Hit::ConfirmYes;
+                if let Some(c) = self.confirm.as_mut() {
+                    c.yes_focused = yes;
+                }
+            }
+            Hit::Back | Hit::SheetCancel | Hit::Paste => {}
         }
     }
 
@@ -729,8 +923,11 @@ impl Ui {
 
     /// Paint the interface into `cv`.
     ///
-    /// When `over_game` the background is left as a scrim over the frozen frame
-    /// the caller has already drawn; otherwise the page is opaque.
+    /// When `over_game` the page is laid over the frozen frame the host has
+    /// already drawn, rather than over the library's own background. That is the
+    /// *only* difference: every screen has the same size and the same place in
+    /// both, so opening the menu over a game, or walking from it back to the
+    /// library, never moves anything under the player's cursor.
     pub fn paint(&mut self, cv: &mut Canvas, over_game: bool) {
         self.hot.clear();
         view::paint(self, cv, over_game);
@@ -827,7 +1024,7 @@ mod tests {
             "Enter on a freshly-opened page must start the game"
         );
 
-        // Same in the overlay, when the machine stopped somewhere unsavable.
+        // Same in the pause menu, when the machine stopped somewhere unsavable.
         let mut u = ui(&[("Zeliard", 0)]);
         u.open_overlay(0, false);
         assert!(u.action_enabled(u.action));
@@ -837,12 +1034,12 @@ mod tests {
     #[test]
     fn the_cursor_steps_over_disabled_actions() {
         // No saves => Continue is disabled. Wrapping upward from New game must
-        // skip past it to Back, not come to rest on a dead row.
+        // skip past it to Settings, not come to rest on a dead row.
         let mut u = ui(&[("Zeliard", 0)]);
         u.key(Key::Enter);
         assert_eq!(u.actions()[u.action], "New game");
         u.key(Key::Up);
-        assert_eq!(u.actions()[u.action], "Back");
+        assert_eq!(u.actions()[u.action], "Settings");
         u.key(Key::Down);
         assert_eq!(u.actions()[u.action], "New game");
     }
@@ -879,7 +1076,7 @@ mod tests {
     }
 
     #[test]
-    fn overlay_offers_save_and_resume_and_the_way_back_to_the_library() {
+    fn the_pause_menu_offers_save_and_resume_and_the_library() {
         let mut u = ui(&[("Zeliard", 1)]);
         u.open_overlay(0, true);
         assert_eq!(
@@ -892,34 +1089,144 @@ mod tests {
 
         u.action = 1;
         assert_eq!(u.key(Key::Enter), Action::Save);
-
-        u.action = 4;
-        assert_eq!(u.key(Key::Enter), Action::ToLibrary);
     }
 
     #[test]
-    fn save_is_disabled_when_the_machine_never_reached_a_savable_point() {
-        let mut u = ui(&[("Zeliard", 0)]);
-        u.open_overlay(0, false);
-        assert!(
-            !u.action_enabled(1),
-            "Save must be off when it cannot happen"
+    fn going_to_the_library_from_a_paused_game_does_not_end_it() {
+        // The whole point: the library is a screen laid *over* the game, exactly
+        // as the pause menu is. It used to re-exec the player, which threw the
+        // running game away for the crime of wanting to look at the list.
+        let mut u = ui(&[("Zeliard", 1), ("Pop", 0)]);
+        u.open_overlay(0, true);
+        u.action = 4;
+        assert_eq!(u.actions()[u.action], "Library");
+        assert_eq!(
+            u.key(Key::Enter),
+            Action::None,
+            "nothing is asked of the host"
         );
-        u.action = 1;
-        assert_eq!(u.key(Key::Enter), Action::None);
+        assert_eq!(u.screen, Screen::Library);
+        assert_eq!(u.running, Some(0), "the game is still there, still paused");
+
+        // Back goes to the paused game's page, and back again into the game.
+        assert_eq!(u.key(Key::Escape), Action::None);
+        assert_eq!((u.screen, u.game), (Screen::Game, 0));
+        assert_eq!(u.key(Key::Escape), Action::Resume);
+
+        // ...and F12 from the library goes straight back into the game.
+        u.screen = Screen::Library;
+        assert_eq!(u.key(Key::Overlay), Action::Resume);
+    }
+
+    #[test]
+    fn another_games_page_browsed_from_a_paused_game_is_not_the_pause_menu() {
+        // `running` is an index, not a flag, precisely for this: the page you are
+        // looking at need not be the game you are in. Offering Resume/Save on
+        // Pop's page while Zeliard is the game that is actually paused would be a
+        // Resume that resumes something else.
+        let mut u = ui(&[("Zeliard", 1), ("Pop", 2)]);
+        u.open_overlay(0, true);
+        u.screen = Screen::Library;
+        u.key(Key::Right); // onto Pop
+        u.key(Key::Enter);
+        assert_eq!((u.screen, u.game), (Screen::Game, 1));
+        assert_eq!(u.actions(), ["Continue", "New game", "Settings"]);
+        // And back from it is the library, not the game.
+        assert_eq!(u.key(Key::Escape), Action::None);
+        assert_eq!(u.screen, Screen::Library);
+    }
+
+    #[test]
+    fn starting_a_game_over_a_paused_one_asks_first() {
+        for (label, restore, game) in [
+            ("another game", None, 1),
+            ("a new game", None, 0),
+            ("a save", Some(0), 0),
+        ] {
+            let mut u = ui(&[("Zeliard", 1), ("Pop", 1)]);
+            u.open_overlay(0, true);
+            u.game = game;
+
+            let asked = u.request_launch(game, restore);
+            assert_eq!(asked, Action::None, "{label}: must not launch on the spot");
+            let c = u
+                .confirm
+                .as_ref()
+                .unwrap_or_else(|| panic!("{label}: nothing was asked"));
+            assert!(!c.yes_focused, "{label}: the cursor starts on Cancel");
+
+            // Enter as it stands answers Cancel — and answers it for good.
+            assert_eq!(u.key(Key::Enter), Action::None);
+            assert_eq!(u.confirm, None);
+            assert_eq!(u.running, Some(0), "{label}: the game is still paused");
+
+            // Choosing the other button, and only that, launches.
+            u.request_launch(game, restore);
+            u.key(Key::Right);
+            assert_eq!(u.key(Key::Enter), Action::Launch { game, restore });
+            assert_eq!(u.confirm, None);
+        }
+    }
+
+    #[test]
+    fn nothing_is_asked_when_there_is_nothing_to_lose() {
+        // No game running: a launch is not destroying anything, so it must not
+        // grow a dialog in front of it.
+        let mut u = ui(&[("Zeliard", 1)]);
+        u.key(Key::Enter);
+        assert_eq!(
+            u.key(Key::Enter),
+            Action::Launch {
+                game: 0,
+                restore: Some(0)
+            }
+        );
+        assert_eq!(u.confirm, None);
     }
 
     #[test]
     fn escape_in_the_library_quits_but_never_while_a_game_is_paused_behind_it() {
         let mut u = ui(&[("Zeliard", 0)]);
         assert_eq!(u.key(Key::Escape), Action::Quit);
+        assert!(!u.has_back(), "the root library has nowhere to go back to");
 
-        // Reached the library from a paused game: Escape must go back to it, not
-        // throw the game away.
+        // Reached the library from a paused game: back must go to it, not throw
+        // the game away.
         let mut u = ui(&[("Zeliard", 0)]);
         u.open_overlay(0, true);
         u.screen = Screen::Library;
-        assert_eq!(u.key(Key::Escape), Action::Resume);
+        assert!(u.has_back());
+        assert_eq!(u.key(Key::Escape), Action::None);
+        assert_eq!(u.screen, Screen::Game);
+    }
+
+    #[test]
+    fn the_library_is_browse_only_while_a_game_is_paused() {
+        // Adding or removing a game renumbers the list the paused game is
+        // identified by, and none of it is work that cannot wait until you have
+        // left the game. So: no Add, no "…", no Delete, no drop.
+        let mut u = ui(&[("Zeliard", 0), ("Pop", 0)]);
+        u.open_overlay(0, true);
+        u.screen = Screen::Library;
+        let mut cv = Canvas::new(1280, 800);
+        u.paint(&mut cv, true);
+        assert!(!painted(&u, Hit::Add), "no Add button over a running game");
+        assert!(!painted(&u, Hit::Menu(0)), "no card menu either");
+
+        u.key(Key::Delete);
+        assert_eq!(u.confirm, None, "Delete cannot remove a game from here");
+        u.open_menu(1);
+        assert_eq!(u.menu, None);
+        assert_eq!(u.dropped("/tmp/g.zip"), Action::None);
+        assert_eq!(u.screen, Screen::Library, "and a drop did not navigate");
+
+        // The cursor cannot walk off the end of the grid onto a button that is
+        // not there.
+        u.key(Key::Right);
+        u.key(Key::Right);
+        assert_eq!(u.game, 1);
+        u.key(Key::Up);
+        assert_eq!(u.game, 1, "there is nothing above the top row");
     }
 
     #[test]
@@ -936,19 +1243,84 @@ mod tests {
         u.hot.iter().any(|(_, x)| *x == h)
     }
 
+    fn rect_of(u: &Ui, h: Hit) -> Rect {
+        u.hot
+            .iter()
+            .find(|(_, x)| *x == h)
+            .unwrap_or_else(|| panic!("{h:?} was never painted"))
+            .0
+    }
+
     #[test]
-    fn add_game_is_on_screen_however_many_games_there_are() {
-        // It used to be the last tile of the grid, so the more games you had the
-        // further down it slid — and past a screenful it was off the bottom, which
-        // made the one way to add a game the one thing you could not see. It lives
-        // in the header now, so no amount of scrolling can take it away.
-        for count in [0usize, 3, 24] {
-            let games: Vec<(&str, usize)> = (0..count).map(|_| ("Game", 0)).collect();
-            let mut u = ui(&games);
-            let mut cv = Canvas::new(1280, 800);
+    fn every_screen_but_the_root_library_draws_a_way_back() {
+        // The rule, as a test: no screen may rely on the player knowing that
+        // Escape exists.
+        let mut u = ui(&[("Zeliard", 1)]);
+        let mut cv = Canvas::new(1280, 800);
+
+        u.paint(&mut cv, false);
+        assert!(!painted(&u, Hit::Back), "the library is where you start");
+
+        for screen in [Screen::Game, Screen::Settings, Screen::AddGame] {
+            u.screen = screen;
             u.paint(&mut cv, false);
-            assert!(painted(&u, Hit::Add), "Add missing with {count} games");
+            assert!(painted(&u, Hit::Back), "{screen:?} has no back button");
         }
+
+        // Including the library, once it is a screen over a paused game.
+        u.open_overlay(0, true);
+        u.screen = Screen::Library;
+        u.paint(&mut cv, true);
+        assert!(painted(&u, Hit::Back), "the library over a game has one");
+
+        // And the sheets, which cover it, carry their own.
+        u.running = None;
+        u.screen = Screen::Library;
+        u.open_menu(0);
+        u.paint(&mut cv, false);
+        assert!(
+            painted(&u, Hit::SheetCancel),
+            "the card menu has no way out"
+        );
+        assert_eq!(u.click_at(rect_of(&u, Hit::SheetCancel)), Action::None);
+        assert_eq!(u.menu, None);
+    }
+
+    #[test]
+    fn the_frame_never_moves_between_screens() {
+        // "No dramatic resizes": every screen is laid out in the same rect, and a
+        // screen over a running game is laid out in the same rect as the same
+        // screen with no game behind it. The back button is on all of them, so
+        // where it lands is a fair proxy for where the page begins.
+        let mut u = ui(&[("Zeliard", 2), ("Pop", 0)]);
+        let mut cv = Canvas::new(1280, 800);
+
+        u.open_overlay(0, true);
+        u.paint(&mut cv, true);
+        let back = rect_of(&u, Hit::Back);
+        let card_in_game = {
+            u.screen = Screen::Library;
+            u.paint(&mut cv, true);
+            (rect_of(&u, Hit::Back), rect_of(&u, Hit::Game(0)))
+        };
+        assert_eq!(back, card_in_game.0, "the bar moved between screens");
+
+        for screen in [Screen::Settings, Screen::AddGame] {
+            u.screen = screen;
+            u.paint(&mut cv, true);
+            assert_eq!(rect_of(&u, Hit::Back), back, "{screen:?} moved the bar");
+        }
+
+        // The same library, with no game behind it: same bar, same cards, same
+        // place. Only the backdrop changes.
+        u.running = None;
+        u.screen = Screen::Library;
+        u.paint(&mut cv, false);
+        assert_eq!(
+            rect_of(&u, Hit::Game(0)),
+            card_in_game.1,
+            "the library resized itself when it stopped being an overlay"
+        );
     }
 
     #[test]
@@ -995,6 +1367,21 @@ mod tests {
     }
 
     #[test]
+    fn add_game_is_on_screen_however_many_games_there_are() {
+        // It used to be the last tile of the grid, so the more games you had the
+        // further down it slid — and past a screenful it was off the bottom, which
+        // made the one way to add a game the one thing you could not see. It lives
+        // in the header now, so no amount of scrolling can take it away.
+        for count in [0usize, 3, 24] {
+            let games: Vec<(&str, usize)> = (0..count).map(|_| ("Game", 0)).collect();
+            let mut u = ui(&games);
+            let mut cv = Canvas::new(1280, 800);
+            u.paint(&mut cv, false);
+            assert!(painted(&u, Hit::Add), "Add missing with {count} games");
+        }
+    }
+
+    #[test]
     fn up_from_the_top_row_reaches_add_game_and_down_comes_back() {
         // The button sits above the grid, so that is where the cursor should find
         // it — and Down must come back into the grid rather than trapping you.
@@ -1030,15 +1417,18 @@ mod tests {
         );
     }
 
+    impl Ui {
+        /// Click the middle of a rect the paint put on screen.
+        fn click_at(&mut self, r: Rect) -> Action {
+            self.click(r.x + r.w / 2.0, r.y + r.h / 2.0)
+        }
+    }
+
     /// Click whatever `h` was painted at. Panics if it was not painted at all,
     /// which is the point: a button nobody drew is a button nobody can press.
     fn click_hit(u: &mut Ui, h: Hit) -> Action {
-        let (r, _) = *u
-            .hot
-            .iter()
-            .find(|(_, x)| *x == h)
-            .unwrap_or_else(|| panic!("{h:?} was never painted"));
-        u.click(r.x + r.w / 2.0, r.y + r.h / 2.0)
+        let r = rect_of(u, h);
+        u.click_at(r)
     }
 
     #[test]
@@ -1054,7 +1444,7 @@ mod tests {
         // It opens a menu, and does nothing else.
         assert_eq!(click_hit(&mut u, Hit::Menu(0)), Action::None);
         assert_eq!(u.menu, Some(0));
-        assert_eq!(u.deleting, None);
+        assert_eq!(u.confirm, None);
 
         // Remove is the only thing on offer for a game with nothing else to run,
         // and taking it asks rather than deletes.
@@ -1062,25 +1452,25 @@ mod tests {
         u.paint(&mut cv, false);
         assert_eq!(click_hit(&mut u, Hit::MenuItem(0)), Action::None);
         assert_eq!(u.menu, None, "the menu closes behind the question");
-        assert_eq!(u.deleting, Some(0));
+        assert!(u.confirm.is_some());
 
         // Enter straight away must NOT delete: the focus starts on Cancel, so the
         // dangerous answer is never the one a stray keypress gives.
         assert_eq!(u.key(Key::Enter), Action::None);
-        assert_eq!(u.deleting, None, "the question is answered either way");
+        assert_eq!(u.confirm, None, "the question is answered either way");
 
         // Escape cancels too. Delete still opens the question straight from the
         // grid — the menu is another way in, not the only one.
         u.key(Key::Delete);
-        assert_eq!(u.deleting, Some(0));
+        assert!(u.confirm.is_some());
         assert_eq!(u.key(Key::Escape), Action::None);
-        assert_eq!(u.deleting, None);
+        assert_eq!(u.confirm, None);
 
         // Choosing Remove, and only that, asks the host to delete it.
         u.key(Key::Delete);
         u.key(Key::Right); // Cancel -> Remove
         assert_eq!(u.key(Key::Enter), Action::DeleteGame(0));
-        assert_eq!(u.deleting, None);
+        assert_eq!(u.confirm, None);
     }
 
     #[test]
@@ -1113,8 +1503,8 @@ mod tests {
         u.key(Key::Down);
         assert_eq!(u.key(Key::Enter), Action::RunFile { game: 0, exe: 1 });
 
-        // Escape goes back to the menu it came from, rather than dumping you out
-        // on the grid a level further than you asked to go.
+        // Back goes to the menu it came from, rather than dumping you out on the
+        // grid a level further than you asked to go.
         u.open_menu(0);
         u.key(Key::Enter);
         assert_eq!(u.key(Key::Escape), Action::None);
@@ -1129,7 +1519,7 @@ mod tests {
         assert_eq!(u.menu_items(0), ["Remove game"]);
         u.open_menu(0);
         assert_eq!(u.key(Key::Enter), Action::None);
-        assert_eq!(u.deleting, Some(0), "the only row is Remove");
+        assert!(u.confirm.is_some(), "the only row is Remove");
         assert_eq!(u.picking, None);
     }
 
@@ -1141,7 +1531,7 @@ mod tests {
         u.games[0].programs = vec!["INSTALL.EXE".into()];
         let mut cv = Canvas::new(1280, 800);
         u.paint(&mut cv, false);
-        let (card, _) = *u.hot.iter().find(|(_, h)| *h == Hit::Game(1)).unwrap();
+        let card = rect_of(&u, Hit::Game(1));
 
         for sheet in ["menu", "programs"] {
             u.menu = None;
@@ -1155,10 +1545,7 @@ mod tests {
                 !painted(&u, Hit::Game(1)),
                 "{sheet}: the library stopped taking clicks"
             );
-            assert_eq!(
-                u.click(card.x + card.w / 2.0, card.y + card.h / 2.0),
-                Action::None
-            );
+            assert_eq!(u.click_at(card), Action::None);
             assert_eq!(
                 u.screen,
                 Screen::Library,
@@ -1174,7 +1561,7 @@ mod tests {
         let mut u = ui(&[("Zeliard", 0), ("Pop", 0)]);
         let mut cv = Canvas::new(1280, 800);
         u.paint(&mut cv, false);
-        let (card, _) = *u.hot.iter().find(|(_, h)| *h == Hit::Game(1)).unwrap();
+        let card = rect_of(&u, Hit::Game(1));
 
         u.key(Key::Delete);
         u.paint(&mut cv, false);
@@ -1185,12 +1572,9 @@ mod tests {
         assert!(painted(&u, Hit::ConfirmYes) && painted(&u, Hit::ConfirmNo));
 
         // Clicking where a card used to be does nothing at all.
-        assert_eq!(
-            u.click(card.x + card.w / 2.0, card.y + card.h / 2.0),
-            Action::None
-        );
+        assert_eq!(u.click_at(card), Action::None);
         assert_eq!(u.screen, Screen::Library);
-        assert_eq!(u.deleting, Some(0), "still waiting on an answer");
+        assert!(u.confirm.is_some(), "still waiting on an answer");
 
         // Arrows drive the dialog, not the grid.
         assert_eq!(u.game, 0);
@@ -1212,12 +1596,7 @@ mod tests {
         assert_eq!(u.key(Key::Paste), Action::Paste);
         let mut cv = Canvas::new(1280, 800);
         u.paint(&mut cv, false);
-        let (r, _) = *u
-            .hot
-            .iter()
-            .find(|(_, h)| *h == Hit::Paste)
-            .expect("a Paste button was painted");
-        assert_eq!(u.click(r.x + r.w / 2.0, r.y + r.h / 2.0), Action::Paste);
+        assert_eq!(click_hit(&mut u, Hit::Paste), Action::Paste);
 
         // A copied URL routinely carries a trailing newline; typing one is
         // impossible, so it must not survive into the field.
@@ -1257,12 +1636,7 @@ mod tests {
         let mut cv = Canvas::new(1280, 800);
         u.paint(&mut cv, false);
         // Click the second card, wherever the layout put it.
-        let (r, _) = *u
-            .hot
-            .iter()
-            .find(|(_, h)| *h == Hit::Game(1))
-            .expect("second game was painted");
-        let act = u.click(r.x + r.w / 2.0, r.y + r.h / 2.0);
+        let act = click_hit(&mut u, Hit::Game(1));
         assert_eq!(u.game, 1);
         assert_eq!(u.screen, Screen::Game);
         assert_eq!(act, Action::None);

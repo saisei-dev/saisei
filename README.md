@@ -39,7 +39,9 @@ Pick a game and it plays, compiling each part of it to native code the moment co
 
 <img src="docs/img/overlay.png" alt="The in-game menu, over a paused game" width="100%">
 
-**Press F12** and the game stops dead behind a menu. Save where you are, drop back into an earlier save, start over, switch to another game, or just close it and carry on exactly where you were. Every save keeps a picture of the moment you made it, so you can tell one from another at a glance.
+**Press F12** and the game stops dead behind a menu. Save where you are, drop back into an earlier save, or just go back and carry on exactly where you were. Every save keeps a picture of the moment you made it, so you can tell one from another at a glance.
+
+Your library is in there too — the same screens, in the same place, over the frozen frame instead of over the page. You can go and look at it, and come back, and the game will be exactly where you left it: browsing is not leaving. The only thing in there that really does end the game you paused is starting a different one, and that is the one thing the menu asks you about first.
 
 The game really is stopped — not slowed, not skipping — and it can't tell that any time passed, so nothing lurches when you come back.
 
