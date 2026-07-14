@@ -385,7 +385,21 @@ pub(crate) unsafe fn mem_capture(out: &mut Vec<u8>) {
 pub(crate) unsafe fn mem_restore(b: &[u8]) -> bool {
     match crate::devices::pod_restore::<DosMemSnap>(b) {
         Some(s) => {
-            dos_mem_block_count = s.count.min(DOS_MEM_BLOCK_MAX as u16);
+            let count = s.count.min(DOS_MEM_BLOCK_MAX as u16);
+            // A chain saved before DOS kept its headers in guest memory tiles the
+            // arena without the MCB paragraph between blocks. Restore it and the
+            // first publish writes a header into the top 16 bytes of whichever
+            // block came before — the guest's own data. Such a save has no arena
+            // we can honour: drop it, and `arena_init_if_needed` rebuilds one
+            // around the image, which is exactly what a save written before this
+            // block existed at all already does.
+            for i in 1..count as usize {
+                let prev = s.blocks[i - 1];
+                if s.blocks[i].seg != prev.seg.wrapping_add(prev.parags).wrapping_add(1) {
+                    return false;
+                }
+            }
+            dos_mem_block_count = count;
             dos_mem_blocks = s.blocks;
             // A non-zero count is what stops `arena_init_if_needed` rebuilding a
             // virgin arena over the top of the one just restored.
@@ -2401,8 +2415,40 @@ pub extern "C" fn dos_find_first(path: *const c_char, attr: u16) -> u8 {
 //
 // So: a real block chain, with first-fit allocation, a free that frees and
 // coalesces, and a resize that can grow into the free block above it. Blocks
-// tile the arena — every paragraph from the program's PSP to the 640K line
+// tile the arena — every paragraph from the environment block to the 640K line
 // belongs to exactly one block, owned or free.
+//
+// And the chain is **in guest memory**, because in DOS that is where it lives.
+// Every block is preceded by one paragraph of header — the MCB: a signature
+// ('M', or 'Z' on the last block), the owner's PSP (0 = free), and the size in
+// paragraphs. It is not DOS's private bookkeeping: a program's own MCB sits at
+// PSP-1, so a program can read how big its block is, and walk `seg + size` from
+// there to the next header, and the one after, and add up what is free —
+// without making a single DOS call. Dune II's memory manager does exactly that,
+// and against a host-side-only chain it walked into the tail of the environment
+// block (zeros: no signature, owner 0, size 0), concluded there was no memory
+// anywhere, and printed "Insufficient memory by 222928 bytes." with 300K free.
+//
+// So the arena tiles like DOS's does — [MCB][block][MCB][block]…[MCB][free] —
+// and `arena_publish` writes the headers into guest RAM after every change, so
+// what a program reads there is what DOS believes.
+
+/// 'M': a block with another one after it.
+const MCB_MEMBER: u8 = 0x4D;
+/// 'Z': the last block in the chain.
+const MCB_LAST: u8 = 0x5A;
+
+/// The environment block: 0x10 paragraphs of strings under the program, with its
+/// own MCB under *that*. Its size is what `init_psp` fills, and the layout below
+/// the PSP is fixed by it: [env MCB][env][program MCB][PSP][image…].
+pub const ENV_PARAS: u16 = 0x10;
+
+/// Where the environment block goes, given the program's PSP. One definition, so
+/// the loader and the arena cannot disagree about which paragraph is the
+/// program's MCB — the program reads its own block size out of it.
+pub unsafe fn dos_env_seg() -> u16 {
+    psp_seg.wrapping_sub(ENV_PARAS).wrapping_sub(1)
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -2441,17 +2487,47 @@ unsafe fn arena_init_if_needed() {
     }
     let base = psp_seg;
     let top = next_free_seg;
+    // The environment, the program, and everything above it. Each block's MCB is
+    // the paragraph below its `seg`, so the free block starts one paragraph above
+    // the image, not at it: `top` itself is the free block's header.
     dos_mem_blocks[0] = MemBlock {
+        seg: dos_env_seg(),
+        parags: ENV_PARAS,
+        owner: base,
+    };
+    dos_mem_blocks[1] = MemBlock {
         seg: base,
         parags: top.wrapping_sub(base),
         owner: base,
     };
-    dos_mem_blocks[1] = MemBlock {
-        seg: top,
-        parags: (CONVENTIONAL_TOP_SEG as u16).wrapping_sub(top),
+    dos_mem_blocks[2] = MemBlock {
+        seg: top.wrapping_add(1),
+        parags: (CONVENTIONAL_TOP_SEG as u16)
+            .wrapping_sub(top)
+            .wrapping_sub(1),
         owner: 0,
     };
-    dos_mem_block_count = 2;
+    dos_mem_block_count = 3;
+    arena_sync_next_free();
+}
+
+/// Write the chain into guest memory, where DOS keeps it and where a program
+/// reads it. Called after every change to the arena, via `arena_sync_next_free`.
+unsafe fn arena_publish() {
+    for i in 0..dos_mem_block_count as usize {
+        let b = dos_mem_blocks[i];
+        let mcb = seg_off(b.seg.wrapping_sub(1), 0);
+        *mcb = if i + 1 == dos_mem_block_count as usize {
+            MCB_LAST
+        } else {
+            MCB_MEMBER
+        };
+        *mcb.add(1) = b.owner as u8;
+        *mcb.add(2) = (b.owner >> 8) as u8;
+        *mcb.add(3) = b.parags as u8;
+        *mcb.add(4) = (b.parags >> 8) as u8;
+        libc::memset(mcb.add(5) as *mut c_void, 0, 11);
+    }
 }
 
 /// `next_free_seg` is where `load_executable` puts an image and what the frozen
@@ -2469,14 +2545,18 @@ unsafe fn arena_sync_next_free() {
         }
     }
     next_free_seg = top;
+    arena_publish();
 }
 
 unsafe fn arena_coalesce() {
     let mut i = 0usize;
     while i + 1 < dos_mem_block_count as usize {
         if dos_mem_blocks[i].owner == 0 && dos_mem_blocks[i + 1].owner == 0 {
+            // The header of the block being absorbed becomes data: two free
+            // blocks of N and M paragraphs merge into one of N + 1 + M.
             dos_mem_blocks[i].parags = dos_mem_blocks[i]
                 .parags
+                .wrapping_add(1)
                 .wrapping_add(dos_mem_blocks[i + 1].parags);
             for j in i + 1..dos_mem_block_count as usize - 1 {
                 dos_mem_blocks[j] = dos_mem_blocks[j + 1];
@@ -2490,6 +2570,10 @@ unsafe fn arena_coalesce() {
 
 /// Split block `i` so it is exactly `parags` long, leaving the remainder as a
 /// free block behind it. No-op when there is no remainder.
+///
+/// The remainder is one paragraph shorter than the space given up: that
+/// paragraph is the free block's own MCB. A shrink that leaves exactly one
+/// paragraph leaves a free block of size zero, which is a thing DOS has.
 unsafe fn arena_split(i: usize, parags: u16) -> bool {
     let cur = dos_mem_blocks[i].parags;
     if parags >= cur {
@@ -2504,8 +2588,8 @@ unsafe fn arena_split(i: usize, parags: u16) -> bool {
         j -= 1;
     }
     dos_mem_blocks[i + 1] = MemBlock {
-        seg: dos_mem_blocks[i].seg.wrapping_add(parags),
-        parags: cur - parags,
+        seg: dos_mem_blocks[i].seg.wrapping_add(parags).wrapping_add(1),
+        parags: cur - parags - 1,
         owner: 0,
     };
     dos_mem_blocks[i].parags = parags;
@@ -2553,6 +2637,8 @@ unsafe fn arena_set_owner(seg: u16, owner: u16) {
     for i in 0..dos_mem_block_count as usize {
         if dos_mem_blocks[i].seg == seg {
             dos_mem_blocks[i].owner = owner;
+            // The owner is a field of the MCB, and the child reads its own.
+            arena_sync_next_free();
             return;
         }
     }
@@ -2725,12 +2811,16 @@ pub extern "C" fn dos_resize_mem_impl(
         // Grow: only into the free block immediately above, and only if it is
         // big enough. Anything else is "insufficient memory", and BX must say
         // how large the block *could* have been made.
+        //
+        // What the free block above can give up is its data *and* its header —
+        // absorb the whole block and its MCB paragraph becomes data too. So a
+        // free block of N paragraphs is worth N+1 to the block below it.
         let want_extra = parags - cur;
         let next_free = dos_mem_blocks
             .get(i + 1)
             .filter(|_| i + 1 < dos_mem_block_count as usize)
             .filter(|b| b.owner == 0)
-            .map(|b| b.parags)
+            .map(|b| b.parags.wrapping_add(1))
             .unwrap_or(0);
         if next_free < want_extra {
             set_CF(1);
@@ -2745,8 +2835,10 @@ pub extern "C" fn dos_resize_mem_impl(
             }
             dos_mem_block_count -= 1;
         } else {
-            dos_mem_blocks[i + 1].seg = segment.wrapping_add(parags);
-            dos_mem_blocks[i + 1].parags = next_free - want_extra;
+            // What is left of it keeps its header one paragraph above the block
+            // that just grew.
+            dos_mem_blocks[i + 1].seg = segment.wrapping_add(parags).wrapping_add(1);
+            dos_mem_blocks[i + 1].parags = next_free - want_extra - 1;
         }
         if segment == psp_seg {
             program_min_block_paras = parags;

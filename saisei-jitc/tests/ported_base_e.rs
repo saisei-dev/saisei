@@ -66,15 +66,36 @@ fn unknown_prefix__traps_when_reached() {
     let func = json!({
         "start": 0x0000,
         "instructions": [
-            {"address": 0x0000, "mnemonic": "lock inc", "op_str": "ax", "bytes": ""},
+            {"address": 0x0000, "mnemonic": "bnd jmp", "op_str": "ax", "bytes": ""},
             {"address": 0x0001, "mnemonic": "ret", "op_str": "", "bytes": ""},
         ],
     });
     let src = render_rs(&func, &[0x0000], "");
     assert!(
-        src.contains(r#"r.jit_unsupported_instruction(c"prefix:lock inc".as_ptr());"#),
+        src.contains(r#"r.jit_unsupported_instruction(c"prefix:bnd jmp".as_ptr());"#),
         "{src}"
     );
+}
+
+/// LOCK holds the bus for the instruction, which is a promise to other bus
+/// masters. There are none: one CPU, and a translated instruction is one step on
+/// one thread. So the instruction under the prefix is emitted as itself —
+/// operands and flags alike — rather than trapping. Dune II's `lock inc` is a
+/// plain `inc`.
+#[test]
+fn lock_prefix__emits_the_instruction_under_it() {
+    let func = json!({
+        "start": 0x0000,
+        "instructions": [
+            {"address": 0x0000, "mnemonic": "lock inc", "op_str": "word ptr [bx]", "bytes": "F0FF07"},
+            {"address": 0x0003, "mnemonic": "ret", "op_str": "", "bytes": "C3"},
+        ],
+    });
+    let src = render_rs(&func, &[0x0000], "");
+    assert!(!src.contains("jit_unsupported_instruction"), "{src}");
+    // the increment lands in memory, and INC leaves CF alone
+    assert!(src.contains("r.memw_write(r.ds(), r.bx()"), "{src}");
+    assert!(src.contains("wrapping_add(1)"), "{src}");
 }
 
 // ===========================================================================

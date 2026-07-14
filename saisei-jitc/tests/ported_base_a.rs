@@ -322,14 +322,21 @@ fn interrupt_flag_clobber__non_dos_int_does_not_preadvance_ip_before_run_interru
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert!(src.contains("r.run_interrupt(0x60);"), "{src}");
+    // The interrupt carries the address it expects to come back to, and leaves the
+    // chunk when it does not come back there — an IRET resumes at the cs:ip on the
+    // stack, in whatever code is there by then, and a handler is free to change
+    // both (an overlay manager changes both at once).
+    assert!(
+        src.contains("if r.run_interrupt_resume(0x60, 0x0002) != 0 { return -1; }"),
+        "{src}"
+    );
     // ip advances to the next instruction only AFTER the interrupt has run
     assert!(
-        src.find("r.set_ip(0x0000);").unwrap() < src.find("r.run_interrupt(0x60);").unwrap(),
+        src.find("r.set_ip(0x0000);").unwrap() < src.find("r.run_interrupt_resume(0x60").unwrap(),
         "{src}"
     );
     assert!(
-        src.find("r.run_interrupt(0x60);").unwrap() < src.find("r.set_ip(0x0002);").unwrap(),
+        src.find("r.run_interrupt_resume(0x60").unwrap() < src.find("r.set_ip(0x0002);").unwrap(),
         "{src}"
     );
 }

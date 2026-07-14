@@ -250,7 +250,10 @@ fn ir_to_c__interrupt_emits_run_interrupt() {
     });
     let src = render_app(&func, &[]);
     assert!(src.contains("r.set_ip(0x0000);"), "{src}");
-    assert!(src.contains("r.run_interrupt(0x60);"), "{src}");
+    assert!(
+        src.contains("if r.run_interrupt_resume(0x60, 0x0002) != 0 { return -1; }"),
+        "{src}"
+    );
 }
 
 #[test]
@@ -264,7 +267,10 @@ fn ir_to_c__interrupt_1a_emits_run_interrupt() {
     });
     let src = render_app(&func, &[]);
     assert!(src.contains("r.set_ip(0x0000);"), "{src}");
-    assert!(src.contains("r.run_interrupt(0x1A);"), "{src}");
+    assert!(
+        src.contains("if r.run_interrupt_resume(0x1A, 0x0002) != 0 { return -1; }"),
+        "{src}"
+    );
 }
 
 #[test]
@@ -338,7 +344,10 @@ fn ir_to_c__bios_video_mode_interrupt_emits_run_interrupt() {
     });
     let src = render_app(&func, &[]);
     assert!(src.contains("r.set_ax(0x13);"), "{src}");
-    assert!(src.contains("r.run_interrupt(0x10);"), "{src}");
+    assert!(
+        src.contains("if r.run_interrupt_resume(0x10, 0x0005) != 0 { return -1; }"),
+        "{src}"
+    );
 }
 
 // ============================================================================

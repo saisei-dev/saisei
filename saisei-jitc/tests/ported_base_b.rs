@@ -737,7 +737,10 @@ fn for_loop__loop_with_jcxz_is_structured_as_for_loop() {
     assert!(src.contains("if r.cx() == 0 {"), "{src}");
     assert!(src.contains("return 0x0009;"), "{src}");
     // the body and the loop back-edge with the cx decrement
-    assert!(src.contains("r.run_interrupt(0x10);"), "{src}");
+    assert!(
+        src.contains("if r.run_interrupt_resume(0x10, 0x0007) != 0 { return -1; }"),
+        "{src}"
+    );
     assert!(src.contains("r.set_cx(r.cx().wrapping_sub(1));"), "{src}");
     assert!(src.contains("if r.cx() != 0 {"), "{src}");
     assert!(src.contains("return 0x0005;"), "{src}");

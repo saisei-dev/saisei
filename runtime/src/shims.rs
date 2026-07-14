@@ -2910,7 +2910,22 @@ unsafe fn invoke_isr(
         sp() as c_uint,
         flags as c_uint,
     );
-    while machine_halted == 0 && (sp().wrapping_sub(sp_at_invoke_isr_entry) as i16) < 0 {
+    // A handler has returned when the frame the INT pushed is off the stack —
+    // except for the two that do not IRET. INT 25h and INT 26h (DOS absolute
+    // disk read/write) return with a far RET and *leave the FLAGS word the INT
+    // pushed*: removing it is documented to be the caller's job (`popf`, or
+    // `add sp,2`). Their frame is therefore two bytes shallower than every other
+    // one, and those two bytes belong to the caller from the moment it resumes.
+    // Waiting for the full frame to come off means the handler's return never
+    // ends this loop, and it runs on into the caller's own code — which is how
+    // Popcorn came back from `int 25h` somewhere its own `ret` had taken it.
+    let handler_leaves_flags = int_no == 0x25 || int_no == 0x26;
+    let frame_floor = if handler_leaves_flags {
+        sp_at_invoke_isr_entry.wrapping_sub(2)
+    } else {
+        sp_at_invoke_isr_entry
+    };
+    while machine_halted == 0 && (sp().wrapping_sub(frame_floor) as i16) < 0 {
         let addr = ((cs() as u32) << 4) + ip() as u32;
         if resolve_and_run_chunk(addr) == 0 {
             let mut msg = [0u8; 512];
@@ -2946,7 +2961,10 @@ unsafe fn invoke_isr(
     );
     isr_depth -= 1;
     shim_log_stdout(cstr!("Trace: isr_depth exit -> %d\n"), isr_depth as c_int);
-    if preserve_stack != 0 {
+    // ...and for the same reason, do not put the stack back where the INT found
+    // it: the flags word below it is the caller's to pop, and restoring SP over
+    // it would hand its `popf` whatever lies above instead.
+    if preserve_stack != 0 && !handler_leaves_flags {
         let after_word0 = memw_read_impl(saved_ss, saved_sp, SHIMS_FILE, cstr!("invoke_isr"), 1563);
         let after_word1 = memw_read_impl(
             saved_ss,
@@ -3083,6 +3101,55 @@ pub unsafe extern "C" fn run_interrupt_impl(
 #[no_mangle]
 pub unsafe extern "C" fn run_interrupt(int_no: u8) {
     run_interrupt_impl(int_no, cstr!("<external>"), cstr!("run_interrupt"), 0);
+}
+
+/// `INT n`, and — the part a chunk cannot assume — *where* to carry on.
+///
+/// An IRET resumes at the cs:ip on the stack, executing whatever bytes are at
+/// that address now. A handler is free to change both, and Borland's overlay
+/// manager changes both at once: INT 3Fh traps on a stub, the manager reads the
+/// overlay's real code from the EXE over the stub that called it, and returns
+/// into it. A chunk that carries on with the instruction it compiled after the
+/// INT assumes neither happened — so Dune II ran the translation of an overlay
+/// stub table (zeros, decoded as `add [bx+si], al`) long after the real code had
+/// been loaded on top of it, and the garbage `lds` in it put a non-segment in DS.
+///
+/// Returns non-zero when the chunk must leave the dispatcher and let the machine
+/// re-resolve the live cs:ip: the handler redirected the return, or the code
+/// under us was overwritten. Zero means the resume lands on the very next
+/// instruction of code that has not changed — carrying on in-chunk is then the
+/// same execution, which is why this is not paid on every interrupt.
+#[no_mangle]
+pub unsafe extern "C" fn run_interrupt_resume_impl(
+    int_no: u8,
+    next_ip: u16,
+    file: *const c_char,
+    func: *const c_char,
+    line: c_int,
+) -> c_int {
+    let cs_before = cs();
+    run_interrupt_impl(int_no, file, func, line);
+    if cs() != cs_before || ip() != next_ip {
+        shim_log_stdout(
+            cstr!("Trace: int 0x%02X resumed at %04X:%04X, not %04X:%04X -- leaving the chunk\n"),
+            int_no as c_uint,
+            cs() as c_uint,
+            ip() as c_uint,
+            cs_before as c_uint,
+            next_ip as c_uint,
+        );
+        return 1;
+    }
+    if jit_running_chunk_is_stale() {
+        shim_log_stdout(
+            cstr!("Trace: int 0x%02X overwrote the code under this chunk -- re-translating at %04X:%04X\n"),
+            int_no as c_uint,
+            cs() as c_uint,
+            ip() as c_uint,
+        );
+        return 1;
+    }
+    0
 }
 
 // ============================================================================
@@ -4056,7 +4123,10 @@ unsafe fn init_psp() {
         );
     }
 
-    let env_seg = psp_seg.wrapping_sub(0x10);
+    // Not psp_seg - 0x10: the paragraph immediately below the PSP is the
+    // program's MCB, which is where a program reads its own block size. The
+    // environment sits below that, with an MCB of its own. See dos::dos_env_seg.
+    let env_seg = crate::dos::dos_env_seg();
     env_block = seg_off(env_seg, 0);
     libc::memset(env_block as *mut c_void, 0, 0x100);
     let mut program_path = cfg().program_path;
@@ -10799,6 +10869,11 @@ impl JitChunk {
 const MAX_JIT_CHUNKS: usize = 1024;
 static mut jit_chunks: [JitChunk; MAX_JIT_CHUNKS] = [JitChunk::ZERO; MAX_JIT_CHUNKS];
 static mut jit_chunk_count: usize = 0;
+/// The chunk whose translated code is running right now — restored on the way
+/// out of every nested dispatch, so it names the caller again when an ISR or a
+/// far callback returns. It is what lets a chunk ask whether the bytes it was
+/// translated from are still the bytes in memory (`jit_running_chunk_is_stale`).
+static mut jit_running_chunk: *mut JitChunk = ptr::null_mut();
 static mut jit_code_lo: u32 = 0xFFFFFFFF;
 static mut jit_code_hi: u32 = 0;
 
@@ -11047,6 +11122,8 @@ unsafe fn jit_dispatch(
     line: c_int,
 ) -> c_int {
     set_cs(((*c).seg_base >> 4) as u16);
+    let outer = jit_running_chunk;
+    jit_running_chunk = c;
     ((*c).fn_.unwrap())(
         (linear - (*c).seg_base) as c_int,
         expected_retip,
@@ -11054,8 +11131,16 @@ unsafe fn jit_dispatch(
         func,
         line,
     );
+    jit_running_chunk = outer;
     shim_drain_pending_tail_dispatch(file, func, line);
     1
+}
+
+/// Has the code under the chunk we are running been overwritten since it was
+/// translated? A chunk is a *cache* of an instruction fetch, and the CPU it
+/// stands in for re-fetches from memory every time.
+unsafe fn jit_running_chunk_is_stale() -> bool {
+    !jit_running_chunk.is_null() && (*jit_running_chunk).stale != 0
 }
 
 unsafe fn jit_compile_or_get(seg: u16, off: u16) -> *mut JitChunk {

@@ -217,7 +217,7 @@ fn localize_regs(line: &str) -> String {
     });
     let calls_re = CALLS_RE.get_or_init(|| {
         Regex::new(
-            r"\b(memb_write|memw_write|memb|memw|rcb_read8|rcb_read16|rcb_write8|rcb_write16|inb|inw|outb|outw|JIT_BUDGET|HLT_WAIT|run_interrupt|schedule_interrupt|dos_api|dos_exit|bios_keyboard|rep_movsb_block|rep_movsw_block|rep_stosb_block|call_table_|lcall_table_|jump_table_|near_ret_tail_|long_jump_|iret_|retf_pop_|retf_|jit_unsupported_instruction)\(",
+            r"\b(memb_write|memw_write|memb|memw|rcb_read8|rcb_read16|rcb_write8|rcb_write16|inb|inw|outb|outw|JIT_BUDGET|HLT_WAIT|run_interrupt_resume|run_interrupt|schedule_interrupt|dos_api|dos_exit|bios_keyboard|rep_movsb_block|rep_movsw_block|rep_stosb_block|call_table_|lcall_table_|jump_table_|near_ret_tail_|long_jump_|iret_|retf_pop_|retf_|jit_unsupported_instruction)\(",
         )
         .unwrap()
     });
@@ -441,6 +441,23 @@ impl RRenderer {
     // ---- operand lowering --------------------------------------------------
 
     /// Lower a (rewrite_operands-produced) operand to a Rust rvalue expression.
+    /// An rvalue read as a signed value of its operand width.
+    ///
+    /// Not `({v}) as i16`: `rvalue` renders an immediate as a bare hex literal,
+    /// and rustc then types that literal as `i16`, where `0xCD00` does not fit —
+    /// the chunk does not compile. (Nor does a *negative* immediate, which
+    /// `rvalue` already hands over as its 16-bit two's complement, `0xFFB4`.)
+    /// Going through the unsigned width first is a no-op for a register or a
+    /// `memw` read, and for a literal it is the truncate-then-reinterpret that
+    /// x86 does anyway.
+    fn signed16(v: &str) -> String {
+        format!("({v}) as u16 as i16")
+    }
+
+    fn signed8(v: &str) -> String {
+        format!("({v}) as u8 as i8")
+    }
+
     fn rvalue(&self, op: &str) -> R<String> {
         let l = op.to_lowercase();
         if is_reg(&l) {
@@ -1513,7 +1530,7 @@ impl RRenderer {
             Ok(vec![
                 "{".into(),
                 "    let dividend: i32 = ((dx() as i16 as i32) << 16) | (ax() as i32);".into(),
-                format!("    let divisor = ({ov}) as i16 as i32;"),
+                format!("    let divisor = {} as i32;", Self::signed16(&ov)),
                 "    match dividend.checked_div(divisor) {".into(),
                 "        Some(q) if (-32768..=32767).contains(&q) => { set_ax(q as u16); set_dx((dividend % divisor) as u16); }".into(),
                 "        _ => { run_interrupt(0x00); }".into(),
@@ -1524,7 +1541,7 @@ impl RRenderer {
             Ok(vec![
                 "{".into(),
                 "    let dividend: i16 = ax() as i16;".into(),
-                format!("    let divisor = ({ov}) as i8 as i16;"),
+                format!("    let divisor = {} as i16;", Self::signed8(&ov)),
                 "    match dividend.checked_div(divisor) {".into(),
                 "        Some(q) if (-128..=127).contains(&q) => { set_al((q & 0xFF) as u8); set_ah((dividend % divisor) as u8); }".into(),
                 "        _ => { run_interrupt(0x00); }".into(),
@@ -1561,7 +1578,11 @@ impl RRenderer {
             let (fav, fbv) = (self.rvalue(&fa)?, self.rvalue(&fb)?);
             let mut l = vec![
                 "{".into(),
-                format!("    let tmp: i32 = (({fav}) as i16 as i32).wrapping_mul(({fbv}) as i16 as i32);"),
+                format!(
+                    "    let tmp: i32 = ({} as i32).wrapping_mul({} as i32);",
+                    Self::signed16(&fav),
+                    Self::signed16(&fbv)
+                ),
             ];
             for x in self.store(&dest, "(tmp & 0xFFFF) as u16")? {
                 l.push(format!("    {x}"));
@@ -1577,7 +1598,10 @@ impl RRenderer {
         if operand_width8(&operand) && !writes_dx(insn) {
             Ok(vec![
                 "{".into(),
-                format!("    let tmp: i16 = (al() as i8 as i16) * (({ov}) as i8 as i16);"),
+                format!(
+                    "    let tmp: i16 = (al() as i8 as i16) * ({} as i16);",
+                    Self::signed8(&ov)
+                ),
                 "    set_ax((tmp as u16) & 0xFFFF);".into(),
                 "    let v = (tmp < -128 || tmp > 127) as u8;".into(),
                 "    set_CF(v); set_OF(v);".into(),
@@ -1587,7 +1611,8 @@ impl RRenderer {
             Ok(vec![
                 "{".into(),
                 format!(
-                    "    let tmp: i32 = (ax() as i16 as i32).wrapping_mul(({ov}) as i16 as i32);"
+                    "    let tmp: i32 = (ax() as i16 as i32).wrapping_mul({} as i32);",
+                    Self::signed16(&ov)
                 ),
                 "    set_dx(((tmp >> 16) & 0xFFFF) as u16);".into(),
                 "    set_ax((tmp & 0xFFFF) as u16);".into(),
@@ -1847,7 +1872,19 @@ impl RRenderer {
             Some(0x21) => self.simple(&["dos_api();"]),
             Some(0x20) => self.simple(&["dos_exit();"]),
             Some(0x16) => self.simple(&["bios_keyboard();"]),
-            Some(n) => Ok(vec![format!("run_interrupt(0x{n:02X});")]),
+            // Not `run_interrupt(n); <next instruction>`: that hard-codes both
+            // where the handler returns to and what is there when it does. An
+            // IRET goes to the cs:ip on the stack, and the handler may have
+            // changed it — or overwritten the code we were translated from, which
+            // is exactly what an overlay manager (INT 3Fh) does to the stub that
+            // called it. Either way, leave and let the machine re-resolve.
+            Some(n) => {
+                let next_ip =
+                    (i64f(insn, "address").unwrap_or(0) + insn_len(insn) + self.cs_base) & 0xFFFF;
+                Ok(vec![format!(
+                    "if run_interrupt_resume(0x{n:02X}, 0x{next_ip:04X}) != 0 {{ return -1; }}"
+                )])
+            }
             None => uns(format!("int {}", s(insn, "op_str"))),
         }
     }
@@ -1991,7 +2028,7 @@ impl RRenderer {
         Ok(vec![
             "set_cx(cx().wrapping_sub(1));".into(),
             format!("if {cond} {{"),
-            format!("    return 0x{target:04X};"),
+            format!("    return 0x{:04X};", target & 0xFFFF),
             "}".into(),
         ])
     }
@@ -2112,23 +2149,23 @@ impl RRenderer {
     }
 
     fn handle_call(&mut self, insn: &Insn) -> R<Vec<String>> {
-        let mut target = i64f(insn, "target");
-        if let Some(t) = target {
-            if s(insn, "bytes").len() == 6 && (t & 0xFFFF0000) == 0xFFFF0000 {
-                target = Some(t & 0xFFFF);
-            }
-        }
+        // A near transfer's destination is an offset in the current segment, and
+        // it wraps there. Capstone reports address+disp un-wrapped, so a jump or
+        // call backwards from low in the segment comes back as 0xFFFFFFxx — which
+        // is not an ip, does not fit the i32 a block key is, and used to be masked
+        // only for the one instruction length someone had seen it on. Mask it: the
+        // CPU does, and an ip is what a block key means.
+        let target = i64f(insn, "target")
+            .or_else(|| parse_imm(s(insn, "op_str")))
+            .map(|t| t & 0xFFFF);
         let ret_arg = self.call_return_arg(insn);
-        if target.is_none() {
-            target = parse_imm(s(insn, "op_str"));
-        }
         if let Some(t) = target {
             if self.known_funcs.contains(&t) {
                 return Ok(vec![
                     "{".into(),
                     "    set_sp((sp().wrapping_sub(2)) & 0xFFFF);".into(),
                     format!("    memw_write(ss(), sp(), {ret_arg});"),
-                    format!("    return 0x{t:04X};"),
+                    format!("    return 0x{:04X};", t & 0xFFFF),
                     "}".into(),
                 ]);
             }
@@ -2333,6 +2370,17 @@ impl RRenderer {
                 "rep" => self.handle_rep(insn, base),
                 "repe" | "repz" => self.handle_repe(insn, base),
                 "repne" | "repnz" => self.handle_repne(insn, base),
+                // LOCK asserts the bus lock for the duration of the instruction,
+                // which is a promise made to *other bus masters* — that no one
+                // else reads or writes the line half-way through. There is no one
+                // else: one CPU, and a translated instruction is a single step on
+                // a single thread. The instruction under the prefix is unchanged,
+                // operands and flags alike, so emit it.
+                "lock" => {
+                    let mut base_insn = insn.clone();
+                    base_insn.insert("mnemonic".into(), Value::String(base.to_string()));
+                    self.format_instruction(&base_insn)
+                }
                 other => uns(format!("prefix:{other} {base}")),
             };
         }
@@ -2534,7 +2582,7 @@ impl RRenderer {
         if is_last && mnem == "jmp" {
             match parse_hex16(&op_str) {
                 Some(target) => {
-                    out.push(format!("{indent}return 0x{target:04X};"));
+                    out.push(format!("{indent}return 0x{:04X};", target & 0xFFFF));
                     return Ok((out, true));
                 }
                 None => return uns(format!("jmp {op_str}")),
@@ -2560,14 +2608,14 @@ impl RRenderer {
             match fall {
                 Some(f) => {
                     out.push(format!("{indent}if {cond} {{"));
-                    out.push(format!("{indent}    return 0x{target:04X};"));
+                    out.push(format!("{indent}    return 0x{:04X};", target & 0xFFFF));
                     out.push(format!("{indent}}} else {{"));
-                    out.push(format!("{indent}    return 0x{f:04X};"));
+                    out.push(format!("{indent}    return 0x{:04X};", f & 0xFFFF));
                     out.push(format!("{indent}}}"));
                 }
                 None => {
                     out.push(format!("{indent}if {cond} {{"));
-                    out.push(format!("{indent}    return 0x{target:04X};"));
+                    out.push(format!("{indent}    return 0x{:04X};", target & 0xFFFF));
                     out.push(format!("{indent}}}"));
                     out.push(format!("{indent}return -1;"));
                 }
@@ -2612,7 +2660,7 @@ impl RRenderer {
         if is_last {
             let ss = succs(block.start);
             if let Some(&first) = ss.first() {
-                out.push(format!("{indent}return 0x{first:04X};"));
+                out.push(format!("{indent}return 0x{:04X};", first & 0xFFFF));
             } else {
                 out.push(format!("{indent}return -1;"));
             }

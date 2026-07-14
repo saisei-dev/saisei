@@ -434,6 +434,7 @@ extern "C" {
     fn retf_impl(file: *const c_char, func: *const c_char, line: c_int);
     fn retf_pop_impl(file: *const c_char, func: *const c_char, line: c_int, pop_bytes: u16);
     fn run_interrupt_impl(int_no: u8, file: *const c_char, func: *const c_char, line: c_int);
+    fn run_interrupt_resume_impl(int_no: u8, next_ip: u16, file: *const c_char, func: *const c_char, line: c_int) -> c_int;
     fn schedule_interrupt_impl(int_no: u8, file: *const c_char, func: *const c_char, line: c_int);
 
     fn shim_drain_pending_tail_dispatch(file: *const c_char, func: *const c_char, line: c_int);
@@ -579,6 +580,10 @@ extern "C" {
 #[inline(always)] pub fn SAFEPOINT() { unsafe { safe_point_impl(site(), site(), 0) } }
 
 #[inline(always)] pub fn run_interrupt(int_no: u8) { unsafe { run_interrupt_impl(int_no, site(), site(), 0) } }
+/// INT n, answering whether the handler left us somewhere other than `next_ip`,
+/// or rewrote the code we are translated from. Non-zero: leave the dispatcher and
+/// let the machine re-resolve the live cs:ip. See run_interrupt_resume_impl.
+#[inline(always)] pub fn run_interrupt_resume(int_no: u8, next_ip: u16) -> c_int { unsafe { run_interrupt_resume_impl(int_no, next_ip, site(), site(), 0) } }
 #[inline(always)] pub fn schedule_interrupt(int_no: u8) { unsafe { schedule_interrupt_impl(int_no, site(), site(), 0) } }
 
 #[inline(always)] pub fn rep_movsb_block(dst_seg: u16, src_seg: u16) { unsafe { rep_movsb_block_impl(dst_seg, src_seg, site(), site(), 0) } }
@@ -938,6 +943,7 @@ impl Regs {
     // -- runtime calls that can mutate guest registers: spill + reload.
     regs_ffi_mut!(HLT_WAIT());
     regs_ffi_mut!(run_interrupt(int_no: u8));
+    regs_ffi_mut!(run_interrupt_resume(int_no: u8, next_ip: u16) -> c_int);
     regs_ffi_mut!(schedule_interrupt(int_no: u8));
     regs_ffi_mut!(dos_api() -> u8);
     regs_ffi_mut!(dos_exit());
