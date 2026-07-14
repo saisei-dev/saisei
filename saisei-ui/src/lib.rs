@@ -227,6 +227,15 @@ pub struct Ui {
 
     /// Filled by paint; read by the mouse. Cleared each frame.
     hot: Vec<(Rect, Hit)>,
+    /// Whatever the pointer is over, or None if it is over nothing.
+    ///
+    /// Distinct from the cursor. For most things the two are the same — hovering a
+    /// card or an action *is* selecting it, so the keyboard and the mouse never
+    /// fight over two positions (see `point_at`). But a few controls are outside
+    /// the cursor's cycle and were left with no way to answer the pointer at all:
+    /// Back sat permanently in `SURFACE_HI`, the colour this palette reserves for
+    /// "hovered", so the one state it could show was the one it was always in.
+    hover: Option<Hit>,
     /// Columns the library grid last used, so Up/Down move by a row.
     cols: usize,
     /// First visible row of the library grid.
@@ -256,6 +265,7 @@ impl Ui {
             volume: 0.6,
             dragging_volume: false,
             hot: Vec::new(),
+            hover: None,
             cols: 1,
             scroll: 0,
         }
@@ -805,10 +815,18 @@ impl Ui {
                 return self.set_volume(value_along(track, x));
             }
         }
-        if let Some(hit) = self.hit(x, y) {
+        // Assigned unconditionally, so sliding off a control clears the highlight
+        // — unlike the cursor below, which stays where it was put.
+        self.hover = self.hit(x, y);
+        if let Some(hit) = self.hover {
             self.point_at(hit);
         }
         Action::None
+    }
+
+    /// Is the pointer over `h`? For the controls the cursor never lands on.
+    pub(crate) fn hovering(&self, h: Hit) -> bool {
+        self.hover == Some(h)
     }
 
     /// The mouse came up. Ends a drag; nothing else in the UI cares.
@@ -825,6 +843,9 @@ impl Ui {
     }
 
     pub fn click(&mut self, x: f32, y: f32) -> Action {
+        // A click is also the pointer telling us where it is: on a touchpad tap the
+        // press can be the first the UI hears of that position, with no move before it.
+        self.hover = self.hit(x, y);
         match self.hit(x, y) {
             Some(hit) => {
                 self.point_at(hit);
@@ -1284,6 +1305,42 @@ mod tests {
         );
         assert_eq!(u.click_at(rect_of(&u, Hit::SheetCancel)), Action::None);
         assert_eq!(u.menu, None);
+    }
+
+    #[test]
+    fn the_back_button_answers_the_pointer() {
+        // It used to be painted in SURFACE_HI — the colour reserved for "hovered" —
+        // no matter where the mouse was, so hovering it changed nothing: the one
+        // state it could show was the one it never left. Assert on the *pixels*, not
+        // on a flag, because a flag nothing paints is exactly the bug that was here.
+        fn px(cv: &Canvas, r: Rect) -> Vec<u8> {
+            let (x, y) = ((r.x + r.w / 2.0) as usize, (r.y + r.h / 2.0) as usize);
+            let i = (y * cv.w + x) * 4;
+            cv.px[i..i + 4].to_vec()
+        }
+
+        let mut u = ui(&[("Zeliard", 1)]);
+        let mut cv = Canvas::new(1280, 800);
+        u.screen = Screen::Settings;
+
+        u.paint(&mut cv, false);
+        let btn = rect_of(&u, Hit::Back);
+        // Off the button entirely — the far corner of the page.
+        u.mouse_move(cv.w as f32 - 1.0, cv.h as f32 - 1.0);
+        u.paint(&mut cv, false);
+        let idle = px(&cv, btn);
+
+        u.mouse_move(btn.x + btn.w / 2.0, btn.y + btn.h / 2.0);
+        assert!(u.hovering(Hit::Back), "the pointer is on it");
+        u.paint(&mut cv, false);
+        assert_ne!(px(&cv, btn), idle, "hovering Back must change how it looks");
+
+        // And sliding off it puts it back — a highlight that never leaves is the
+        // same as no highlight at all.
+        u.mouse_move(cv.w as f32 - 1.0, cv.h as f32 - 1.0);
+        assert!(!u.hovering(Hit::Back));
+        u.paint(&mut cv, false);
+        assert_eq!(px(&cv, btn), idle, "leaving Back must undo the highlight");
     }
 
     #[test]

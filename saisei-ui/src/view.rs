@@ -108,8 +108,21 @@ fn nav(
         let bh = BAR_H * s;
         let bw = ui.fonts.width(label, Weight::Bold, 15.0 * s) + 32.0 * s;
         let btn = Rect::new(r.x, r.y, bw, bh);
-        cv.rounded(btn, bh / 2.0, t::SURFACE_HI);
-        cv.stroke(btn, bh / 2.0, 1.0, t::BORDER);
+        // It answers the pointer now. It used to be painted in SURFACE_HI whatever
+        // the mouse was doing — the one colour this palette keeps for "hovered" —
+        // so the only state it could show was the one it never left. Idle is a
+        // plain surface; hovering lifts it and rings it in the accent, which is the
+        // same rise every other control makes. Not the accent *fill* a selected
+        // action gets, though: Back is outside the keyboard cursor's cycle, and two
+        // things wearing the selection at once is worse than one that never wore it.
+        let hot = ui.hovering(Hit::Back);
+        let (bg, edge) = if hot {
+            (t::SURFACE_HI, t::ACCENT)
+        } else {
+            (t::SURFACE, t::BORDER)
+        };
+        cv.rounded(btn, bh / 2.0, bg);
+        cv.stroke(btn, bh / 2.0, 1.0, edge);
         ui.fonts.draw_centered(
             cv,
             label,
