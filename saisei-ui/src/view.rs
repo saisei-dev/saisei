@@ -1,12 +1,15 @@
 //! Painting the interface.
 //!
 //! Every screen is laid out in the same rect — the window, less a margin — and
-//! wears the same bar at the top: a way back, and a title saying where you are.
-//! That is what lets the library, a game's page, the settings and the pause menu
-//! be one interface rather than four, and it is what makes walking between them
-//! hold still. Nothing here resizes, moves or reflows because of *where* it was
-//! opened from; when a game is paused behind the page, the only thing that
-//! changes is what is behind it.
+//! wears the same header: the wordmark, the tree over the machine in the corner, a
+//! title saying where you are, and under the rule a way back. That is what lets the
+//! library, a game's page, the settings and the pause menu be one interface rather
+//! than four, and it is what makes walking between them hold still. Nothing here
+//! resizes, moves or reflows because of *where* it was opened from; when a game is
+//! paused behind the page, the only thing that changes is what is behind it.
+//!
+//! And everything that can be chosen says so the same way — see `chip`. There is
+//! one language for "this is the one", and it is a ring.
 
 use crate::canvas::{Canvas, Color, Rect};
 use crate::font::Weight;
@@ -20,12 +23,13 @@ fn scale(cv: &Canvas) -> f32 {
     (cv.h as f32 / 800.0).clamp(0.62, 2.4)
 }
 
-/// The height of the bar's button row. The title sits below it, and the page
-/// below that — the same distances on every screen, so the page never jumps.
+/// The band the brand and the title share, the rule under it, then the bar the
+/// buttons sit in, then the page. The same distances on every screen, so nothing
+/// jumps.
+const BAND_H: f32 = 46.0;
+const BAR_DROP: f32 = 18.0;
 const BAR_H: f32 = 40.0;
-const TITLE_DROP: f32 = 18.0;
-const SUB_DROP: f32 = 38.0;
-const CONTENT_DROP: f32 = 30.0;
+const CONTENT_DROP: f32 = 26.0;
 
 pub fn paint(ui: &mut Ui, cv: &mut Canvas, over_game: bool) {
     let s = scale(cv);
@@ -84,80 +88,144 @@ fn cv_rect(cv: &Canvas) -> Rect {
     Rect::new(0.0, 0.0, cv.w as f32, cv.h as f32)
 }
 
-// ---- the bar every screen wears ---------------------------------------------
+// ---- the header every screen wears ------------------------------------------
 
-/// The way back, the title, and the room they take. Returns the rect the screen's
-/// own content gets, below it.
+/// What a screen gets back from `header`: the bar it may hang a button of its own
+/// in, and the page under it.
+struct Page {
+    bar: Rect,
+    content: Rect,
+}
+
+/// The brand, the title, the way back, and the room they take.
 ///
-/// The back button is drawn, not implied. Escape does the same thing, but a key
-/// you have to be told about is not an interface — and the line of grey hints
-/// this replaces ("Arrows move  Enter choose  Esc back") was exactly that: the
-/// exits, printed at the foot of the page, for anyone still reading.
-fn nav(
+/// The logo used to be the first two seconds of the session and then nothing: the
+/// splash faded, and what it faded into was a dark list that could have belonged to
+/// anything. So the picture that opens the window stays at the top of every screen
+/// in it — the wordmark, and in the corner the tree over the machine, both cut out
+/// of the one splash rather than redrawn as a second asset that could drift from
+/// it. Beside the wordmark, the title: where you are, said in the same breath as
+/// what this is. Under both, a rule; under that, the bar, with the way back at its
+/// left and whatever the screen itself offers at its right.
+///
+/// It is the same band, in the same place, at the same size, on the library, on a
+/// game's page, in the settings, and over a paused game — which is what makes them
+/// one interface and not four, and it is why the title lives up here rather than in
+/// a heading each screen sets for itself.
+///
+/// The back button is drawn, not implied. Escape does the same thing, but a key you
+/// have to be told about is not an interface — and the line of grey hints this
+/// replaced ("Arrows move  Enter choose  Esc back") was exactly that: the exits,
+/// printed at the foot of the page, for anyone still reading.
+fn header(
     ui: &mut Ui,
     cv: &mut Canvas,
     r: Rect,
     s: f32,
     title: &str,
     sub: Option<(&str, bool)>,
-) -> Rect {
-    if ui.has_back() {
-        // "‹" rather than a drawn chevron: it is one glyph in the font we already
-        // ship, and `back_arrow_has_a_glyph` keeps it honest.
-        let label = "‹   Back";
-        let bh = BAR_H * s;
-        let bw = ui.fonts.width(label, Weight::Bold, 15.0 * s) + 32.0 * s;
-        let btn = Rect::new(r.x, r.y, bw, bh);
-        // It answers the pointer now. It used to be painted in SURFACE_HI whatever
-        // the mouse was doing — the one colour this palette keeps for "hovered" —
-        // so the only state it could show was the one it never left. Idle is a
-        // plain surface; hovering lifts it and rings it in the accent, which is the
-        // same rise every other control makes. Not the accent *fill* a selected
-        // action gets, though: Back is outside the keyboard cursor's cycle, and two
-        // things wearing the selection at once is worse than one that never wore it.
-        let hot = ui.hovering(Hit::Back);
-        let (bg, edge) = if hot {
-            (t::SURFACE_HI, t::ACCENT)
-        } else {
-            (t::SURFACE, t::BORDER)
-        };
-        cv.rounded(btn, bh / 2.0, bg);
-        cv.stroke(btn, bh / 2.0, 1.0, edge);
-        ui.fonts.draw_centered(
-            cv,
-            label,
-            btn.x,
-            btn.w,
-            btn.y + (bh - 20.0 * s) / 2.0,
-            Weight::Bold,
-            15.0 * s,
-            t::TEXT,
-        );
-        ui.push_hot(btn, Hit::Back);
+) -> Page {
+    let rule_y = r.y + BAND_H * s;
+
+    // The mark, in the corner the splash had it in. Keyed, so its black is nothing
+    // and its dissolving edge really dissolves. It reaches *up*, into the window's
+    // margin, rather than down into the page: branding that pushes the games further
+    // down the screen every time you look at them has stopped being branding and
+    // started being furniture. And it is dropped altogether on a narrow window, where
+    // there is no corner to spare and it would only crowd the title.
+    let mut art_w = 0.0;
+    if !ui.mark.is_empty() && r.w > 560.0 * s {
+        let top = 5.0 * s;
+        let h = rule_y - top - 3.0 * s; // from just under the window's edge, to the rule
+        let w = h * ui.mark.w as f32 / ui.mark.h as f32;
+        cv.image_keyed(&ui.mark, Rect::new(r.x + r.w - w, top, w, h), 255);
+        art_w = w;
     }
 
-    let ty = r.y + (BAR_H + TITLE_DROP) * s;
-    let title = ui.fonts.elide(title, Weight::Bold, 30.0 * s, r.w * 0.7);
+    // The wordmark, standing on the rule.
+    let mut word_w = 0.0;
+    if !ui.wordmark.is_empty() {
+        let h = 30.0 * s;
+        let w = h * ui.wordmark.w as f32 / ui.wordmark.h as f32;
+        cv.image_keyed(
+            &ui.wordmark,
+            Rect::new(r.x, rule_y - h - 7.0 * s, w, h),
+            255,
+        );
+        word_w = w + 22.0 * s;
+        // A hairline between the brand and the title. They are two different things
+        // said side by side, and nothing else here is doing the job of saying so.
+        cv.fill(
+            Rect::new(r.x + word_w - 11.0 * s, rule_y - 31.0 * s, 1.0, 22.0 * s),
+            t::BORDER,
+        );
+    }
+
+    // The title, on the same line: where you are.
+    let px = 25.0 * s;
+    let room = (r.w - word_w - art_w - 24.0 * s).max(40.0 * s);
+    let title = ui.fonts.elide(title, Weight::Bold, px, room);
+    let ty = rule_y - 9.0 * s - ui.fonts.line_height(Weight::Bold, px);
     ui.fonts
-        .draw_top(cv, &title, r.x, ty, Weight::Bold, 30.0 * s, t::TEXT);
+        .draw_top(cv, &title, r.x + word_w, ty, Weight::Bold, px, t::TEXT);
+
+    // The rule, and under the wordmark its own length of it in the accent — the tab
+    // the rest of the interface hangs off.
+    cv.fill(Rect::new(r.x, rule_y, r.w, 1.0), t::BORDER);
+    cv.fill(
+        Rect::new(r.x, rule_y, (word_w - 22.0 * s).max(72.0 * s), 2.0),
+        t::ACCENT,
+    );
+
+    // The bar: the way back, and room for the screen's own button opposite it.
+    let bar = Rect::new(r.x, rule_y + BAR_DROP * s, r.w, BAR_H * s);
+    let mut sub_x = r.x;
+    if ui.has_back() {
+        // "‹" rather than a drawn chevron: it is one glyph in the font we already
+        // ship, and `the_back_arrow_has_a_glyph` keeps it honest.
+        //
+        // It is never *chosen* — Back is outside the keyboard cursor's cycle — so the
+        // only state it has beyond idle is the pointer being on it, which is the same
+        // rise every other control makes.
+        let label = "‹   Back";
+        let bw = ui.fonts.width(label, Weight::Bold, 15.0 * s) + 32.0 * s;
+        chip(
+            ui,
+            cv,
+            Rect::new(bar.x, bar.y, bw, bar.h),
+            s,
+            Chip::pill(label, Hit::Back),
+        );
+        sub_x += bw + 20.0 * s;
+    }
+
+    // And what the screen has to say for itself, beside it: how many games there
+    // are, whether one of them is paused, which game the settings belong to.
     if let Some((text, accent)) = sub {
-        let text = ui.fonts.elide(text, Weight::Regular, 14.5 * s, r.w * 0.8);
+        let px = 14.5 * s;
+        let text = ui
+            .fonts
+            .elide(text, Weight::Regular, px, r.w - (sub_x - r.x));
+        let y = bar.y + (bar.h - ui.fonts.line_height(Weight::Regular, px)) / 2.0;
         ui.fonts.draw_top(
             cv,
             &text,
-            r.x,
-            ty + SUB_DROP * s,
+            sub_x,
+            y,
             Weight::Regular,
-            14.5 * s,
+            px,
             if accent { t::ACCENT } else { t::TEXT_DIM },
         );
     }
 
-    // The content starts at the same y whether or not there was a subtitle: a
-    // page that shifted up when its subtitle went away would be a page that moves
-    // for no reason the player can see.
-    let top = ty + (SUB_DROP + CONTENT_DROP) * s;
-    Rect::new(r.x, top, r.w, (r.y + r.h - top).max(0.0))
+    // The content starts at the same y whether or not there was a subtitle, and
+    // whether or not there was a way back: a page that shifted because of what was
+    // above it would be a page that moves for no reason the player can see.
+    let top = bar.y + bar.h + CONTENT_DROP * s;
+    Page {
+        bar,
+        content: Rect::new(r.x, top, r.w, (r.y + r.h - top).max(0.0)),
+    }
 }
 
 // ---- the question asked before anything cannot be undone ---------------------
@@ -168,7 +236,9 @@ fn paint_confirm(ui: &mut Ui, cv: &mut Canvas, screen: Rect, s: f32) {
     cv.fill(screen, t::SCRIM);
 
     let w = (540.0 * s).min(screen.w - 40.0 * s);
-    let h = 232.0 * s;
+    // As tall as what it has to say, and no taller: a fixed height left a question
+    // with no note sitting in a box a third of which was nothing.
+    let h = if c.note.is_some() { 204.0 } else { 180.0 } * s;
     let d = Rect::new((screen.w - w) / 2.0, (screen.h - h) / 2.0, w, h);
     shadow(cv, d, t::RADIUS * 1.6, 20.0 * s);
     cv.rounded(d, t::RADIUS * 1.6, t::SURFACE);
@@ -217,55 +287,159 @@ fn paint_confirm(ui: &mut Ui, cv: &mut Canvas, screen: Rect, s: f32) {
     let yes = Rect::new(d.x + d.w - 28.0 * s - yes_w, by, yes_w, bh);
     let no = Rect::new(yes.x - 10.0 * s - no_w, by, no_w, bh);
 
-    // Whichever button holds the focus is the filled one — and the destructive
-    // answer wears the warning colour only when it is the one that is armed.
+    // Whichever answer holds the focus wears the ring. The destructive one is red
+    // whether it is armed or not: which of the two throws something away is not a
+    // fact about where the cursor happens to be.
     let on = c.yes_focused;
-    let hot = if c.danger { t::DANGER } else { t::ACCENT };
-    let ink = if c.danger {
-        Color::rgb(0xFF, 0xF2, 0xF5)
-    } else {
-        Color::rgb(0x1A, 0x0C, 0x14)
-    };
-    button(ui, cv, yes, s, &c.yes, on, hot, ink);
-    ui.push_hot(yes, Hit::ConfirmYes);
-    button(
+    chip(
+        ui,
+        cv,
+        yes,
+        s,
+        Chip {
+            on,
+            danger: c.danger,
+            ..Chip::new(&c.yes, Hit::ConfirmYes)
+        },
+    );
+    chip(
         ui,
         cv,
         no,
         s,
-        "Cancel",
-        !on,
-        t::ACCENT,
-        Color::rgb(0x1A, 0x0C, 0x14),
+        Chip {
+            on: !on,
+            ..Chip::new("Cancel", Hit::ConfirmNo)
+        },
     );
-    ui.push_hot(no, Hit::ConfirmNo);
 }
 
-/// A pill with a label: filled and inked when it holds the focus, quiet when it
-/// does not.
-#[allow(clippy::too_many_arguments)]
-fn button(
-    ui: &mut Ui,
-    cv: &mut Canvas,
-    r: Rect,
-    s: f32,
-    label: &str,
+// ---- the one way anything here says "this one" ------------------------------
+
+/// A pressable thing: the way back, an action, an answer to a question.
+///
+/// Everything that can be pressed is drawn by `chip`, and everything that can be
+/// *chosen* says so the same way: the surface lifts, the hairline round it becomes
+/// the accent and thickens, and the label goes with it. Nothing is ever filled with
+/// the accent.
+///
+/// It used to be filled. The library's cards marked the cursor with a ring while
+/// the buttons an inch away marked it with a slab of solid pink, so the same
+/// keypress meant "this one" in two different visual languages depending on which
+/// half of the screen it landed in — and the slab, being the loudest thing on the
+/// page, read as a thing that had already happened rather than a thing you were
+/// about to do.
+struct Chip<'a> {
+    label: &'a str,
+    /// What pressing it means — and, since the pointer is hit-tested against what
+    /// was painted, how it knows the pointer is on it.
+    hit: Hit,
+    /// The cursor is on it.
     on: bool,
-    fill: Color,
-    ink: Color,
-) {
-    cv.rounded(r, 8.0, if on { fill } else { t::SURFACE_HI });
-    cv.stroke(r, 8.0, 1.0, if on { fill } else { t::BORDER });
-    ui.fonts.draw_centered(
+    enabled: bool,
+    /// The destructive answer. Red at rest, red when chosen; never anywhere else.
+    danger: bool,
+    /// Centred (a button) or set in from the left (a row of a column).
+    centered: bool,
+    /// Label size and corner radius, before the window's scale.
+    px: f32,
+    radius: f32,
+}
+
+impl<'a> Chip<'a> {
+    fn new(label: &'a str, hit: Hit) -> Chip<'a> {
+        Chip {
+            label,
+            hit,
+            on: false,
+            enabled: true,
+            danger: false,
+            centered: true,
+            px: 15.0,
+            radius: 8.0,
+        }
+    }
+    /// The pill in the bar — Back, Add game.
+    fn pill(label: &'a str, hit: Hit) -> Chip<'a> {
+        Chip {
+            radius: BAR_H / 2.0,
+            ..Chip::new(label, hit)
+        }
+    }
+}
+
+fn chip(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32, c: Chip) {
+    let tone = if c.danger { t::DANGER } else { t::ACCENT };
+    // Four states, and they have to be four *different* ones. Back was painted in
+    // SURFACE_HI whatever the mouse was doing — the one colour this palette keeps
+    // for "the pointer is here" — so the only state it could show was the one it
+    // never left.
+    let (bg, edge, wide, ink) = if !c.enabled {
+        (
+            t::SURFACE.alpha(110),
+            t::BORDER.alpha(120),
+            1.0,
+            t::TEXT_OFF,
+        )
+    } else if c.on {
+        (t::SURFACE_HI, tone, 2.0, tone)
+    } else if ui.hovering(c.hit) {
+        (t::SURFACE_HI, tone.alpha(150), 1.0, t::TEXT)
+    } else {
+        (
+            t::SURFACE,
+            t::BORDER,
+            1.0,
+            if c.danger { t::DANGER } else { t::TEXT },
+        )
+    };
+    let px = c.px * s;
+    let radius = c.radius * s;
+    cv.rounded(r, radius, bg);
+    cv.stroke(r, radius, wide, edge);
+
+    let y = r.y + (r.h - ui.fonts.line_height(Weight::Bold, px)) / 2.0;
+    let label = ui.fonts.elide(c.label, Weight::Bold, px, r.w - 24.0 * s);
+    if c.centered {
+        ui.fonts
+            .draw_centered(cv, &label, r.x, r.w, y, Weight::Bold, px, ink);
+    } else {
+        ui.fonts
+            .draw_top(cv, &label, r.x + 16.0 * s, y, Weight::Bold, px, ink);
+    }
+    ui.push_hot(r, c.hit);
+}
+
+/// A row of a list — a program on a game's disk, a file in a bundle.
+///
+/// The same sentence as `chip`, said quietly: a list is mostly rows you are *not*
+/// on, and giving each of them a hairline of its own turns a menu into a stack of
+/// boxes. So an unchosen row is nothing at all, and the chosen one wears exactly
+/// the ring a chip does.
+fn row(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32, label: &str, hit: Hit, on: bool) {
+    let hot = ui.hovering(hit);
+    if on || hot {
+        cv.rounded(r, 8.0 * s, t::SURFACE_HI);
+        cv.stroke(
+            r,
+            8.0 * s,
+            if on { 2.0 } else { 1.0 },
+            if on { t::ACCENT } else { t::ACCENT.alpha(150) },
+        );
+    }
+    let px = 15.0 * s;
+    let label = ui.fonts.elide(label, Weight::Regular, px, r.w - 28.0 * s);
+    let y = r.y + (r.h - ui.fonts.line_height(Weight::Regular, px)) / 2.0;
+    ui.fonts.draw_top(
         cv,
-        label,
-        r.x,
-        r.w,
-        r.y + (r.h - 20.0 * s) / 2.0,
-        Weight::Bold,
-        15.0 * s,
-        if on { ink } else { t::TEXT },
+        &label,
+        r.x + 14.0 * s,
+        y,
+        Weight::Regular,
+        px,
+        if on { t::ACCENT } else { t::TEXT },
     );
+    ui.push_hot(r, hit);
 }
 
 // ---- the card menu, and the programs on a game's disk -----------------------
@@ -276,7 +450,10 @@ fn button(
 ///
 /// The way out is a *button*. A sheet covers the page's back button, so it has to
 /// bring one of its own — otherwise the only exit is a key nobody mentioned.
-/// Returns the row rects, in order, for the caller to hang its hits on.
+///
+/// `hit` says what a row *is*, which the sheet needs and not just its caller: a row
+/// that only learns its meaning after it has been painted cannot know the pointer
+/// is on it.
 #[allow(clippy::too_many_arguments)]
 fn sheet(
     ui: &mut Ui,
@@ -288,7 +465,8 @@ fn sheet(
     rows: &[String],
     sel: usize,
     cancel: &str,
-) -> Vec<Rect> {
+    hit: impl Fn(usize) -> Hit,
+) {
     cv.fill(screen, t::SCRIM);
 
     let rh = 46.0 * s;
@@ -331,7 +509,6 @@ fn sheet(
         );
     }
 
-    let mut out = Vec::with_capacity(rows.len());
     for (i, label) in rows.iter().enumerate() {
         let r = Rect::new(
             d.x + 12.0 * s,
@@ -339,32 +516,14 @@ fn sheet(
             d.w - 24.0 * s,
             rh - 6.0 * s,
         );
-        let on = i == sel;
-        if on {
-            cv.rounded(r, 8.0, t::SURFACE_HI);
-            cv.stroke(r, 8.0, 1.0, t::ACCENT);
-        }
-        let label = ui
-            .fonts
-            .elide(label, Weight::Regular, 15.0 * s, r.w - 26.0 * s);
-        ui.fonts.draw_top(
-            cv,
-            &label,
-            r.x + 13.0 * s,
-            r.y + 11.0 * s,
-            Weight::Regular,
-            15.0 * s,
-            if on { t::TEXT } else { t::TEXT_DIM },
-        );
-        out.push(r);
+        let label = label.clone();
+        row(ui, cv, r, s, &label, hit(i), i == sel);
     }
 
     let bh = 40.0 * s;
     let bw = ui.fonts.width(cancel, Weight::Bold, 15.0 * s) + 40.0 * s;
     let btn = Rect::new(d.x + d.w - 24.0 * s - bw, d.y + d.h - bh - 18.0 * s, bw, bh);
-    button(ui, cv, btn, s, cancel, false, t::ACCENT, t::TEXT);
-    ui.push_hot(btn, Hit::SheetCancel);
-    out
+    chip(ui, cv, btn, s, Chip::pill(cancel, Hit::SheetCancel));
 }
 
 /// Everything you can do to a game that is not playing it.
@@ -375,10 +534,18 @@ fn paint_card_menu(ui: &mut Ui, cv: &mut Canvas, screen: Rect, s: f32) {
     let rows: Vec<String> = ui.menu_items(i).into_iter().map(str::to_string).collect();
     let sel = ui.menu_idx.min(rows.len().saturating_sub(1));
 
-    let hits = sheet(ui, cv, screen, s, &title, None, &rows, sel, "Close");
-    for (i, r) in hits.into_iter().enumerate() {
-        ui.push_hot(r, Hit::MenuItem(i));
-    }
+    sheet(
+        ui,
+        cv,
+        screen,
+        s,
+        &title,
+        None,
+        &rows,
+        sel,
+        "Close",
+        Hit::MenuItem,
+    );
 }
 
 /// The other programs on the game's disk — its setup, its installer.
@@ -396,7 +563,7 @@ fn paint_pick_program(ui: &mut Ui, cv: &mut Canvas, screen: Rect, s: f32) {
 
     // "Back", not "Close": this opened from the card menu, and that is where
     // leaving it lands.
-    let hits = sheet(
+    sheet(
         ui,
         cv,
         screen,
@@ -406,10 +573,8 @@ fn paint_pick_program(ui: &mut Ui, cv: &mut Canvas, screen: Rect, s: f32) {
         &rows,
         sel,
         "Back",
+        Hit::Program,
     );
-    for (i, r) in hits.into_iter().enumerate() {
-        ui.push_hot(r, Hit::Program(i));
-    }
 }
 
 /// Three dots — the button that means "and the rest". Drawn from rectangles:
@@ -456,7 +621,11 @@ fn paint_library(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
         Some(i) => format!("{count}  ·  {} is paused", ui.games[i].title),
         None => count,
     };
-    let inner = nav(ui, cv, r, s, "Saisei", Some((&sub, ui.in_game())));
+    // "Library", not "Saisei": the wordmark beside it already says what this is, on
+    // this screen and every other, and a page whose title is the name of the program
+    // is a page that has not said where you are.
+    let page = header(ui, cv, r, s, "Library", Some((&sub, ui.in_game())));
+    let inner = page.content;
 
     // Add game: a real button, in the bar, always on screen.
     //
@@ -465,37 +634,18 @@ fn paint_library(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
     // entirely, so the one way to add a game was the one thing you couldn't see.
     // Up here it is never scrolled away and never competes with the games.
     if ui.can_edit_library() {
-        let add_sel = ui.game == n;
         let label = "+  Add game";
-        let bh = BAR_H * s;
         let bw = ui.fonts.width(label, Weight::Bold, 15.0 * s) + 34.0 * s;
-        let btn = Rect::new(r.x + r.w - bw, r.y, bw, bh);
-        cv.rounded(
-            btn,
-            bh / 2.0,
-            if add_sel { t::ACCENT } else { t::SURFACE_HI },
-        );
-        cv.stroke(
-            btn,
-            bh / 2.0,
-            1.0,
-            if add_sel { t::ACCENT } else { t::BORDER },
-        );
-        ui.fonts.draw_centered(
+        chip(
+            ui,
             cv,
-            label,
-            btn.x,
-            btn.w,
-            btn.y + (bh - 20.0 * s) / 2.0,
-            Weight::Bold,
-            15.0 * s,
-            if add_sel {
-                Color::rgb(0x1A, 0x0C, 0x14)
-            } else {
-                t::TEXT
+            Rect::new(page.bar.x + page.bar.w - bw, page.bar.y, bw, page.bar.h),
+            s,
+            Chip {
+                on: ui.game == n,
+                ..Chip::pill(label, Hit::Add)
             },
         );
-        ui.push_hot(btn, Hit::Add);
     }
 
     let top = inner.y;
@@ -682,7 +832,7 @@ fn paint_game(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
     } else {
         format!("{saves} save{}", if saves == 1 { "" } else { "s" })
     };
-    let inner = nav(ui, cv, r, s, &title, Some((&sub, paused)));
+    let inner = header(ui, cv, r, s, &title, Some((&sub, paused))).content;
 
     // Actions.
     let col_w = (300.0 * s).min(inner.w * 0.42);
@@ -690,28 +840,20 @@ fn paint_game(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
     let bh = 46.0 * s;
     let labels = ui.actions();
     for (i, label) in labels.iter().enumerate() {
-        let row = Rect::new(inner.x, y, col_w, bh);
-        let enabled = ui.action_enabled(i);
-        let sel = ui.focus == Focus::Actions && ui.action == i;
-        let (bg, fg) = match (enabled, sel) {
-            (false, _) => (t::SURFACE.alpha(110), t::TEXT_OFF),
-            (true, true) => (t::ACCENT, Color::rgb(0x1A, 0x0C, 0x14)),
-            (true, false) => (t::SURFACE_HI, t::TEXT),
-        };
-        cv.rounded(row, t::RADIUS, bg);
-        if sel && enabled {
-            cv.stroke(row, t::RADIUS, 1.0, t::ACCENT);
-        }
-        ui.fonts.draw_top(
+        chip(
+            ui,
             cv,
-            label,
-            row.x + 16.0 * s,
-            row.y + (bh - 20.0 * s) / 2.0,
-            Weight::Bold,
-            16.0 * s,
-            fg,
+            Rect::new(inner.x, y, col_w, bh),
+            s,
+            Chip {
+                on: ui.focus == Focus::Actions && ui.action == i,
+                enabled: ui.action_enabled(i),
+                centered: false,
+                px: 16.0,
+                radius: t::RADIUS,
+                ..Chip::new(label, Hit::Action(i))
+            },
         );
-        ui.push_hot(row, Hit::Action(i));
         y += bh + 10.0 * s;
     }
 
@@ -857,7 +999,7 @@ fn paint_settings(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
         .get(ui.game)
         .map(|g| g.title.clone())
         .unwrap_or_default();
-    let inner = nav(ui, cv, r, s, "Settings", Some((&game, true)));
+    let inner = header(ui, cv, r, s, "Settings", Some((&game, true))).content;
 
     let col_w = (380.0 * s).min(inner.w);
     paint_volume(ui, cv, Rect::new(inner.x, inner.y, col_w, 44.0 * s), s);
@@ -883,7 +1025,7 @@ fn paint_add(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
     } else {
         "Drop a game's zip or folder anywhere on this window."
     };
-    let inner = nav(ui, cv, r, s, "Add a game", Some((sub, false)));
+    let inner = header(ui, cv, r, s, "Add a game", Some((sub, false))).content;
 
     if picking {
         let row_h = 40.0 * s;
@@ -893,24 +1035,9 @@ fn paint_add(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
             if y + row_h > inner.y + inner.h {
                 break;
             }
-            let row = Rect::new(inner.x, y, w, row_h);
-            let sel = ui.add.exe_idx == i;
-            cv.rounded(row, 8.0, if sel { t::ACCENT } else { t::SURFACE_HI });
             let name = ui.add.exes[i].clone();
-            ui.fonts.draw_top(
-                cv,
-                &name,
-                row.x + 14.0 * s,
-                row.y + (row_h - 18.0 * s) / 2.0,
-                Weight::Bold,
-                15.0 * s,
-                if sel {
-                    Color::rgb(0x1A, 0x0C, 0x14)
-                } else {
-                    t::TEXT
-                },
-            );
-            ui.push_hot(row, Hit::Exe(i));
+            let r = Rect::new(inner.x, y, w, row_h);
+            row(ui, cv, r, s, &name, Hit::Exe(i), ui.add.exe_idx == i);
         }
         return;
     }
@@ -947,19 +1074,16 @@ fn paint_add(ui: &mut Ui, cv: &mut Canvas, r: Rect, s: f32) {
     let paste_w = ui.fonts.width("Paste", Weight::Bold, 14.5 * s) + 30.0 * s;
     let field = Rect::new(inner.x, fy + 26.0 * s, well.w - paste_w - 8.0 * s, 44.0 * s);
     let paste = Rect::new(field.x + field.w + 8.0 * s, field.y, paste_w, field.h);
-    cv.rounded(paste, 8.0, t::SURFACE_HI);
-    cv.stroke(paste, 8.0, 1.0, t::BORDER);
-    ui.fonts.draw_centered(
+    chip(
+        ui,
         cv,
-        "Paste",
-        paste.x,
-        paste.w,
-        paste.y + 12.0 * s,
-        Weight::Bold,
-        14.5 * s,
-        t::TEXT,
+        paste,
+        s,
+        Chip {
+            px: 14.5,
+            ..Chip::new("Paste", Hit::Paste)
+        },
     );
-    ui.push_hot(paste, Hit::Paste);
 
     cv.rounded(field, 8.0, t::SURFACE_HI);
     cv.stroke(field, 8.0, 1.0, t::ACCENT.alpha(160));

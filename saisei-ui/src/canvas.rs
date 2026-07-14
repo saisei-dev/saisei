@@ -79,6 +79,54 @@ impl Image {
     pub fn is_empty(&self) -> bool {
         self.w == 0 || self.h == 0
     }
+
+    /// A sub-rectangle of this image, clamped to its bounds.
+    pub fn crop(&self, x: usize, y: usize, w: usize, h: usize) -> Image {
+        let x0 = x.min(self.w);
+        let y0 = y.min(self.h);
+        let w = w.min(self.w - x0);
+        let h = h.min(self.h - y0);
+        let mut rgb = Vec::with_capacity(w * h * 3);
+        for row in y0..y0 + h {
+            let s = (row * self.w + x0) * 3;
+            rgb.extend_from_slice(&self.rgb[s..s + w * 3]);
+        }
+        Image { w, h, rgb }
+    }
+
+    /// The same image, box-filtered down to `h` pixels tall (or returned as it is,
+    /// if it is already smaller).
+    ///
+    /// The brand art is cut out of a 1402px splash and drawn a hundred pixels tall.
+    /// Resampling the full-size source on every frame of a menu would be a megabyte
+    /// of reads per frame for a picture that never changes; this is done once.
+    pub fn scaled_to_height(&self, h: usize) -> Image {
+        if self.is_empty() || self.h <= h || h == 0 {
+            return self.clone();
+        }
+        let w = (self.w * h / self.h).max(1);
+        let mut rgb = Vec::with_capacity(w * h * 3);
+        for dy in 0..h {
+            let (sy0, sy1) = (dy * self.h / h, ((dy + 1) * self.h).div_ceil(h).min(self.h));
+            for dx in 0..w {
+                let (sx0, sx1) = (dx * self.w / w, ((dx + 1) * self.w).div_ceil(w).min(self.w));
+                let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
+                for sy in sy0..sy1.max(sy0 + 1) {
+                    for sx in sx0..sx1.max(sx0 + 1) {
+                        let s = (sy * self.w + sx) * 3;
+                        r += self.rgb[s] as u32;
+                        g += self.rgb[s + 1] as u32;
+                        b += self.rgb[s + 2] as u32;
+                        n += 1;
+                    }
+                }
+                rgb.push((r / n) as u8);
+                rgb.push((g / n) as u8);
+                rgb.push((b / n) as u8);
+            }
+        }
+        Image { w, h, rgb }
+    }
 }
 
 pub struct Canvas {
@@ -223,12 +271,42 @@ impl Canvas {
         let dw = (img.w as f32 * scale).max(1.0);
         let dh = (img.h as f32 * scale).max(1.0);
         let dst = Rect::new(r.x + (r.w - dw) / 2.0, r.y + (r.h - dh) / 2.0, dw, dh);
-        self.image_stretch(img, dst, alpha);
+        self.blit(img, dst, alpha, false);
+        dst
+    }
+
+    /// Draw `img` fitted into `r` with its black keyed out: each pixel's coverage
+    /// is its own brightness, so the darkest parts of the picture are the parts you
+    /// can see through.
+    ///
+    /// Every piece of the logo is pixel art painted on black — which is a *shape*,
+    /// drawn on nothing, and not a black tile with a tree in it. Blitted flat, the
+    /// header's mark would be a black rectangle sitting on the page, and worse over
+    /// a paused game, where the page is not black. Keyed, it lands as the thing
+    /// itself, and its dissolving edge pixels fade out instead of stopping at a
+    /// border.
+    ///
+    /// Returns the rect the image actually covered.
+    pub fn image_keyed(&mut self, img: &Image, r: Rect, alpha: u8) -> Rect {
+        if img.is_empty() || r.w <= 0.0 || r.h <= 0.0 {
+            return Rect::default();
+        }
+        let scale = (r.w / img.w as f32).min(r.h / img.h as f32);
+        let dw = (img.w as f32 * scale).max(1.0);
+        let dh = (img.h as f32 * scale).max(1.0);
+        let dst = Rect::new(r.x + (r.w - dw) / 2.0, r.y + (r.h - dh) / 2.0, dw, dh);
+        self.blit(img, dst, alpha, true);
         dst
     }
 
     /// Draw `img` stretched to exactly `r`.
     pub fn image_stretch(&mut self, img: &Image, r: Rect, alpha: u8) {
+        self.blit(img, r, alpha, false);
+    }
+
+    /// The one blit. `keyed` takes each pixel's coverage from its own brightness
+    /// rather than covering the destination outright.
+    fn blit(&mut self, img: &Image, r: Rect, alpha: u8, keyed: bool) {
         if img.is_empty() || r.w <= 0.0 || r.h <= 0.0 {
             return;
         }
@@ -254,7 +332,15 @@ impl Canvas {
                     }
                 }
                 let c = Color((r_ / n) as u8, (g_ / n) as u8, (b_ / n) as u8, alpha);
-                self.blend(ox + dx as i32, oy + dy as i32, c, 1.0);
+                // The value channel, not a luminance: the blossom is saturated pink
+                // and the machine is cream, and weighting those by how *bright* a
+                // human finds them would thin the tree out and leave the PC solid.
+                let cov = if keyed {
+                    c.0.max(c.1).max(c.2) as f32 / 255.0
+                } else {
+                    1.0
+                };
+                self.blend(ox + dx as i32, oy + dy as i32, c, cov);
             }
         }
     }
@@ -337,6 +423,57 @@ mod tests {
         // Inside the band: the image. Above it: untouched.
         assert_eq!(at(&c, 20, 20), Color::rgb(200, 200, 200));
         assert_eq!(at(&c, 20, 2), Color::rgb(0, 0, 0));
+    }
+
+    #[test]
+    fn a_keyed_image_lets_its_black_through() {
+        // The logo is a shape painted on black, not a black picture. Keyed, it is
+        // drawn as *light*: its black is nothing at all, and a lit pixel covers the
+        // page in proportion to how lit it is. (So even the brightest is a shade shy
+        // of opaque, which is the point — the page keeps showing faintly through the
+        // art, rather than the art punching a hole in the page.)
+        let img = Image {
+            w: 2,
+            h: 1,
+            rgb: vec![0, 0, 0, 0xE8, 0x7B, 0xA8],
+        };
+        let mut c = Canvas::new(2, 1);
+        c.clear(Color::rgb(0, 0, 255));
+        c.image_keyed(&img, Rect::new(0.0, 0.0, 2.0, 1.0), 255);
+        assert_eq!(at(&c, 0, 0), Color::rgb(0, 0, 255), "the black was painted");
+        let lit = at(&c, 1, 0);
+        assert!(
+            lit.0 > 0xD0 && lit.1 > 0x60 && (lit.2 as i32 - 0xA8).abs() < 20,
+            "the blossom should land as itself, got {lit:?}"
+        );
+
+        // Flat, the same image lays its black down over the blue — which is what a
+        // header drawn this way would have put in the corner of every screen.
+        c.clear(Color::rgb(0, 0, 255));
+        c.image_stretch(&img, Rect::new(0.0, 0.0, 2.0, 1.0), 255);
+        assert_eq!(at(&c, 0, 0), Color::rgb(0, 0, 0));
+    }
+
+    #[test]
+    fn a_crop_takes_the_rectangle_it_asked_for_and_scaling_keeps_the_aspect() {
+        // A 4x2 image, left half red and right half green.
+        let mut rgb = Vec::new();
+        for _ in 0..2 {
+            rgb.extend_from_slice(&[255, 0, 0, 255, 0, 0, 0, 255, 0, 0, 255, 0]);
+        }
+        let img = Image { w: 4, h: 2, rgb };
+
+        let right = img.crop(2, 0, 2, 2);
+        assert_eq!((right.w, right.h), (2, 2));
+        assert!(right.rgb.chunks_exact(3).all(|p| p == [0, 255, 0]));
+
+        // Clamped, not panicking, when the rect runs off the edge.
+        assert_eq!(img.crop(3, 1, 99, 99).w, 1);
+
+        let small = img.crop(0, 0, 4, 2).scaled_to_height(1);
+        assert_eq!((small.w, small.h), (2, 1));
+        // Nothing to do for an image already at or under the height.
+        assert_eq!(small.scaled_to_height(4).h, 1);
     }
 
     #[test]

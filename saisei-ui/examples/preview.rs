@@ -77,7 +77,11 @@ fn main() {
     .collect();
     let dir = std::env::args().nth(1).unwrap();
 
-    let mut u = Ui::new(Image::default(), games);
+    // The real splash, because the header is cut out of it: a preview drawn with no
+    // logo is a preview of a different interface.
+    let logo = Image::decode_png(include_bytes!("../../runtime/assets/saisei_logo.png"))
+        .expect("the splash must decode");
+    let mut u = Ui::new(logo, games);
     shot(&mut u, &dir, "library", false);
 
     u.key(Key::Enter); // open Zeliard
@@ -86,6 +90,11 @@ fn main() {
     // Paused: the same page, in the same place, over the frozen frame.
     u.open_overlay(0, true);
     shot(&mut u, &dir, "paused", true);
+
+    // The one screen with a control on it that is neither a button nor a list.
+    u.screen = Screen::Settings;
+    shot(&mut u, &dir, "settings", true);
+    u.screen = Screen::Game;
 
     // ...and the library, reached from it. Same bar, same cards, same geometry —
     // the game is still sitting there, and the card says so.

@@ -141,17 +141,34 @@ same library over a paused game. The runtime owns the SDL surface it paints onto
 (`saisei_ui_*` in `runtime/src/sdl.rs`).
 
 - **One page, one size, one place.** Every screen is laid out in the same rect —
-  the window, less a margin — and wears the same bar: a **drawn** back button and
-  a title saying where you are. Between a screen with a game paused behind it and
-  the same screen without, the *only* difference is the backdrop (`t::SCRIM` over
-  the frozen frame, vs the page's own gradient). This is what killed the old
-  floating overlay panel: a panel is a different size and shape from the library,
-  so every step between them resized the thing under the player's cursor. Two
-  tests hold the line — `the_frame_never_moves_between_screens` and
-  `every_screen_but_the_root_library_draws_a_way_back`. Escape and F12 are
-  shortcuts for the back button, never the only way out: the line of grey hints
-  that used to sit at the foot of each page ("Arrows move  Enter choose  Esc
-  back") *was* the exits, printed for anyone still reading.
+  the window, less a margin — and wears the same header (`view::header`): the
+  wordmark, the tree-over-the-machine in the corner, a title saying where you are,
+  a rule, and under it a **drawn** back button. Between a screen with a game paused
+  behind it and the same screen without, the *only* difference is the backdrop
+  (`t::SCRIM` over the frozen frame, vs the page's own gradient). This is what
+  killed the old floating overlay panel: a panel is a different size and shape from
+  the library, so every step between them resized the thing under the player's
+  cursor. Three tests hold the line — `the_frame_never_moves_between_screens`,
+  `every_screen_but_the_root_library_draws_a_way_back` and
+  `the_brand_is_on_every_screen`. Escape and F12 are shortcuts for the back button,
+  never the only way out: the line of grey hints that used to sit at the foot of
+  each page ("Arrows move  Enter choose  Esc back") *was* the exits, printed for
+  anyone still reading.
+- **The brand is the splash, cut in two — never a second asset.** `Ui::new` cuts
+  the wordmark and the mark out of the one `saisei_logo.png` the splash is baked
+  from (`MARK_BOX`/`WORDMARK_BOX`, fractions, checked against the real file by
+  `the_header_is_cut_from_the_logo`: the boxes must not overlap and the cut must run
+  through the band of black *between* the tree and the word). Both are drawn keyed
+  (`Canvas::image_keyed`): pixel art on black is a shape drawn on nothing, so a
+  pixel's own brightness is its coverage — blitted flat, the header would put a
+  black tile in the corner of every screen, and a visible one over a paused game.
+- **One thing means "this one": a ring, never a fill.** Everything pressable is
+  `view::chip` (or `view::row` for a list); idle is a plain surface with a hairline,
+  the pointer lifts it, and the *chosen* one gets a 2px accent ring and an accent
+  label. Nothing is filled with the accent — the library's cards marked the cursor
+  with a ring while the buttons an inch away marked it with a slab of solid pink, so
+  the same keypress meant "this one" in two visual languages depending on where it
+  landed. `a_selection_is_a_ring_and_never_a_slab` holds it.
 - **Nothing irreversible happens without an answer** (`Ui::request_launch`,
   `offer_delete` → one `Confirm`, which carries the `Action` it is asking about so
   a yes cannot drift from the words on screen). Every confirmation opens with the

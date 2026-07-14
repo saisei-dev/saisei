@@ -7,12 +7,19 @@
 //! crate and not a pile of drawing code inside the player: there is exactly one
 //! interface, used twice.
 //!
-//! Two rules the whole thing is built around.
+//! Three rules the whole thing is built around.
 //!
-//! **Every screen carries its own way back.** A button in the corner, and a title
-//! saying where you are. Escape and F12 still work, but they are shortcuts for
-//! that button — not the only door, spelled out in a line of grey text at the
-//! foot of the page that you have to read before you can leave.
+//! **Every screen carries its own way back, and wears the same brand.** The
+//! wordmark and the tree the splash opened with, a title saying where you are, and
+//! a button in the corner to leave by. Escape and F12 still work, but they are
+//! shortcuts for that button — not the only door, spelled out in a line of grey
+//! text at the foot of the page that you have to read before you can leave.
+//!
+//! **One thing means "this one".** A ring in the accent, on a lifted surface,
+//! whether it is a card in the library, an action on a game's page, a row of a menu
+//! or an answer to a question. Nothing is filled with the accent: a solid pink slab
+//! and a ringed card are two languages for the same sentence, and this used to speak
+//! both, a few inches apart.
 //!
 //! **Nothing irreversible happens without an answer.** Going to the library from
 //! a paused game does not end it: the library is a screen *over* the game, the
@@ -187,6 +194,14 @@ enum Hit {
 pub struct Ui {
     pub fonts: Fonts,
     pub logo: Image,
+    /// The two halves of the logo, cut out of it once, for the bar every screen
+    /// wears: the wordmark, and the tree over the machine.
+    ///
+    /// They are not separate assets. The splash is one picture — the tree, the PC,
+    /// and `saisei` set underneath it — and the header is that same picture, taken
+    /// apart. A second file would be a second thing to keep in step with the first.
+    pub wordmark: Image,
+    pub mark: Image,
     pub games: Vec<GameView>,
     pub screen: Screen,
     /// The game the cursor is on in the library, and the subject of the Game page.
@@ -242,10 +257,33 @@ pub struct Ui {
     scroll: usize,
 }
 
+/// Where in the splash each half of it is.
+///
+/// Fractions, not pixels, so the art can be re-exported at another size without
+/// this going quietly wrong; measured off `runtime/assets/saisei_logo.png`, whose
+/// tree sits at (64, 63)–(1370, 845) of 1402x1122 and whose wordmark sits at
+/// (224, 850)–(1114, 1018), with the band of black between them that makes the cut
+/// obvious. `the_header_is_cut_from_the_logo` holds it to that.
+const MARK_BOX: [f32; 4] = [0.045, 0.055, 0.932, 0.700];
+const WORDMARK_BOX: [f32; 4] = [0.159, 0.757, 0.636, 0.155];
+
+/// Cut a box out of `img` and shrink it to something a header can afford to draw
+/// every frame.
+fn cut(img: &Image, [x, y, w, h]: [f32; 4], tall: usize) -> Image {
+    if img.is_empty() {
+        return Image::default();
+    }
+    let px = |f: f32, of: usize| (f * of as f32).round() as usize;
+    img.crop(px(x, img.w), px(y, img.h), px(w, img.w), px(h, img.h))
+        .scaled_to_height(tall)
+}
+
 impl Ui {
     pub fn new(logo: Image, games: Vec<GameView>) -> Ui {
         Ui {
             fonts: Fonts::new(),
+            wordmark: cut(&logo, WORDMARK_BOX, 96),
+            mark: cut(&logo, MARK_BOX, 256),
             logo,
             games,
             screen: Screen::Library,
@@ -1270,6 +1308,171 @@ mod tests {
             .find(|(_, x)| *x == h)
             .unwrap_or_else(|| panic!("{h:?} was never painted"))
             .0
+    }
+
+    /// The real splash — the one the player hands the UI at startup. The header is
+    /// cut out of *this* file, so a test that cut up a stand-in would be checking
+    /// nothing.
+    fn logo() -> Image {
+        Image::decode_png(include_bytes!("../../runtime/assets/saisei_logo.png"))
+            .expect("the splash must decode")
+    }
+
+    /// How much of a rect has anything drawn in it, as a fraction of its pixels.
+    fn ink(cv: &Canvas, r: Rect) -> f32 {
+        let (mut lit, mut n) = (0, 0);
+        for y in r.y as usize..(r.y + r.h) as usize {
+            for x in r.x as usize..(r.x + r.w) as usize {
+                let i = (y * cv.w + x) * 4;
+                // Against the page itself, not against black: the backdrop is a very
+                // dark plum, and counting *that* as ink would pass on an empty screen.
+                if cv.px[i] as u32 + cv.px[i + 1] as u32 + cv.px[i + 2] as u32 > 0x60 {
+                    lit += 1;
+                }
+                n += 1;
+            }
+        }
+        lit as f32 / n.max(1) as f32
+    }
+
+    #[test]
+    fn the_header_is_cut_from_the_logo() {
+        // The wordmark and the mark are not assets of their own: they are two boxes
+        // of the splash. Which is only true for as long as the boxes are where the
+        // splash keeps them — so this is the thing that has to be checked, and it
+        // cannot be checked against a stand-in image.
+        let logo = logo();
+        let u = Ui::new(logo.clone(), vec![]);
+        assert!(!u.mark.is_empty() && !u.wordmark.is_empty());
+        // The wordmark is a word: far wider than it is tall. The mark is a picture.
+        assert!(u.wordmark.w > u.wordmark.h * 3, "that is not a wordmark");
+        assert!(u.mark.w < u.mark.h * 3, "that is not the tree");
+
+        // How lit a picture is, on average. The art is on black, so a box that caught
+        // nothing is nearly nought and a box with a picture in it is not.
+        let lit = |img: &Image| {
+            img.rgb
+                .chunks_exact(3)
+                .map(|p| p[0].max(p[1]).max(p[2]) as f32)
+                .sum::<f32>()
+                / (img.w * img.h).max(1) as f32
+        };
+        let (tree, word) = (lit(&u.mark), lit(&u.wordmark));
+        assert!(tree > 20.0, "the mark's box caught no tree ({tree})");
+        assert!(word > 20.0, "the wordmark's box caught no word ({word})");
+
+        // And the cut between them runs through the black that separates them in the
+        // art, rather than through either picture. If the splash is ever redrawn with
+        // the word tucked up against the tree, this is what says so — instead of a
+        // header that quietly grows a slice of somebody else's half.
+        let cut_top = (MARK_BOX[1] + MARK_BOX[3]) * logo.h as f32;
+        let cut_bot = WORDMARK_BOX[1] * logo.h as f32;
+        assert!(cut_top < cut_bot, "the two boxes overlap");
+        let gutter = lit(&logo.crop(
+            0,
+            cut_top as usize,
+            logo.w,
+            (cut_bot - cut_top).max(1.0) as usize,
+        ));
+        assert!(
+            gutter * 3.0 < tree.min(word),
+            "the cut runs through the picture ({gutter}), not the gap between them"
+        );
+    }
+
+    #[test]
+    fn the_brand_is_on_every_screen() {
+        // The logo used to be the first two seconds of the session and then nothing.
+        // Every screen wears it now — including the ones over a paused game, where
+        // the *only* thing that may differ is the backdrop.
+        let mut u = Ui::new(
+            logo(),
+            vec![GameView {
+                key: "zeliard".into(),
+                title: "Zeliard".into(),
+                saves: vec![],
+                programs: vec![],
+            }],
+        );
+        let mut cv = Canvas::new(1280, 800);
+        let word = Rect::new(44.0, 50.0, 160.0, 40.0);
+        let mark = Rect::new(1100.0, 4.0, 176.0, 84.0);
+
+        for (screen, over) in [
+            (Screen::Library, false),
+            (Screen::Game, false),
+            (Screen::Settings, false),
+            (Screen::AddGame, false),
+            (Screen::Game, true),
+            (Screen::Library, true),
+        ] {
+            if over {
+                u.open_overlay(0, true);
+            }
+            u.screen = screen;
+            u.paint(&mut cv, over);
+            assert!(
+                ink(&cv, word) > 0.10,
+                "{screen:?} (over_game={over}) has no wordmark"
+            );
+            assert!(
+                ink(&cv, mark) > 0.05,
+                "{screen:?} (over_game={over}) has no mark in the corner"
+            );
+        }
+    }
+
+    #[test]
+    fn a_selection_is_a_ring_and_never_a_slab() {
+        // One language for "this is the one", everywhere. The library's cards said it
+        // with a ring while the buttons an inch away said it with a slab of solid
+        // pink, so the same keypress looked like two different things depending on
+        // which half of the screen it landed in.
+        let mut u = ui(&[("Zeliard", 1)]);
+        let mut cv = Canvas::new(1280, 800);
+        // Is any pixel in here the blossom? An edge is antialiased and a label has
+        // gaps, so both questions are asked of a *region*, never of one pixel.
+        let accent = |cv: &Canvas, r: Rect| {
+            (r.y as usize..(r.y + r.h) as usize).any(|y| {
+                (r.x as usize..(r.x + r.w) as usize).any(|x| {
+                    let i = (y * cv.w + x) * 4;
+                    let (r, g, b) = (cv.px[i], cv.px[i + 1], cv.px[i + 2]);
+                    r > 0xC0 && (0x50..0xB0).contains(&g) && b > 0x80
+                })
+            })
+        };
+
+        // The action the cursor is on, on a game's page: ringed by the accent...
+        u.key(Key::Enter);
+        u.paint(&mut cv, false);
+        let sel = rect_of(&u, Hit::Action(u.action));
+        assert!(
+            accent(&cv, Rect::new(sel.x, sel.y + sel.h / 3.0, 3.0, sel.h / 3.0)),
+            "the chosen action wears no ring"
+        );
+        // ...and not filled by it. Past the label, where nothing but a fill could put
+        // the accent.
+        assert!(
+            !accent(
+                &cv,
+                Rect::new(sel.x + sel.w * 0.7, sel.y + 6.0, sel.w * 0.25, sel.h - 12.0)
+            ),
+            "the chosen action is filled with the accent — it may only be ringed by it"
+        );
+
+        // The same for the button in the library's bar, which is the same idea and
+        // used to be the same slab.
+        u.key(Key::Escape);
+        u.key(Key::Up); // out of the grid, onto Add game
+        u.paint(&mut cv, false);
+        let add = rect_of(&u, Hit::Add);
+        assert!(
+            !accent(
+                &cv,
+                Rect::new(add.x + add.w / 2.0, add.y + 5.0, add.w / 4.0, 6.0)
+            ),
+            "Add game is filled with the accent"
+        );
     }
 
     #[test]
