@@ -66,3 +66,65 @@ fn parse_imm_negative() {
         assert_eq!(disassemble::parse_imm(tok), Some(-42), "disasm {tok}");
     }
 }
+
+/// FS/GS are 386 registers and this CPU has neither — the prelude's `word_reg!`
+/// block declares cs/ds/es/ss and stops. The emitter used to pass capstone's
+/// segment straight through anyway, so `fs:[si]` came out as `memw(fs, si)`:
+/// a call to an `fs()` accessor that does not exist, which failed the WHOLE
+/// chunk at rustc with "cannot find function `fs`". The bytes come from the
+/// speculative decoder reading data as code, so nothing was ever *meant* to run
+/// them — but a chunk that will not compile is a chunk silently lost.
+///
+/// So they take the route every other inexpressible construct takes: a run-time
+/// `jit_unsupported_instruction` trap, paid only if control actually arrives.
+#[test]
+fn an_fs_segment_override_traps_instead_of_calling_a_register_that_does_not_exist() {
+    let func = json!({
+        "start": 0x0000,
+        "instructions": [
+            {"address":0x0000,"mnemonic":"mov","op_str":"ax, word ptr fs:[si]","bytes":"648B04",
+             "detail": {"mem_refs": [{"segment":"FS","disp":0,"access":"read"}]}},
+            {"address":0x0003,"mnemonic":"ret","op_str":"","bytes":"C3"},
+        ],
+    });
+    let src = render_rs(&func, &[], "");
+    assert!(src.contains("jit_unsupported_instruction"), "{src}");
+    assert!(
+        !src.contains("fs()"),
+        "emitted a call to a nonexistent register: {src}"
+    );
+}
+
+#[test]
+fn the_gs_register_itself_traps_too() {
+    let func = json!({
+        "start": 0x0000,
+        "instructions": [
+            {"address":0x0000,"mnemonic":"push","op_str":"gs","bytes":"0FA8"},
+            {"address":0x0002,"mnemonic":"ret","op_str":"","bytes":"C3"},
+        ],
+    });
+    let src = render_rs(&func, &[], "");
+    assert!(src.contains("jit_unsupported_instruction"), "{src}");
+    assert!(
+        !src.contains("gs()"),
+        "emitted a call to a nonexistent register: {src}"
+    );
+}
+
+/// The control: the segments this CPU *does* have must still lower normally, or
+/// the guard above would be quietly throwing real code away.
+#[test]
+fn an_es_segment_override_still_lowers() {
+    let func = json!({
+        "start": 0x0000,
+        "instructions": [
+            {"address":0x0000,"mnemonic":"mov","op_str":"ax, word ptr es:[si]","bytes":"268B04",
+             "detail": {"mem_refs": [{"segment":"ES","disp":0,"access":"read"}]}},
+            {"address":0x0003,"mnemonic":"ret","op_str":"","bytes":"C3"},
+        ],
+    });
+    let src = render_rs(&func, &[], "");
+    assert!(src.contains("r.memw(r.es(), r.si())"), "{src}");
+    assert!(!src.contains("jit_unsupported_instruction"), "{src}");
+}

@@ -23,6 +23,7 @@
 
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
+use std::sync::OnceLock;
 
 use regex::Regex;
 
@@ -39,6 +40,57 @@ pub type R<T> = Result<T, Unsupported>;
 
 fn uns<T>(what: impl Into<String>) -> R<T> {
     Err(Unsupported(what.into()))
+}
+
+/// FS or GS named anywhere in an instruction's operands — as a segment override
+/// (a 0x64/0x65 prefix) or as the register itself (`push fs`, `mov ax, gs`).
+///
+/// They are 386 additions, and the CPU this backend targets does not have them:
+/// the prelude's `word_reg!` block declares cs, ds, es and ss, and nothing else.
+/// So an operand naming one cannot be lowered — but it was being lowered anyway.
+/// `rewrite_mem_op` passes capstone's segment straight through, so `fs:[si]`
+/// became `memw(fs, si)`, a call to an `fs()` accessor that does not exist, and
+/// rustc failed the **whole chunk** with "cannot find function `fs`". Nothing
+/// emits such bytes on purpose — it is the speculative decoder reading data as
+/// code — but a chunk that will not compile is a chunk silently lost, and the
+/// emitter had no idea it had produced one.
+///
+/// Reporting it as `Unsupported` puts it on the path built for exactly this case
+/// (see `render_block`): the instruction becomes a `jit_unsupported_instruction`
+/// trap, the chunk still compiles, and the gap is paid only if control really
+/// arrives at those bytes — which, for data decoded as code, it never does.
+///
+/// Matched against capstone's own operand text, not the variable-renamed copy, so
+/// a game annotation that happened to name something `fs` cannot trip it.
+fn fs_gs_operand(insn: &Insn, raw_op_str: &str) -> Option<String> {
+    let overridden = insn
+        .get("detail")
+        .and_then(|d| d.get("mem_refs"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m.get("segment").and_then(Value::as_str))
+        .find(|s| s.eq_ignore_ascii_case("fs") || s.eq_ignore_ascii_case("gs"));
+    // The wording matters: this text is pasted into the emitted chunk as the trap's
+    // message, and `runtime_abi_contract` reads that chunk back looking for calls
+    // to runtime symbols with `(\w+)\s*\(`. An identifier followed by a space and a
+    // bracket — "override (386+)" — reads to it as a call to `override`, and the
+    // chunk gets reported for using a symbol the prelude never declared. Keep
+    // brackets out of it.
+    if let Some(seg) = overridden {
+        return Some(format!(
+            "{}: segment override on a CPU with no such register",
+            seg.to_lowercase()
+        ));
+    }
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"(?i)\b(fs|gs)\b").unwrap());
+    re.captures(raw_op_str).map(|c| {
+        format!(
+            "{}: 386 segment register, and this CPU has none",
+            c[1].to_lowercase()
+        )
+    })
 }
 
 /// A Rust `c"..."` literal holding `what`, safe to paste into emitted code.
@@ -2450,7 +2502,13 @@ impl RRenderer {
         let succs = |a: i64| succ.get(&a).cloned().unwrap_or_default();
         let is_last = idx == n - 1;
         let mnem = s(insn, "mnemonic").to_string();
+        let raw_op_str = s(insn, "op_str").to_string();
         let op_str = decode_variables(s(insn, "op_str"));
+
+        // Before anything is lowered: this CPU has no FS or GS to lower it to.
+        if let Some(what) = fs_gs_operand(insn, &raw_op_str) {
+            return uns(format!("{mnem} {raw_op_str}: {what}"));
+        }
 
         if is_last && insn.get("op").and_then(Value::as_str) == Some("INDIRECT_NEAR_JMP") {
             let expr = self.indirect_jump_target(insn)?;

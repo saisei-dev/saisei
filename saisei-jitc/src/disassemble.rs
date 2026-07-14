@@ -39,6 +39,14 @@ fn b64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
+/// `fs` / `gs` as a whole operand token — `push fs`, `mov ax, gs`. Segment
+/// *overrides* are caught from the decoded mem_refs instead; this is for the
+/// registers appearing in their own right.
+fn fs_gs_reg_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?i)\b(fs|gs)\b").unwrap())
+}
+
 fn prefix_seg(p: u8) -> Option<&'static str> {
     Some(match p {
         0x2E => "CS",
@@ -718,6 +726,26 @@ pub fn stage2(
                 let r = &decoded[&cur];
                 (r.mnemonic.clone(), r.op_str.clone(), r.size())
             };
+
+            // An instruction naming FS or GS ends this path, exactly as an
+            // undecodable byte does. They are 386 registers and this CPU has
+            // neither (the prelude's `word_reg!` block stops at ss), so codegen
+            // cannot lower one — it emits a run-time trap instead — and control
+            // therefore cannot flow *through* it. Following the fallthrough would
+            // be walking into whatever lies past an instruction that can only
+            // abort, and in practice that is not code at all: FS/GS in a real-mode
+            // DOS program is the signature of the decoder having wandered into
+            // data. Left unpruned, one such wander sprawled a Dungeon Master
+            // segment into a 13.9 MB chunk (a normal one is 11 KB) that rustc
+            // spent eight minutes and 900 MB on, twenty-one at a time.
+            if decoded[&cur]
+                .mem_refs
+                .iter()
+                .any(|(seg, _)| seg.eq_ignore_ascii_case("fs") || seg.eq_ignore_ascii_case("gs"))
+                || fs_gs_reg_re().is_match(&op_str)
+            {
+                break;
+            }
 
             // DOS terminate sequences end a function.
             if mnemonic == "int" {
