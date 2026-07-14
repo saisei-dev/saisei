@@ -54,10 +54,17 @@ pub fn exec_player(args: &[String]) -> ! {
 
     // The window belongs to this process image; the next one opens its own.
     // Flush first — the re-exec discards our buffered stdio.
+    //
+    // Exec `/proc/self/exe` — the image we are running — not the path
+    // `current_exe()` reports. They differ the moment the binary on disk is
+    // rebuilt: cargo unlinks and recreates it, the readlink turns into
+    // ".../saisei (deleted)", and exec'ing that string is ENOENT. The magic
+    // link execs our own inode regardless, and it is the image that built
+    // this argv, so the argv is understood. The runtime's save-load re-exec
+    // (`save_manager`) does the same, for the same reason.
     unsafe {
         libc::fflush(ptr::null_mut());
-        let path = CString::new(exe_path.as_str()).unwrap();
-        libc::execv(path.as_ptr(), argv.as_ptr());
+        libc::execv(c"/proc/self/exe".as_ptr(), argv.as_ptr());
     }
     eprintln!(
         "saisei: could not restart ({})",
