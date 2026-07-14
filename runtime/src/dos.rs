@@ -3204,16 +3204,39 @@ pub extern "C" fn dos_exec_impl(
             }
             *vm().add((dst + 1 + len as usize) & 0xFFFFF) = 0x0D; // CR terminator
 
+            // The block also names two FCBs (far pointers at 06h and 0Ah), and
+            // DOS copies 16 bytes from each into the child's PSP at 5Ch and 6Ch
+            // — a verbatim byte copy, not a parse, and blind: DOS does not
+            // validate the pointers. The pair is a real parent-to-child channel:
+            // a shell that EXECs its main program can hand it an "FCB" holding
+            // a far pointer into the shell's own resident memory, which the
+            // child follows to a signature it verifies before agreeing to run —
+            // without the copy such a child exits 0 without a word.
+            for (pb_off, psp_off) in [(6usize, 0x5Cusize), (0xA, 0x6C)] {
+                let src_off = (*pb.add(pb_off) as u16) | ((*pb.add(pb_off + 1) as u16) << 8);
+                let src_seg = (*pb.add(pb_off + 2) as u16) | ((*pb.add(pb_off + 3) as u16) << 8);
+                let src_lin = ((((src_seg as u32) << 4) + src_off as u32) & 0xFFFFF) as usize;
+                let dst_lin = ((child_psp as usize) << 4) + psp_off;
+                for i in 0..0x10usize {
+                    *vm().add((dst_lin + i) & 0xFFFFF) = *vm().add((src_lin + i) & 0xFFFFF);
+                }
+            }
+
             let env_seg = (*pb as u16) | ((*pb.add(1) as u16) << 8);
             let mut tail = [0u8; 0x80];
             for i in 0..len as usize {
                 tail[i] = *vm().add((tail_lin + 1 + i) & 0xFFFFF);
             }
             shim_log_stdout(
-                c"Trace: dos_exec command tail len=%d \"%s\" env_seg=0x%04X\n".as_ptr(),
+                c"Trace: dos_exec command tail len=%d \"%s\" env_seg=0x%04X fcb1=%04X:%04X fcb2=%04X:%04X\n"
+                    .as_ptr(),
                 len as c_int,
                 tail.as_ptr() as *const c_char,
                 env_seg as c_int,
+                ((*pb.add(8) as u16) | ((*pb.add(9) as u16) << 8)) as c_int,
+                ((*pb.add(6) as u16) | ((*pb.add(7) as u16) << 8)) as c_int,
+                ((*pb.add(0xC) as u16) | ((*pb.add(0xD) as u16) << 8)) as c_int,
+                ((*pb.add(0xA) as u16) | ((*pb.add(0xB) as u16) << 8)) as c_int,
             );
         }
     }
