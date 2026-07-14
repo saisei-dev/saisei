@@ -5,16 +5,20 @@ use shim_common::*;
 use std::ffi::c_void;
 use std::os::raw::c_char;
 
+/// See the note on the same assertion in `ported_shims1.rs`: there is no x87 in
+/// this machine, so the equipment word must not claim one — a guest told otherwise
+/// takes its floating-point path and issues instructions the CPU cannot execute.
 #[test]
-fn bios_equipment_reports_math_coprocessor() {
+fn bios_equipment_reports_no_math_coprocessor() {
     let _g = guard();
     let lib = ShimLib::load();
     unsafe {
         let equipment_addr = (0x40usize << 4) + 0x0010;
         let equipment = lib.read_u16(equipment_addr);
-        assert!(
-            equipment & 0x0002 != 0,
-            "expected BIOS equipment word to report an 8087"
+        assert_eq!(
+            equipment & 0x0002,
+            0,
+            "equipment word claims an 8087 this machine does not have"
         );
     }
 }

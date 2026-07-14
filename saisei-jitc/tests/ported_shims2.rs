@@ -446,12 +446,16 @@ fn test_bios_equipment_interrupt_returns_equipment_word() {
         let run_interrupt: unsafe extern "C" fn(u8) = lib.func("run_interrupt");
         let cpu = lib.cpu();
 
+        // The contract is that INT 11h hands back the equipment word the BIOS put
+        // in the BDA — not that the word holds any particular value. It used to
+        // assert the literal 0x0063 in both places, so changing the machine's
+        // description of itself (no x87, and an EGA/VGA rather than a CGA in bits
+        // 5-4) broke a test that was not about either.
         let equipment = lib.read_u16(0x410);
-        assert_eq!(equipment, 0x0063);
 
         (*cpu).r_ax.x = 0;
         run_interrupt(0x11);
-        assert_eq!((*cpu).r_ax.x, 0x0063);
+        assert_eq!((*cpu).r_ax.x, equipment);
     }
 }
 

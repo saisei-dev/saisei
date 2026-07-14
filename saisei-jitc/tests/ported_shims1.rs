@@ -89,15 +89,24 @@ unsafe fn fork_run<F: FnOnce()>(f: F) -> (i32, String) {
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
+/// The BIOS equipment word (BDA 0040:0010) must report **no** maths coprocessor.
+///
+/// This test used to assert the opposite — that bit 1 was set — and it was wrong
+/// to. There is no x87 in this machine, and a program that is told there is one
+/// takes its floating-point path and issues instructions the CPU cannot execute.
+/// Advertising hardware we do not emulate is not generosity, it is a lie the guest
+/// acts on. (Changed with the equipment word in "The EGA is a chip, not a byte
+/// array", which also cleared bits 5-4 so the word stops claiming a CGA.)
 #[test]
-fn test_bios_equipment_reports_math_coprocessor() {
+fn test_bios_equipment_reports_no_math_coprocessor() {
     let _g = guard();
     let lib = ShimLib::load();
     unsafe {
         let equipment = lib.read_u16((0x40usize << 4) + 0x0010);
-        assert!(
-            equipment & 0x0002 != 0,
-            "Expected BIOS equipment word to report an 8087"
+        assert_eq!(
+            equipment & 0x0002,
+            0,
+            "equipment word claims an 8087 this machine does not have"
         );
     }
 }
