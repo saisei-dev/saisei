@@ -518,6 +518,17 @@ pub struct GameConfig {
     pub psp_seg: u16,
     pub patches: *const GamePatch,
     pub patch_count: usize,
+    /// The program's **command tail** — what DOS would have put at PSP:80h had
+    /// you typed the arguments after its name. Empty for most games, and a bundle
+    /// that needs one says so in its JSON (`"args"`).
+    ///
+    /// This is not a nicety. A DOS program's command line is part of *how it is
+    /// invoked*, and a launcher that always hands over an empty one is running a
+    /// different command than the one the game shipped with. MechWarrior's shell
+    /// picks its sound device by scanning its own tail for S/T/A/R — and, finding
+    /// nothing, defaults to **Roland MT-32**, which no machine here has. `MW A`
+    /// is the invocation; `MW` is a different program.
+    pub command_tail: *const c_char,
 }
 
 // Weak default `game_config` so the runtime links standalone (the shim-test
@@ -547,6 +558,7 @@ pub static game_config: GameConfig = GameConfig {
     psp_seg: 0,
     patches: core::ptr::null(),
     patch_count: 0,
+    command_tail: EMPTY_CSTR.as_ptr() as *const c_char,
 };
 
 // The host's run-time config, when it installed one. Null => the linked-in
@@ -4216,10 +4228,89 @@ unsafe fn init_psp() {
     memw_write_impl(psp_seg, 0x2C, env_seg, SHIMS_FILE, cstr!("init_psp"), 2343);
     dta_ptr = seg_off(psp_seg, 0x80) as *mut c_void;
 
-    memb_write_impl(psp_seg, 0x80, 0, SHIMS_FILE, cstr!("init_psp"), 2350);
-    memb_write_impl(psp_seg, 0x81, 0x0D, SHIMS_FILE, cstr!("init_psp"), 2351);
+    // The command tail, laid out as DOS lays it out: a length byte at 80h, the
+    // characters after it, and a CR the program is entitled to find at the end
+    // (the length is authoritative, but plenty of code scans for the CR instead).
+    // DOS counts the separating space, so a tail typed as `MW A` is " A", length 2
+    // — a bundle writing `"args": "A"` means what a user typing `MW A` means.
+    init_psp_command_tail();
+
     libc::memset(seg_off(psp_seg, 0x5C) as *mut c_void, 0, 0x10);
     libc::memset(seg_off(psp_seg, 0x6C) as *mut c_void, 0, 0x10);
+}
+
+/// Read the command tail back out of the PSP and print it — the program's own
+/// view of its command line, bytes and all.
+unsafe fn report_psp_command_tail() {
+    let len = *seg_off(psp_seg, 0x80) as usize;
+    let mut buf = [0u8; 0x82];
+    for i in 0..len.min(0x7E) {
+        buf[i] = *seg_off(psp_seg, 0x81 + i as u16);
+    }
+    shim_log_stdout(
+        cstr!("Trace: PSP:80h command tail = %d byte(s) \"%s\"\n"),
+        len as c_int,
+        buf.as_ptr() as *const c_char,
+    );
+}
+
+/// Write `GameConfig.command_tail` into the PSP. Empty (a length of 0 and a CR)
+/// when the bundle asks for nothing, which is what every game but MechWarrior does.
+unsafe fn init_psp_command_tail() {
+    let args = cfg().command_tail;
+    let mut len: usize = 0;
+    if !args.is_null() {
+        len = libc::strlen(args);
+    }
+    // The PSP tail area is 80h..FFh: a length byte, up to 7Eh characters, and the
+    // CR. Longer than that is longer than DOS could have delivered.
+    let max = 0x7E - 1; // leave room for the leading space DOS puts there
+    if len > max {
+        len = max;
+    }
+    if len == 0 {
+        memb_write_impl(psp_seg, 0x80, 0, SHIMS_FILE, cstr!("init_psp"), 2350);
+        memb_write_impl(psp_seg, 0x81, 0x0D, SHIMS_FILE, cstr!("init_psp"), 2351);
+        return;
+    }
+    // The tail DOS builds starts with the space that separated the arguments from
+    // the program's name — `MW A` gives " A", not "A". A program that indexes from
+    // the first character (as MechWarrior's shell does) reads the space, finds it
+    // matches nothing, and moves on; one that assumed the space and skipped it
+    // would otherwise skip the argument itself.
+    let tail_len = len + 1;
+    memb_write_impl(
+        psp_seg,
+        0x80,
+        tail_len as u8,
+        SHIMS_FILE,
+        cstr!("init_psp"),
+        2350,
+    );
+    memb_write_impl(psp_seg, 0x81, b' ', SHIMS_FILE, cstr!("init_psp"), 2350);
+    for i in 0..len {
+        memb_write_impl(
+            psp_seg,
+            0x82 + i as u16,
+            *args.add(i) as u8,
+            SHIMS_FILE,
+            cstr!("init_psp"),
+            2350,
+        );
+    }
+    memb_write_impl(
+        psp_seg,
+        0x81 + tail_len as u16,
+        0x0D,
+        SHIMS_FILE,
+        cstr!("init_psp"),
+        2351,
+    );
+    shim_log_stdout(
+        cstr!("Trace: command tail = \"%s\" (%d chars at PSP:81h)\n"),
+        args,
+        tail_len as c_int,
+    );
 }
 
 unsafe fn init_bios_data_area() {
@@ -9369,6 +9460,7 @@ unsafe extern "C" fn int15h_impl(
     line: c_int,
 ) {
     shim_log(cstr!("int15h_impl"), file, func, line, ptr::null());
+    shim_log_stdout(cstr!("Trace: int 15h AX=0x%04X\n"), ax() as c_uint);
     match ah() {
         0xC0 => {
             set_es(BIOS_CONFIG_TABLE_SEG);
@@ -13002,6 +13094,11 @@ pub unsafe extern "C" fn saisei_main(argc: c_int, argv: *mut *mut c_char) -> c_i
         );
         libc::fflush(stderr);
     } else if !cfg().program_path.is_null() {
+        // The command line the program will actually see, read back out of the PSP
+        // where DOS left it. `init_psp` writes it before argv is parsed, so it
+        // cannot report itself — and a program that quietly gets no arguments
+        // behaves like a different program (see GameConfig::command_tail).
+        report_psp_command_tail();
         run_machine();
         libc::fprintf(
             stderr,

@@ -109,6 +109,7 @@ pub fn install_game_config(def: &GameDef) {
         psp_seg: vals.psp_seg,
         patches: ptr::null(),
         patch_count: 0,
+        command_tail: leak_cstr(&vals.args),
     }));
 
     unsafe { saisei_set_game_config(config) };

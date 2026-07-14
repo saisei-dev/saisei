@@ -244,6 +244,12 @@ pub struct GameConfigValues {
     pub program_path: String,
     pub init_cs: u16,
     pub psp_seg: u16,
+    /// The program's command tail — the arguments a user would have typed after
+    /// its name. A DOS program's command line is part of how it is invoked, and a
+    /// launcher that always passes an empty one is running a different command
+    /// from the one the game shipped with: MechWarrior's shell reads its own tail
+    /// to pick a sound device and, given nothing, chooses a Roland MT-32.
+    pub args: String,
     /// (lo, hi, name) — runtime memory-protection ranges.
     pub protected_slots: Vec<(u32, u32, String)>,
 }
@@ -290,6 +296,10 @@ pub fn game_config_values(game: &GameDef) -> GameConfigValues {
         program_path: game.program_path.clone(),
         init_cs: (as_int(pick("init_cs")) & 0xFFFF) as u16,
         psp_seg: (as_int(pick("psp_seg")) & 0xFFFF) as u16,
+        args: pick("args")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         protected_slots: pick("protected_slots")
             .and_then(Value::as_array)
             .map(|slots| {
@@ -320,6 +330,7 @@ pub fn generate_game_config(root: &Path, game: &GameDef) -> PathBuf {
     let game_name = vals.name;
     let init_cs = vals.init_cs;
     let psp_seg = vals.psp_seg;
+    let args = vals.args;
     let slots = vals.protected_slots;
 
     // Emit the per-game GameConfig data file, include!d into the saisei-game
@@ -358,6 +369,7 @@ pub fn generate_game_config(root: &Path, game: &GameDef) -> PathBuf {
         "    pub protected_slots: *const ProtectedSlot, pub protected_slot_count: usize,\n",
     );
     out.push_str("    pub init_cs: u16, pub psp_seg: u16, pub patches: *const GamePatch, pub patch_count: usize,\n");
+    out.push_str("    pub command_tail: *const c_char,\n");
     out.push_str("}\n");
     out.push_str("unsafe impl Sync for GameConfig {}\nunsafe impl Sync for ProtectedSlot {}\n\n");
     let (name_arr, name_len) = byte_arr(&game_name);
@@ -365,6 +377,10 @@ pub fn generate_game_config(root: &Path, game: &GameDef) -> PathBuf {
     let (path_arr, path_len) = byte_arr(&game.program_path);
     out.push_str(&format!(
         "static PROGRAM_PATH: [u8; {path_len}] = {path_arr};\n"
+    ));
+    let (args_arr, args_len) = byte_arr(&args);
+    out.push_str(&format!(
+        "static COMMAND_TAIL: [u8; {args_len}] = {args_arr};\n"
     ));
     let slots_expr = if slots.is_empty() {
         "core::ptr::null()".to_string()
@@ -400,7 +416,8 @@ pub fn generate_game_config(root: &Path, game: &GameDef) -> PathBuf {
         init_cs & 0xFFFF,
         psp_seg & 0xFFFF
     ));
-    out.push_str("    patches: core::ptr::null(), patch_count: 0,\n};\n");
+    out.push_str("    patches: core::ptr::null(), patch_count: 0,\n");
+    out.push_str("    command_tail: COMMAND_TAIL.as_ptr() as *const c_char,\n};\n");
     std::fs::create_dir_all(out_path.parent().unwrap()).ok();
     std::fs::write(&out_path, out).unwrap_or_else(|e| die(&format!("write config: {e}")));
     out_path
