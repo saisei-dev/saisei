@@ -88,10 +88,14 @@ fn boot_regions__dos_boot_regions_initialised() {
         assert_eq!(*vm.add(psp_cmd), 0);
         assert_eq!(*vm.add(psp_cmd + 1), 0x0D);
 
-        // Environment block pointer
+        // Environment block pointer. The paragraph just below the PSP is the
+        // program's own MCB (where a program reads its block size), and the
+        // environment sits ENV_PARAS below that with an MCB of its own — so the
+        // segment is psp_seg - 1 - ENV_PARAS = 0x1000 - 1 - 0x10 = 0x0FEF, not the
+        // pre-MCB-chain 0x0FF0 (see dos::dos_env_seg / shim_boot_machine).
         let env_ptr_off = (0x1000usize << 4) + 0x2C;
         let env_seg = (*vm.add(env_ptr_off) as u16) | ((*vm.add(env_ptr_off + 1) as u16) << 8);
-        assert_eq!(env_seg, 0x0FF0);
+        assert_eq!(env_seg, 0x0FEF);
         let env_off = (env_seg as usize) << 4;
         // A faithful DOS environment block is non-empty: COMMAND.COM always
         // launches a program with COMSPEC / PATH / PROMPT set, so it starts
