@@ -116,7 +116,9 @@ fn parse_hex16(s: &str) -> Option<i64> {
 
 fn mem_ptr_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)^(byte|word) ptr (?:(cs|ds|es|ss):)?\[(.+)\]$").unwrap())
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)^(byte|word|dword) ptr (?:(cs|ds|es|ss|fs|gs):)?\[(.+)\]$").unwrap()
+    })
 }
 
 /// Does the text run up to an operand's `[` end in an explicit segment override?
@@ -239,28 +241,33 @@ pub fn rewrite_mem_op(op: &str, seg: Option<&str>) -> String {
         } else {
             expr.parse::<i64>().ok().map(|v| v & 0xFFFF)
         };
-        if let Some(off) = off_const {
-            if seg_final == "cs" && off == 0x8C2 {
-                return "exec_params.saved_sp".to_string();
-            }
-            if seg_final == "cs" && off == 0x8C4 {
-                return "exec_params.saved_ss".to_string();
-            }
-            if seg_final == "es" {
-                if let Some(macro_) = rcb_macro(off) {
-                    let (aliases, _) = rcb_aliases();
-                    let addr = aliases
-                        .get(&off)
-                        .cloned()
-                        .unwrap_or_else(|| format!("0x{off:04X}"));
-                    return format!("{macro_}(es, {addr})");
+        let size_l = size.to_lowercase();
+        // A dword access is two words; the RCB/exec_params constant-offset field
+        // maps below are all 8/16-bit, so a 32-bit access never lands in one.
+        if size_l != "dword" {
+            if let Some(off) = off_const {
+                if seg_final == "cs" && off == 0x8C2 {
+                    return "exec_params.saved_sp".to_string();
+                }
+                if seg_final == "cs" && off == 0x8C4 {
+                    return "exec_params.saved_ss".to_string();
+                }
+                if seg_final == "es" {
+                    if let Some(macro_) = rcb_macro(off) {
+                        let (aliases, _) = rcb_aliases();
+                        let addr = aliases
+                            .get(&off)
+                            .cloned()
+                            .unwrap_or_else(|| format!("0x{off:04X}"));
+                        return format!("{macro_}(es, {addr})");
+                    }
                 }
             }
         }
-        let macro_ = if size.to_lowercase() == "byte" {
-            "memb"
-        } else {
-            "memw"
+        let macro_ = match size_l.as_str() {
+            "byte" => "memb",
+            "dword" => "memd",
+            _ => "memw",
         };
         if expr.contains('+') || expr.contains('-') {
             return format!("{macro_}({seg_final}, ({expr}) & 0xFFFF)");
@@ -268,7 +275,7 @@ pub fn rewrite_mem_op(op: &str, seg: Option<&str>) -> String {
         return format!("{macro_}({seg_final}, {expr})");
     }
     static SIMPLE: OnceLock<Regex> = OnceLock::new();
-    let simple = SIMPLE.get_or_init(|| Regex::new(r"^(?:byte|word) ptr (.+)$").unwrap());
+    let simple = SIMPLE.get_or_init(|| Regex::new(r"^(?:byte|word|dword) ptr (.+)$").unwrap());
     if let Some(c) = simple.captures(op) {
         return c.get(1).unwrap().as_str().to_string();
     }
@@ -277,7 +284,7 @@ pub fn rewrite_mem_op(op: &str, seg: Option<&str>) -> String {
 
 fn simple_ptr_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)^(byte|word) ptr (.+)$").unwrap())
+    RE.get_or_init(|| Regex::new(r"(?i)^(byte|word|dword) ptr (.+)$").unwrap())
 }
 fn var_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -286,6 +293,7 @@ fn var_re() -> &'static Regex {
 
 const BYTE_REGS: &[&str] = &["al", "ah", "bl", "bh", "cl", "ch", "dl", "dh"];
 const WORD_REGS: &[&str] = &["ax", "bx", "cx", "dx", "si", "di", "bp", "sp"];
+const DWORD_REGS: &[&str] = &["eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp"];
 
 /// _operand_width_from_str.
 fn operand_width_from_str(expr: &str) -> Option<i64> {
@@ -296,11 +304,17 @@ fn operand_width_from_str(expr: &str) -> Option<i64> {
     if WORD_REGS.contains(&e.as_str()) {
         return Some(16);
     }
+    if DWORD_REGS.contains(&e.as_str()) {
+        return Some(32);
+    }
     if e.starts_with("memb(") {
         return Some(8);
     }
     if e.starts_with("memw(") {
         return Some(16);
+    }
+    if e.starts_with("memd(") {
+        return Some(32);
     }
     None
 }
@@ -313,8 +327,14 @@ fn operand_width(op: &str) -> i64 {
     if op_l.starts_with("memw(") {
         return 16;
     }
+    if op_l.starts_with("memd(") {
+        return 32;
+    }
     if BYTE_REGS.contains(&op_l.as_str()) {
         return 8;
+    }
+    if DWORD_REGS.contains(&op_l.as_str()) {
+        return 32;
     }
     16
 }
@@ -866,6 +886,7 @@ impl Renderer {
         let width = match size_prefix {
             Some("byte") => 8,
             Some("word") => 16,
+            Some("dword") => 32,
             _ => match self.stack_var_sizes.get(&key) {
                 Some(w) => *w,
                 None => infer_stack_var_width(operands, index),
@@ -915,7 +936,11 @@ impl Renderer {
                 let var_name = m.get(0).unwrap().as_str().to_string();
                 let width =
                     self.stack_var_width(&var_name, size_prefix.as_deref(), operands, index);
-                let macro_ = if width == 8 { "memb" } else { "memw" };
+                let macro_ = match width {
+                    8 => "memb",
+                    32 => "memd",
+                    _ => "memw",
+                };
                 result.push(format!("{macro_}({seg}, {addr_expr})"));
                 continue;
             }

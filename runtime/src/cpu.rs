@@ -36,6 +36,21 @@ pub struct CpuState {
     pub r_es: u16,
     pub r_ss: u16,
     pub flags: CpuFlags,
+    // High 16 bits of the 386 32-bit GP registers (eax..esp); the low 16 are
+    // r_ax..sp above. Appended at the end and FROZEN — shared byte-for-byte with
+    // the JIT prelude's CpuState (saisei-jitc/rt/saisei_rt.rs). A 16-bit register
+    // write never touches these, so `mov ax,..` leaves the top of eax intact.
+    pub eax_hi: u16,
+    pub ebx_hi: u16,
+    pub ecx_hi: u16,
+    pub edx_hi: u16,
+    pub esi_hi: u16,
+    pub edi_hi: u16,
+    pub ebp_hi: u16,
+    pub esp_hi: u16,
+    // 386 FS/GS segment registers (FROZEN, shared with the JIT prelude).
+    pub r_fs: u16,
+    pub r_gs: u16,
 }
 
 extern "C" {
@@ -84,6 +99,8 @@ word_reg!(cs, set_cs, r_cs);
 word_reg!(ds, set_ds, r_ds);
 word_reg!(es, set_es, r_es);
 word_reg!(ss, set_ss, r_ss);
+word_reg!(fs, set_fs, r_fs);
+word_reg!(gs, set_gs, r_gs);
 
 macro_rules! byte_halves {
     ($lo:ident, $set_lo:ident, $hi:ident, $set_hi:ident, $w:ident, $sw:ident) => {

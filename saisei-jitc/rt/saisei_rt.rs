@@ -40,6 +40,15 @@ pub struct CpuState {
     pub si: u16, pub di: u16, pub bp: u16, pub sp: u16, pub r_ip: u16,
     pub r_cs: u16, pub r_ds: u16, pub r_es: u16, pub r_ss: u16,
     pub flags: CpuFlags,
+    // High 16 bits of the 386 32-bit GP registers (eax..esp). The low 16 live in
+    // r_ax..sp above; a 16-bit write leaves these untouched, so `mov ax,..` never
+    // disturbs the top half of eax. Appended at the end (never reordered): the
+    // layout is FROZEN and shared byte-for-byte with runtime/src/cpu.rs CpuState.
+    pub eax_hi: u16, pub ebx_hi: u16, pub ecx_hi: u16, pub edx_hi: u16,
+    pub esi_hi: u16, pub edi_hi: u16, pub ebp_hi: u16, pub esp_hi: u16,
+    // The 386 FS and GS segment registers, also appended (FROZEN, shared with
+    // runtime/src/cpu.rs). A 386-class program (Arena) genuinely uses them.
+    pub r_fs: u16, pub r_gs: u16,
 }
 
 #[repr(C)]
@@ -315,6 +324,8 @@ word_reg!(cs, set_cs, cs_ptr, r_cs);
 word_reg!(ds, set_ds, ds_ptr, r_ds);
 word_reg!(es, set_es, es_ptr, r_es);
 word_reg!(ss, set_ss, ss_ptr, r_ss);
+word_reg!(fs, set_fs, fs_ptr, r_fs);
+word_reg!(gs, set_gs, gs_ptr, r_gs);
 
 macro_rules! byte_regs {
     ($lo:ident, $set_lo:ident, $lo_ptr:ident, $hi:ident, $set_hi:ident, $hi_ptr:ident, $word:ident, $set_word:ident, $wptr:ident) => {
@@ -331,6 +342,28 @@ byte_regs!(al, set_al, al_ptr, ah, set_ah, ah_ptr, ax, set_ax, ax_ptr);
 byte_regs!(bl, set_bl, bl_ptr, bh, set_bh, bh_ptr, bx, set_bx, bx_ptr);
 byte_regs!(cl, set_cl, cl_ptr, ch, set_ch, ch_ptr, cx, set_cx, cx_ptr);
 byte_regs!(dl, set_dl, dl_ptr, dh, set_dh, dh_ptr, dx, set_dx, dx_ptr);
+
+// 386 32-bit GP registers: eax = (hi << 16) | ax, and so on. A 32-bit write
+// splits across the 16-bit low field and the appended hi field; reads recombine.
+macro_rules! dword_reg {
+    ($get:ident, $set:ident, $lo:ident, $set_lo:ident, $hi:ident) => {
+        #[inline(always)] pub fn $get() -> u32 {
+            unsafe { (((*cpu_ptr()).$hi as u32) << 16) | ($lo() as u32) }
+        }
+        #[inline(always)] pub fn $set(v: u32) {
+            $set_lo(v as u16);
+            unsafe { (*cpu_ptr()).$hi = (v >> 16) as u16; }
+        }
+    };
+}
+dword_reg!(eax, set_eax, ax, set_ax, eax_hi);
+dword_reg!(ebx, set_ebx, bx, set_bx, ebx_hi);
+dword_reg!(ecx, set_ecx, cx, set_cx, ecx_hi);
+dword_reg!(edx, set_edx, dx, set_dx, edx_hi);
+dword_reg!(esi, set_esi, si, set_si, esi_hi);
+dword_reg!(edi, set_edi, di, set_di, edi_hi);
+dword_reg!(ebp, set_ebp, bp, set_bp, ebp_hi);
+dword_reg!(esp, set_esp, sp, set_sp, esp_hi);
 
 // ---- flags ------------------------------------------------------------------
 
@@ -591,6 +624,18 @@ extern "C" {
         *virtual_memory.add(addr_hi as usize) = (v >> 8) as u8;
     }
 }
+// 32-bit memory access, composed from two 16-bit accesses (low word at off, high
+// word at off+2). Reusing memw/memw_write keeps every routing decision — RCB,
+// VGA, SS forensics, page flags, A20 — identical to a pair of word accesses,
+// which is exactly what a dword access is on a real 8086 bus. off+2 wraps within
+// the segment (u16), matching x86 real-mode offset arithmetic.
+#[inline(always)] pub fn memd(seg: u16, off: u16) -> u32 {
+    (memw(seg, off) as u32) | ((memw(seg, off.wrapping_add(2)) as u32) << 16)
+}
+#[inline(always)] pub fn memd_write(seg: u16, off: u16, v: u32) {
+    memw_write(seg, off, v as u16);
+    memw_write(seg, off.wrapping_add(2), (v >> 16) as u16);
+}
 #[inline(always)] pub fn SAFEPOINT() { unsafe { safe_point_impl(site(), site(), 0) } }
 
 #[inline(always)] pub fn run_interrupt(int_no: u8) { unsafe { run_interrupt_impl(int_no, site(), site(), 0) } }
@@ -698,6 +743,11 @@ pub struct Regs {
     pub si_: u16, pub di_: u16, pub bp_: u16, pub sp_: u16,
     pub ip_: u16, pub cs_: u16, pub ds_: u16, pub es_: u16, pub ss_: u16,
     pub cf: u8, pub pf: u8, pub zf: u8, pub sf: u8, pub of: u8, pub if_: u8, pub df: u8,
+    // High halves of the 386 32-bit GP registers, cached alongside the low ones
+    // (eax = (axh << 16) | ax). Same spill/reload discipline as every other field.
+    pub axh: u16, pub bxh: u16, pub cxh: u16, pub dxh: u16,
+    pub sih: u16, pub dih: u16, pub bph: u16, pub sph: u16,
+    pub fs_: u16, pub gs_: u16,
 }
 
 macro_rules! regs_word {
@@ -729,6 +779,12 @@ macro_rules! regs_flag {
         #[inline(always)] pub fn $set(&mut self, v: u8) { self.$field = v; }
     };
 }
+macro_rules! regs_dword {
+    ($get:ident, $set:ident, $lo:ident, $hi:ident) => {
+        #[inline(always)] pub fn $get(&self) -> u32 { ((self.$hi as u32) << 16) | (self.$lo as u32) }
+        #[inline(always)] pub fn $set(&mut self, v: u32) { self.$lo = v as u16; self.$hi = (v >> 16) as u16; }
+    };
+}
 /// &mut runtime-call method: spill, call the free wrapper, reload (the callee
 /// may mutate guest registers — IRQ delivery, DOS services, transfers).
 macro_rules! regs_ffi_mut {
@@ -753,6 +809,9 @@ impl Regs {
                 ip_: (*c).r_ip, cs_: (*c).r_cs, ds_: (*c).r_ds, es_: (*c).r_es, ss_: (*c).r_ss,
                 cf: (*c).flags.CF, pf: (*c).flags.PF, zf: (*c).flags.ZF,
                 sf: (*c).flags.SF, of: (*c).flags.OF, if_: (*c).flags.IF, df: (*c).flags.DF,
+                axh: (*c).eax_hi, bxh: (*c).ebx_hi, cxh: (*c).ecx_hi, dxh: (*c).edx_hi,
+                sih: (*c).esi_hi, dih: (*c).edi_hi, bph: (*c).ebp_hi, sph: (*c).esp_hi,
+                fs_: (*c).r_fs, gs_: (*c).r_gs,
             }
         }
     }
@@ -767,6 +826,9 @@ impl Regs {
             (*c).flags.CF = self.cf; (*c).flags.PF = self.pf; (*c).flags.ZF = self.zf;
             (*c).flags.SF = self.sf; (*c).flags.OF = self.of; (*c).flags.IF = self.if_;
             (*c).flags.DF = self.df;
+            (*c).eax_hi = self.axh; (*c).ebx_hi = self.bxh; (*c).ecx_hi = self.cxh; (*c).edx_hi = self.dxh;
+            (*c).esi_hi = self.sih; (*c).edi_hi = self.dih; (*c).ebp_hi = self.bph; (*c).esp_hi = self.sph;
+            (*c).r_fs = self.fs_; (*c).r_gs = self.gs_;
         }
     }
     #[inline(always)]
@@ -787,10 +849,20 @@ impl Regs {
     regs_seg!(ds, set_ds, ds_, r_ds);
     regs_seg!(es, set_es, es_, r_es);
     regs_seg!(ss, set_ss, ss_, r_ss);
+    regs_seg!(fs, set_fs, fs_, r_fs);
+    regs_seg!(gs, set_gs, gs_, r_gs);
     regs_byte!(al, set_al, ah, set_ah, ax);
     regs_byte!(bl, set_bl, bh, set_bh, bx);
     regs_byte!(cl, set_cl, ch, set_ch, cx);
     regs_byte!(dl, set_dl, dh, set_dh, dx);
+    regs_dword!(eax, set_eax, ax, axh);
+    regs_dword!(ebx, set_ebx, bx, bxh);
+    regs_dword!(ecx, set_ecx, cx, cxh);
+    regs_dword!(edx, set_edx, dx, dxh);
+    regs_dword!(esi, set_esi, si_, sih);
+    regs_dword!(edi, set_edi, di_, dih);
+    regs_dword!(ebp, set_ebp, bp_, bph);
+    regs_dword!(esp, set_esp, sp_, sph);
     regs_flag!(CF, set_CF, cf, CF);
     regs_flag!(PF, set_PF, pf, PF);
     regs_flag!(ZF, set_ZF, zf, ZF);
@@ -879,6 +951,17 @@ impl Regs {
     fn memw_write_flagged(&self, seg: u16, off: u16, v: u16) {
         self.spill();
         unsafe { memw_write_impl(seg, off, v, site(), site(), 0) }
+    }
+    // 32-bit access = two word accesses (low at off, high at off+2), reusing the
+    // cache-coherent memw path so RCB/VGA/SS/page routing stays identical.
+    #[inline(always)]
+    pub fn memd(&self, seg: u16, off: u16) -> u32 {
+        (self.memw(seg, off) as u32) | ((self.memw(seg, off.wrapping_add(2)) as u32) << 16)
+    }
+    #[inline(always)]
+    pub fn memd_write(&self, seg: u16, off: u16, v: u32) {
+        self.memw_write(seg, off, v as u16);
+        self.memw_write(seg, off.wrapping_add(2), (v >> 16) as u16);
     }
     #[inline(never)]
     fn memw_write_slow(&self, seg: u16, off: u16, v: u16) {

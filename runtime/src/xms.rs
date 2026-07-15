@@ -3,8 +3,9 @@
 //! A 1993 DOS game that wants memory beyond the 640K asks for it one of two ways:
 //! EMS, the bank-switched page frame of an expansion card, or XMS, the flat
 //! extended memory above the 1MB line that a 286+ has by virtue of being a 286+.
-//! There is no EMS board plugged into this machine and saying so is honest. But
-//! extended memory is not a board — it is the RAM that is *already here*
+//! This machine now carries both — the EMS board lives in `ems.rs` (Arena needs
+//! it) and this is the XMS half. Extended memory is not a board — it is the RAM
+//! that is *already here*
 //! (see `MEMORY_SIZE`, and `mask_addr` already gates the 1MB line on A20) — and
 //! the only reason a program could not reach it was that nothing was installed to
 //! hand it out. That is what a memory manager is, and this is it.

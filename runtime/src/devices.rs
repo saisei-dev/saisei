@@ -143,6 +143,15 @@ pub static DEVICE_BLOCKS: &[DeviceBlock] = &[
         capture: crate::xms::state_capture,
         restore: crate::xms::state_restore,
     },
+    // Expanded memory (EMS). Unlike XMS, whose block *contents* ride in the
+    // snapshot's linear image, EMS memory is off-CPU — only the four pages
+    // mapped into the frame are addressable — so this block carries the handle
+    // map, the frame registers AND the bytes of every allocated pool page.
+    DeviceBlock {
+        tag: *b"EMSM",
+        capture: crate::ems::state_capture,
+        restore: crate::ems::state_restore,
+    },
 ];
 
 // ---------------------------------------------------------------------------

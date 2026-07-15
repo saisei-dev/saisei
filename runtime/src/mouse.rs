@@ -10,8 +10,7 @@ use crate::cpu::*;
 use core::ffi::{c_char, c_int};
 
 extern "C" {
-    fn shim_log_crash(fmt: *const c_char, ...);
-    fn shim_save_bug_bundle(kind: *const c_char, addr: u32, msg: *const c_char);
+    fn shim_log_stdout(fmt: *const c_char, ...);
     fn shim_invoke_far_call(
         seg: u16,
         off: u16,
@@ -22,7 +21,6 @@ extern "C" {
         r_si: u16,
         r_di: u16,
     );
-    fn abort() -> !;
 }
 
 const MOUSE_DEF_XMIN: i16 = 0;
@@ -436,20 +434,25 @@ pub extern "C" fn mouse_int33_impl(file: *const c_char, func: *const c_char, lin
             }
             0x0009 | 0x000A | 0x000D | 0x000E | 0x000F | 0x0010 | 0x0013 | 0x001A | 0x001C
             | 0x001D => {}
+            // A function this driver does not implement — including the extension
+            // magic numbers a game uses to *probe* for an optional TSR (Arena does
+            // `mov ax,0x53C1; int 33h; cmp ax,1` to sniff for one). A real driver
+            // that lacks the extension does not fault the machine; it returns with
+            // the registers untouched, so the probe reads back its own AX (≠ the
+            // success value it is testing for) and the game takes its not-installed
+            // path. Aborting here was an abort-on-unknown stub that turned that
+            // ordinary negative probe into a crash. Left as a trace for visibility:
+            // a function the game genuinely *needs* will still surface as the game
+            // misbehaving, not as a dead machine.
             other => {
-                let msg =
-                    format!(
-                    "unhandled INT 33h mouse function AX=0x{:04X} (bx={:04X} cx={:04X} dx={:04X})",
-                    other, bx(), cx(), dx()
+                shim_log_stdout(
+                    c"Trace: mouse INT33 unimplemented AX=0x%04X (bx=%04X cx=%04X dx=%04X) - returning unchanged\n"
+                        .as_ptr(),
+                    other as core::ffi::c_uint,
+                    bx() as core::ffi::c_uint,
+                    cx() as core::ffi::c_uint,
+                    dx() as core::ffi::c_uint,
                 );
-                let cmsg = std::ffi::CString::new(msg).unwrap_or_default();
-                shim_log_crash(c"%s\n".as_ptr(), cmsg.as_ptr());
-                shim_save_bug_bundle(
-                    c"unimplemented_mouse".as_ptr(),
-                    ((cs() as u32) << 4) + ip() as u32,
-                    cmsg.as_ptr(),
-                );
-                abort();
             }
         }
     }

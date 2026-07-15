@@ -1819,6 +1819,16 @@ pub static mut cpu: CpuState = CpuState {
         IF: 0,
         DF: 0,
     },
+    eax_hi: 0,
+    ebx_hi: 0,
+    ecx_hi: 0,
+    edx_hi: 0,
+    esi_hi: 0,
+    edi_hi: 0,
+    ebp_hi: 0,
+    esp_hi: 0,
+    r_fs: 0,
+    r_gs: 0,
 };
 
 #[no_mangle]
@@ -2001,6 +2011,14 @@ const BIOS_SYSTEM_ISR_OFF: u16 = (BIOS_SYSTEM_ISR_LINEAR & 0xF) as u16;
 const XMS_ENTRY_LINEAR: u32 = 0x000F1100;
 const XMS_ENTRY_SEG: u16 = (XMS_ENTRY_LINEAR >> 4) as u16;
 const XMS_ENTRY_OFF: u16 = (XMS_ENTRY_LINEAR & 0xF) as u16;
+/// The EMS (expanded memory) driver's INT 67h handler and the paragraph that
+/// carries its device header. A guest detects EMS by getting the INT 67h vector,
+/// then reading the driver name at the vector's *segment*:0x0A — so the vector is
+/// expressed as EMS_ISR_SEG:0000 and "EMMXXXX0" is planted at that segment's
+/// offset 0x0A (see `shim_boot_machine`). It is a real interrupt: IRET, not RETF.
+const EMS_ISR_LINEAR: u32 = 0x000F1200;
+const EMS_ISR_SEG: u16 = (EMS_ISR_LINEAR >> 4) as u16;
+const EMS_ISR_OFF: u16 = (EMS_ISR_LINEAR & 0xF) as u16;
 
 // The F000 segment, and who has which page of it.
 //
@@ -2016,7 +2034,7 @@ const XMS_ENTRY_OFF: u16 = (XMS_ENTRY_LINEAR & 0xF) as u16;
 // This is a set of distinct addresses with no natural key — exactly the kind of
 // table that silently gains a duplicate — so it is checked here, at compile time,
 // instead of by whoever next adds an interrupt.
-const F000_RESERVATIONS: [u32; 19] = [
+const F000_RESERVATIONS: [u32; 20] = [
     DEFAULT_ISR_LINEAR,         // 0x0000
     BIOS_VIDEO_ISR_LINEAR,      // 0x0100
     BIOS_KBD_ISR_LINEAR,        // 0x0200
@@ -2036,6 +2054,7 @@ const F000_RESERVATIONS: [u32; 19] = [
     0x000F_0F10,                // BIOS static functionality table (data — see bios.rs)
     BIOS_SYSTEM_ISR_LINEAR,     // 0x1000
     XMS_ENTRY_LINEAR,           // 0x1100 (far-called, not an interrupt)
+    EMS_ISR_LINEAR,             // 0x1200 (INT 67h; +0x0A carries "EMMXXXX0")
 ];
 const _: () = {
     let mut i = 0;
@@ -8278,6 +8297,19 @@ pub unsafe extern "C" fn shim_boot_machine() {
     memw_raw_write(0, 0x1C * 4 + 2, BIOS_TIMER_TICK_ISR_SEG);
     memw_raw_write(0, 0x33 * 4, MOUSE_ISR_OFF);
     memw_raw_write(0, 0x33 * 4 + 2, MOUSE_ISR_SEG);
+    // INT 67h — the EMS manager. The vector is expressed as EMS_ISR_SEG:0000 so
+    // that a guest which reads the driver name at the vector-segment's offset 0x0A
+    // finds "EMMXXXX0" there; without this a game that requires EMS (Arena) prints
+    // "Not enough EMS" and quits. The device-header bytes are otherwise inert —
+    // `int 67h` is dispatched by address to `ems_int67_impl`, never executed.
+    memw_raw_write(0, 0x67 * 4, EMS_ISR_OFF);
+    memw_raw_write(0, 0x67 * 4 + 2, EMS_ISR_SEG);
+    {
+        let name = b"EMMXXXX0";
+        for (i, &c) in name.iter().enumerate() {
+            *seg_off(EMS_ISR_SEG, EMS_ISR_OFF.wrapping_add(0x0A + i as u16)) = c;
+        }
+    }
     // Seed the instruction-driven virtual clock from the host monotonic clock
     // so virtual and host share an epoch, and hand the chunks their first
     // instruction budget.
@@ -8652,6 +8684,44 @@ unsafe fn pit_write_data(channel: u8, value: u8) {
 // SIGUSR1 freeze diagnostic (a spin on a status port is named directly by
 // watching last_io_port stay pinned while io_access_counter races).
 static mut last_io_port: u16 = 0xFFFF;
+
+/// The CMOS/RTC index latched by a write to port 0x70; the next 0x71 access
+/// reads or writes that register. Bit 7 is the NMI-disable line and is masked off
+/// — it is not part of the register number.
+static mut cmos_index: u8 = 0x0D;
+
+/// Read a CMOS/RTC register (port 0x71). The time-of-day registers answer with
+/// the host wall clock in BCD — which is exactly what the battery-backed RTC chip
+/// on a real machine does — so a game that stamps a save or seeds from the clock
+/// gets a real date. The status registers report a 24-hour BCD chip whose update
+/// is never in progress (bit 7 of A clear), so a reader never has to spin.
+unsafe fn cmos_read(index: u8) -> u8 {
+    #[inline]
+    fn bcd(v: i32) -> u8 {
+        (((v / 10) << 4) | (v % 10)) as u8
+    }
+    let t = libc::time(core::ptr::null_mut());
+    let tmp = libc::localtime(&t);
+    if tmp.is_null() {
+        return 0;
+    }
+    let tm = &*tmp;
+    match index {
+        0x00 => bcd(tm.tm_sec.min(59)),
+        0x02 => bcd(tm.tm_min),
+        0x04 => bcd(tm.tm_hour),
+        0x06 => (tm.tm_wday + 1) as u8, // 1 = Sunday
+        0x07 => bcd(tm.tm_mday),
+        0x08 => bcd(tm.tm_mon + 1),
+        0x09 => bcd(tm.tm_year % 100),
+        0x32 => bcd(19 + (1900 + tm.tm_year) / 100), // century
+        0x0A => 0x26, // status A: 32.768kHz base, ~1024Hz rate, UIP clear
+        0x0B => 0x02, // status B: 24-hour, BCD, no interrupts
+        0x0C => 0x00, // status C: no interrupt flags pending
+        0x0D => 0x80, // status D: RTC RAM/battery valid
+        _ => 0,       // other CMOS RAM: unprogrammed
+    }
+}
 static mut last_io_was_read: u8 = 0;
 static mut io_access_counter: u64 = 0;
 
@@ -8890,6 +8960,10 @@ pub unsafe extern "C" fn inb(port: u16) -> u8 {
     }
     if port == 0x3D5 {
         return cga.crtc_regs[(cga.crtc_index & 0x1F) as usize];
+    }
+    // CMOS/RTC data port: return the register selected by the last 0x70 write.
+    if port == 0x71 {
+        return cmos_read(cmos_index);
     }
     io_port_error(cstr!("inb"), port);
     0
@@ -9174,6 +9248,12 @@ pub unsafe extern "C" fn outb(port: u16, value: u8) {
         0x3CF => {
             vga.graphics_regs[(vga.graphics_index & 0x0F) as usize] = value;
         }
+        // CMOS/RTC index (bit 7 is NMI-disable, not part of the register number).
+        0x70 => cmos_index = value & 0x7F,
+        // CMOS/RTC data: the time-of-day registers are the host clock and read
+        // only; a write to one is dropped (the game cannot set this machine's wall
+        // clock), and the CMOS RAM bytes a BIOS setup would program are not modeled.
+        0x71 => {}
         _ => io_port_error(cstr!("outb"), port),
     }
     if speaker_port {
@@ -9552,6 +9632,20 @@ unsafe extern "C" fn xms_entry_impl(
     retf_impl(file, func, line);
 }
 
+/// INT 67h — the EMS (expanded memory) manager (see `ems.rs`). A real interrupt:
+/// the guest `int 67h`s with the LIM function in AH, and it returns via IRET with
+/// status back in AH.
+unsafe extern "C" fn ems_int67_impl(
+    _expected_retip: u16,
+    file: *const c_char,
+    func: *const c_char,
+    line: c_int,
+) {
+    shim_log(cstr!("ems_int67_impl"), file, func, line, ptr::null());
+    crate::ems::control();
+    iret_impl(file, func, line);
+}
+
 /// INT 2Fh — the DOS multiplex.
 ///
 /// A multiplex call is a broadcast: whoever has hooked the vector for that ID
@@ -9920,7 +10014,7 @@ unsafe extern "C" fn int33h_impl(
     iret_impl(file, func, line);
 }
 
-static mut base_call_targets: [CallTarget; 17] = [
+static mut base_call_targets: [CallTarget; 18] = [
     CallTarget {
         addr: DEFAULT_ISR_LINEAR,
         file: ptr::null(),
@@ -10008,8 +10102,13 @@ static mut base_call_targets: [CallTarget; 17] = [
         file: ptr::null(),
         fn_: Some(xms_entry_impl),
     },
+    CallTarget {
+        addr: EMS_ISR_LINEAR,
+        file: ptr::null(),
+        fn_: Some(ems_int67_impl),
+    },
 ];
-const base_call_target_count: usize = 17;
+const base_call_target_count: usize = 18;
 
 unsafe fn is_builtin_call_target(addr: u32) -> c_int {
     for i in 0..base_call_target_count {

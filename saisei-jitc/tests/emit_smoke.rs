@@ -67,18 +67,12 @@ fn parse_imm_negative() {
     }
 }
 
-/// FS/GS are 386 registers and this CPU has neither — the prelude's `word_reg!`
-/// block declares cs/ds/es/ss and stops. The emitter used to pass capstone's
-/// segment straight through anyway, so `fs:[si]` came out as `memw(fs, si)`:
-/// a call to an `fs()` accessor that does not exist, which failed the WHOLE
-/// chunk at rustc with "cannot find function `fs`". The bytes come from the
-/// speculative decoder reading data as code, so nothing was ever *meant* to run
-/// them — but a chunk that will not compile is a chunk silently lost.
-///
-/// So they take the route every other inexpressible construct takes: a run-time
-/// `jit_unsupported_instruction` trap, paid only if control actually arrives.
+/// FS and GS are 386 additions, and this machine now models a 386 that has them
+/// (Arena's own code uses `push fs`, `mov fs,ax`, `fs:[...]`). So an `fs:[si]`
+/// override lowers to a real `memw(fs(), si())` — the prelude carries the fs()/
+/// gs() accessors — exactly as es/ss do, rather than trapping.
 #[test]
-fn an_fs_segment_override_traps_instead_of_calling_a_register_that_does_not_exist() {
+fn an_fs_segment_override_lowers_to_the_fs_accessor() {
     let func = json!({
         "start": 0x0000,
         "instructions": [
@@ -88,15 +82,12 @@ fn an_fs_segment_override_traps_instead_of_calling_a_register_that_does_not_exis
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert!(src.contains("jit_unsupported_instruction"), "{src}");
-    assert!(
-        !src.contains("fs()"),
-        "emitted a call to a nonexistent register: {src}"
-    );
+    assert!(src.contains("r.memw(r.fs(), r.si())"), "{src}");
+    assert!(!src.contains("jit_unsupported_instruction"), "{src}");
 }
 
 #[test]
-fn the_gs_register_itself_traps_too() {
+fn the_gs_register_pushes_like_any_other_segment() {
     let func = json!({
         "start": 0x0000,
         "instructions": [
@@ -105,11 +96,8 @@ fn the_gs_register_itself_traps_too() {
         ],
     });
     let src = render_rs(&func, &[], "");
-    assert!(src.contains("jit_unsupported_instruction"), "{src}");
-    assert!(
-        !src.contains("gs()"),
-        "emitted a call to a nonexistent register: {src}"
-    );
+    assert!(src.contains("r.gs()"), "{src}");
+    assert!(!src.contains("jit_unsupported_instruction"), "{src}");
 }
 
 /// The control: the segments this CPU *does* have must still lower normally, or

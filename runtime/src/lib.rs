@@ -25,6 +25,7 @@ pub mod bios;
 pub mod cpu;
 pub mod devices;
 pub mod dos;
+pub mod ems;
 pub mod io_bus;
 pub mod keyboard;
 pub mod mouse;

@@ -23,7 +23,6 @@
 
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
-use std::sync::OnceLock;
 
 use regex::Regex;
 
@@ -40,57 +39,6 @@ pub type R<T> = Result<T, Unsupported>;
 
 fn uns<T>(what: impl Into<String>) -> R<T> {
     Err(Unsupported(what.into()))
-}
-
-/// FS or GS named anywhere in an instruction's operands — as a segment override
-/// (a 0x64/0x65 prefix) or as the register itself (`push fs`, `mov ax, gs`).
-///
-/// They are 386 additions, and the CPU this backend targets does not have them:
-/// the prelude's `word_reg!` block declares cs, ds, es and ss, and nothing else.
-/// So an operand naming one cannot be lowered — but it was being lowered anyway.
-/// `rewrite_mem_op` passes capstone's segment straight through, so `fs:[si]`
-/// became `memw(fs, si)`, a call to an `fs()` accessor that does not exist, and
-/// rustc failed the **whole chunk** with "cannot find function `fs`". Nothing
-/// emits such bytes on purpose — it is the speculative decoder reading data as
-/// code — but a chunk that will not compile is a chunk silently lost, and the
-/// emitter had no idea it had produced one.
-///
-/// Reporting it as `Unsupported` puts it on the path built for exactly this case
-/// (see `render_block`): the instruction becomes a `jit_unsupported_instruction`
-/// trap, the chunk still compiles, and the gap is paid only if control really
-/// arrives at those bytes — which, for data decoded as code, it never does.
-///
-/// Matched against capstone's own operand text, not the variable-renamed copy, so
-/// a game annotation that happened to name something `fs` cannot trip it.
-fn fs_gs_operand(insn: &Insn, raw_op_str: &str) -> Option<String> {
-    let overridden = insn
-        .get("detail")
-        .and_then(|d| d.get("mem_refs"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|m| m.get("segment").and_then(Value::as_str))
-        .find(|s| s.eq_ignore_ascii_case("fs") || s.eq_ignore_ascii_case("gs"));
-    // The wording matters: this text is pasted into the emitted chunk as the trap's
-    // message, and `runtime_abi_contract` reads that chunk back looking for calls
-    // to runtime symbols with `(\w+)\s*\(`. An identifier followed by a space and a
-    // bracket — "override (386+)" — reads to it as a call to `override`, and the
-    // chunk gets reported for using a symbol the prelude never declared. Keep
-    // brackets out of it.
-    if let Some(seg) = overridden {
-        return Some(format!(
-            "{}: segment override on a CPU with no such register",
-            seg.to_lowercase()
-        ));
-    }
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"(?i)\b(fs|gs)\b").unwrap());
-    re.captures(raw_op_str).map(|c| {
-        format!(
-            "{}: 386 segment register, and this CPU has none",
-            c[1].to_lowercase()
-        )
-    })
 }
 
 /// A Rust `c"..."` literal holding `what`, safe to paste into emitted code.
@@ -142,7 +90,9 @@ fn parse_hex16(t: &str) -> Option<i64> {
 
 const WORD_REGS: &[&str] = &["ax", "bx", "cx", "dx", "si", "di", "bp", "sp"];
 const BYTE_REGS: &[&str] = &["al", "ah", "bl", "bh", "cl", "ch", "dl", "dh"];
-const SEG_REGS: &[&str] = &["cs", "ds", "es", "ss"];
+/// 386 32-bit GP registers (real-mode data operands under a 0x66 prefix).
+const DWORD_REGS: &[&str] = &["eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp"];
+const SEG_REGS: &[&str] = &["cs", "ds", "es", "ss", "fs", "gs"];
 /// 16-bit effective-address base/index registers (the only regs legal in `[]`).
 const ADDR_REGS: &[&str] = &["bx", "bp", "si", "di"];
 
@@ -152,11 +102,27 @@ fn is_word_reg(l: &str) -> bool {
 fn is_byte_reg(l: &str) -> bool {
     BYTE_REGS.contains(&l)
 }
+fn is_dword_reg(l: &str) -> bool {
+    DWORD_REGS.contains(&l)
+}
 fn is_reg(l: &str) -> bool {
-    is_word_reg(l) || is_byte_reg(l) || SEG_REGS.contains(&l)
+    is_word_reg(l) || is_byte_reg(l) || is_dword_reg(l) || SEG_REGS.contains(&l)
 }
 fn operand_width8(op: &str) -> bool {
     op.starts_with("memb(") || is_byte_reg(&op.to_lowercase())
+}
+/// Operand bit width (8/16/32) from a rewrite_operands-produced operand string.
+/// Immediates and anything unrecognized default to 16 — for a two-operand
+/// instruction the width comes from its non-immediate (register/memory) side.
+fn op_width(op: &str) -> u32 {
+    let l = op.to_lowercase();
+    if l.starts_with("memb(") || is_byte_reg(&l) {
+        8
+    } else if l.starts_with("memd(") || is_dword_reg(&l) {
+        32
+    } else {
+        16
+    }
 }
 
 /// Noreturn runtime calls: after one, the block must `return -1;` — the
@@ -211,13 +177,13 @@ fn localize_regs(line: &str) -> String {
     static CALLS_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let regs_re = REGS_RE.get_or_init(|| {
         Regex::new(
-            r"\b((?:set_)?(?:ax|bx|cx|dx|si|di|bp|sp|ip|cs|ds|es|ss|al|ah|bl|bh|cl|ch|dl|dh|CF|PF|ZF|SF|OF|IF|DF))\(",
+            r"\b((?:set_)?(?:eax|ebx|ecx|edx|esi|edi|ebp|esp|ax|bx|cx|dx|si|di|bp|sp|ip|cs|ds|es|ss|fs|gs|al|ah|bl|bh|cl|ch|dl|dh|CF|PF|ZF|SF|OF|IF|DF))\(",
         )
         .unwrap()
     });
     let calls_re = CALLS_RE.get_or_init(|| {
         Regex::new(
-            r"\b(memb_write|memw_write|memb|memw|rcb_read8|rcb_read16|rcb_write8|rcb_write16|inb|inw|outb|outw|JIT_BUDGET|HLT_WAIT|run_interrupt_resume|run_interrupt|schedule_interrupt|dos_api|dos_exit|bios_keyboard|rep_movsb_block|rep_movsw_block|rep_stosb_block|call_table_|lcall_table_|jump_table_|near_ret_tail_|long_jump_|iret_|retf_pop_|retf_|jit_unsupported_instruction)\(",
+            r"\b(memb_write|memw_write|memd_write|memb|memw|memd|rcb_read8|rcb_read16|rcb_write8|rcb_write16|inb|inw|outb|outw|JIT_BUDGET|HLT_WAIT|run_interrupt_resume|run_interrupt|schedule_interrupt|dos_api|dos_exit|bios_keyboard|rep_movsb_block|rep_movsw_block|rep_stosb_block|call_table_|lcall_table_|jump_table_|near_ret_tail_|long_jump_|iret_|retf_pop_|retf_|jit_unsupported_instruction)\(",
         )
         .unwrap()
     });
@@ -269,8 +235,8 @@ fn insn_weight(insn: &Insn) -> u32 {
         "shl" | "shr" | "sar" | "sal" | "rol" | "ror" | "rcl" | "rcr" => 2, // 3+n cycles
         // Bare string op ≈ 7 cycles; under rep this is setup only (the
         // per-iteration debit happens at run time).
-        "movsb" | "movsw" | "stosb" | "stosw" | "lodsb" | "lodsw" | "cmpsb" | "cmpsw" | "scasb"
-        | "scasw" => 2,
+        "movsb" | "movsw" | "movsd" | "stosb" | "stosw" | "stosd" | "lodsb" | "lodsw" | "lodsd"
+        | "cmpsb" | "cmpsw" | "cmpsd" | "scasb" | "scasw" | "scasd" => 2,
         // The port-string ops carry an I/O access, like `in`/`out` above.
         "insb" | "insw" | "outsb" | "outsw" => 25,
         "lea" => 1, // address arithmetic only — no memory access
@@ -295,16 +261,28 @@ fn var_re() -> &'static Regex {
 
 fn mem_call_re() -> &'static Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)^mem([bw])\((cs|ds|es|ss), (.+)\)$").unwrap())
+    RE.get_or_init(|| Regex::new(r"(?i)^mem([bw])\((cs|ds|es|ss|fs|gs), (.+)\)$").unwrap())
 }
 
 /// Parse a rewrite_mem_op result `memX(seg, addr)` -> (is_byte, seg, addr).
+/// Matches only memb/memw; a 32-bit `memd(...)` goes through `parse_memd`.
 fn parse_mem(op: &str) -> Option<(bool, String, String)> {
     let c = mem_call_re().captures(op.trim())?;
     let byte = c.get(1).unwrap().as_str().eq_ignore_ascii_case("b");
     let seg = c.get(2).unwrap().as_str().to_lowercase();
     let addr = c.get(3).unwrap().as_str().trim().to_string();
     Some((byte, seg, addr))
+}
+
+/// Parse a 32-bit memory operand `memd(seg, addr)` -> (seg, addr).
+fn parse_memd(op: &str) -> Option<(String, String)> {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"(?i)^memd\((cs|ds|es|ss|fs|gs), (.+)\)$").unwrap());
+    let c = re.captures(op.trim())?;
+    Some((
+        c.get(1).unwrap().as_str().to_lowercase(),
+        c.get(2).unwrap().as_str().trim().to_string(),
+    ))
 }
 
 /// Render one effective-address term (a base/index reg or a constant) as u32.
@@ -474,6 +452,10 @@ impl RRenderer {
             let f = if byte { "memb" } else { "memw" };
             return Ok(format!("{f}({seg}(), {off})"));
         }
+        if let Some((seg, addr)) = parse_memd(op) {
+            let off = render_addr(&addr).ok_or_else(|| Unsupported(format!("addr:{addr}")))?;
+            return Ok(format!("memd({seg}(), {off})"));
+        }
         if let Some(v) = parse_imm(op) {
             // Disassembler-signed immediates (e.g. `-0x4c`) render as their 16-bit
             // two's-complement; the consuming arithmetic masks to the operand
@@ -484,6 +466,19 @@ impl RRenderer {
             return Ok(format!("0x{v:X}"));
         }
         uns(format!("rvalue:{op}"))
+    }
+
+    /// rvalue at a known operand width. Identical to `rvalue` for registers and
+    /// memory (their accessors carry the width); differs only for a *negative*
+    /// immediate in a 32-bit operation, which must sign-extend to the full 32 bits
+    /// (`-1` → 0xFFFFFFFF) instead of the 16-bit two's-complement `rvalue` returns.
+    fn rvalue_wide(&self, op: &str, width: u32) -> R<String> {
+        if width == 32 {
+            if let Some(v) = parse_imm(op) {
+                return Ok(format!("0x{:X}", v as u32));
+            }
+        }
+        self.rvalue(op)
     }
 
     /// Lower a store into a (rewrite_operands-produced) destination operand.
@@ -506,6 +501,10 @@ impl RRenderer {
             let off = render_addr(&addr).ok_or_else(|| Unsupported(format!("addr:{addr}")))?;
             let f = if byte { "memb_write" } else { "memw_write" };
             return Ok(vec![format!("{f}({seg}(), {off}, {val});")]);
+        }
+        if let Some((seg, addr)) = parse_memd(dest) {
+            let off = render_addr(&addr).ok_or_else(|| Unsupported(format!("addr:{addr}")))?;
+            return Ok(vec![format!("memd_write({seg}(), {off}, {val});")]);
         }
         uns(format!("store:{dest}"))
     }
@@ -810,8 +809,65 @@ impl RRenderer {
             }
         }
 
-        let sv = self.rvalue(&src)?;
+        // Width comes from the destination: `mov eax, 0xC0000000` must keep all 32
+        // bits of the immediate, not truncate it to a word.
+        let sv = self.rvalue_wide(&src, op_width(&dest))?;
         self.store(&dest, &sv)
+    }
+
+    /// movzx/movsx dest, src — load a narrower source into a wider destination,
+    /// zero- (movzx) or sign- (movsx) extended. Flags are untouched. The source is
+    /// read at its own width; the extension chain casts through the source's signed
+    /// type (for movsx) then the destination's, exactly as the 386 widens.
+    fn handle_movzx(&mut self, insn: &Insn, sign_extend: bool) -> R<Vec<String>> {
+        let op_str = decode_variables(s(insn, "op_str"));
+        let (d, spart) = self.split2(&op_str)?;
+        let rw = self.t.rewrite_operands(insn, &[d, spart]);
+        let (dest, src) = (rw[0].clone(), rw[1].clone());
+        if self.t.match_rcb_access(&src).is_some() {
+            return uns("movzx rcb");
+        }
+        let dw = op_width(&dest);
+        let sw = op_width(&src);
+        let sv = self.rvalue(&src)?;
+        let ud = match dw {
+            8 => "u8",
+            32 => "u32",
+            _ => "u16",
+        };
+        let val = if sign_extend {
+            let is = match sw {
+                8 => "i8",
+                32 => "i32",
+                _ => "i16",
+            };
+            let id = match dw {
+                8 => "i8",
+                32 => "i32",
+                _ => "i16",
+            };
+            format!("((({sv}) as {is}) as {id}) as {ud}")
+        } else {
+            format!("(({sv}) as {ud})")
+        };
+        self.store(&dest, &val)
+    }
+
+    /// setcc dest8 — store 1 into the byte operand if the condition holds, else 0.
+    /// Flags are untouched. The condition is the SETcc twin of a Jcc: `setae` is
+    /// `jae`, `setnz` is `jnz`, so the whole condition table is reused verbatim.
+    fn handle_setcc(&mut self, insn: &Insn) -> R<Vec<String>> {
+        let mnem = s(insn, "mnemonic").to_lowercase();
+        let jmp = format!("j{}", &mnem[3..]);
+        let cond = jcc_condition(&jmp, None, None);
+        let cond = rustify_cond(&cond).ok_or_else(|| Unsupported(format!("setcc:{mnem}")))?;
+        let op_str = decode_variables(s(insn, "op_str"));
+        let rw = self.t.rewrite_operands(insn, &[op_str.trim().to_string()]);
+        let dest = rw[0].clone();
+        if self.t.match_rcb_access(&dest).is_some() {
+            return uns(format!("{mnem} rcb"));
+        }
+        self.store(&dest, &format!("if {cond} {{ 1u8 }} else {{ 0u8 }}"))
     }
 
     fn handle_cmp_test(&mut self, insn: &Insn, is_test: bool) -> R<Vec<String>> {
@@ -827,13 +883,15 @@ impl RRenderer {
         if self.t.match_rcb_access(&left).is_some() || self.t.match_rcb_access(&right).is_some() {
             return uns(format!("{mnem} rcb"));
         }
-        let lv = self.rvalue(&left)?;
-        let rv = self.rvalue(&right)?;
-        let is_byte = left.starts_with("memb(") || is_byte_reg(&left.to_lowercase());
-        let (shift, sign, rtype) = if is_byte {
-            (7u32, 0x80u32, "u8")
-        } else {
-            (15, 0x8000, "u16")
+        // Width comes from whichever operand carries one (an immediate does not);
+        // both are then read as u32, which holds all three widths.
+        let width = op_width(&left).max(op_width(&right));
+        let lv = self.rvalue_wide(&left, width)?;
+        let rv = self.rvalue_wide(&right, width)?;
+        let (shift, sign, rtype) = match width {
+            8 => (7u32, 0x80u32, "u8"),
+            32 => (31, 0x80000000, "u32"),
+            _ => (15, 0x8000, "u16"),
         };
         let mut lines = vec![
             "{".into(),
@@ -867,6 +925,17 @@ impl RRenderer {
         let op_str = decode_variables(s(insn, "op_str"));
         let rw = self.t.rewrite_operands(insn, &[op_str]);
         let op = rw[0].clone();
+        // A 0x66-prefixed push moves 4 bytes and decrements sp by 4 (the stack
+        // address size stays 16-bit in real mode). The pushed value is read
+        // *before* sp changes, so `push esp` records the pre-decrement esp.
+        if op_width(&op) == 32 {
+            let v = self.rvalue_wide(&op, 32)?;
+            return Ok(vec![
+                format!("let push_value: u32 = {v};"),
+                "set_sp((sp().wrapping_sub(4)) & 0xFFFF);".into(),
+                "memd_write(ss(), sp(), push_value);".into(),
+            ]);
+        }
         if op.eq_ignore_ascii_case("sp") {
             return Ok(vec![
                 "let push_value = sp();".into(),
@@ -885,6 +954,16 @@ impl RRenderer {
         let op_str = decode_variables(s(insn, "op_str"));
         let rw = self.t.rewrite_operands(insn, &[op_str]);
         let dest = rw[0].clone();
+        // 0x66-prefixed pop: read 4 bytes, then sp += 4.
+        if op_width(&dest) == 32 {
+            let mut lines = vec!["{".into(), "    let popped: u32 = memd(ss(), sp());".into()];
+            for l in self.store(&dest, "popped")? {
+                lines.push(format!("    {l}"));
+            }
+            lines.push("    set_sp((sp().wrapping_add(4)) & 0xFFFF);".into());
+            lines.push("}".into());
+            return Ok(lines);
+        }
         if dest.eq_ignore_ascii_case("sp") {
             return Ok(vec![
                 "{".into(),
@@ -1117,6 +1196,20 @@ impl RRenderer {
             "outsw" => self.rep_port_string(insn, base, 2),
             "movsb" => Ok(vec![format!("rep_movsb_block(es(), {seg}());")]),
             "movsw" => Ok(vec![format!("rep_movsw_block(es(), {seg}());")]),
+            // No dword block helper in the prelude; emit the loop inline over memd
+            // (two word accesses each, keeping RCB/VGA/SS routing faithful).
+            "movsd" => Ok(vec![
+                "{".into(),
+                "    JIT_BUDGET(cx().wrapping_mul(2) as u32); // rep iterations debit virtual time".into(),
+                "    let delta: i32 = if DF() != 0 { -4 } else { 4 };".into(),
+                "    while cx() != 0 {".into(),
+                format!("        memd_write(es(), di(), memd({seg}(), si()));"),
+                "        set_si(((si() as i32 + delta) & 0xFFFF) as u16);".into(),
+                "        set_di(((di() as i32 + delta) & 0xFFFF) as u16);".into(),
+                "        set_cx(cx().wrapping_sub(1));".into(),
+                "    }".into(),
+                "}".into(),
+            ]),
             "stosb" => Ok(vec!["rep_stosb_block(es());".into()]),
             "stosw" => Ok(vec![
                 "{".into(),
@@ -1124,6 +1217,17 @@ impl RRenderer {
                 "    let delta: i32 = if DF() != 0 { -2 } else { 2 };".into(),
                 "    while cx() != 0 {".into(),
                 "        memw_write(es(), di(), ax());".into(),
+                "        set_di(((di() as i32 + delta) & 0xFFFF) as u16);".into(),
+                "        set_cx(cx().wrapping_sub(1));".into(),
+                "    }".into(),
+                "}".into(),
+            ]),
+            "stosd" => Ok(vec![
+                "{".into(),
+                "    JIT_BUDGET(cx().wrapping_mul(2) as u32); // rep iterations debit virtual time".into(),
+                "    let delta: i32 = if DF() != 0 { -4 } else { 4 };".into(),
+                "    while cx() != 0 {".into(),
+                "        memd_write(es(), di(), eax());".into(),
                 "        set_di(((di() as i32 + delta) & 0xFFFF) as u16);".into(),
                 "        set_cx(cx().wrapping_sub(1));".into(),
                 "    }".into(),
@@ -1153,18 +1257,19 @@ impl RRenderer {
             ]),
             // F3 in front of a string *compare* is REPE — same encoding, same
             // semantics; only the spelling differs from one decoder to the next.
-            "cmpsb" | "cmpsw" | "scasb" | "scasw" => self.handle_repe(insn, base),
+            "cmpsb" | "cmpsw" | "cmpsd" | "scasb" | "scasw" | "scasd" => {
+                self.handle_repe(insn, base)
+            }
             other => uns(format!("rep {other}")),
         }
     }
 
     /// (is_byte, width-type, mask, top-bit-shift) for a dest operand.
     fn width_of(&self, dest: &str) -> (bool, &'static str, u32, u32) {
-        let is_byte = dest.starts_with("memb(") || is_byte_reg(&dest.to_lowercase());
-        if is_byte {
-            (true, "u8", 0xFF, 7)
-        } else {
-            (false, "u16", 0xFFFF, 15)
+        match op_width(dest) {
+            8 => (true, "u8", 0xFF, 7),
+            32 => (false, "u32", 0xFFFFFFFF, 31),
+            _ => (false, "u16", 0xFFFF, 15),
         }
     }
 
@@ -1177,7 +1282,7 @@ impl RRenderer {
         if self.t.match_rcb_access(&dest).is_some() {
             return uns(format!("{mnem} rcb"));
         }
-        let (is_byte, wt, _mask, shift) = self.width_of(&dest);
+        let (_is_byte, wt, _mask, shift) = self.width_of(&dest);
         let dv = self.rvalue(&dest)?;
         let sv = self.rvalue(&src)?;
         let mut l = vec![
@@ -1194,7 +1299,11 @@ impl RRenderer {
                 .collect())
         };
         if mnem == "sar" {
-            let st = if is_byte { "i8" } else { "i16" };
+            let st = match wt {
+                "u8" => "i8",
+                "u32" => "i32",
+                _ => "i16",
+            };
             l.push(format!("        let mut tmp: {st} = ({dv}) as {st};"));
             l.push("        while count != 0 { count -= 1;".into());
             l.push("            set_CF((tmp & 1) as u8);".into());
@@ -1575,6 +1684,25 @@ impl RRenderer {
                     self.t.rewrite_operands(insn, &[parts[1].clone()])[0].clone(),
                 )
             };
+            // 32-bit imul (`imul r32, r/m32, imm32`): the product is 64-bit wide,
+            // the destination takes its low 32, and CF/OF flag a result that does
+            // not fit signed-32. The 16-bit form is the same shape one width down.
+            if op_width(&dest) == 32 {
+                let (fav, fbv) = (self.rvalue_wide(&fa, 32)?, self.rvalue_wide(&fb, 32)?);
+                let mut l = vec![
+                    "{".into(),
+                    format!(
+                        "    let tmp: i64 = (({fav}) as u32 as i32 as i64).wrapping_mul(({fbv}) as u32 as i32 as i64);"
+                    ),
+                ];
+                for x in self.store(&dest, "(tmp & 0xFFFFFFFF) as u32")? {
+                    l.push(format!("    {x}"));
+                }
+                l.push("    let v = (tmp != (tmp as i32 as i64)) as u8;".into());
+                l.push("    set_CF(v); set_OF(v);".into());
+                l.push("}".into());
+                return Ok(l);
+            }
             let (fav, fbv) = (self.rvalue(&fa)?, self.rvalue(&fb)?);
             let mut l = vec![
                 "{".into(),
@@ -1650,8 +1778,12 @@ impl RRenderer {
         if self.t.match_rcb_access(&operand).is_some() {
             return uns("neg rcb");
         }
-        let (is_byte, wt, mask, shift) = self.width_of(&operand);
-        let sign_bit: u32 = if is_byte { 0x80 } else { 0x8000 };
+        let (_is_byte, wt, mask, shift) = self.width_of(&operand);
+        let sign_bit: u32 = match wt {
+            "u8" => 0x80,
+            "u32" => 0x8000_0000,
+            _ => 0x8000,
+        };
         let dv = self.rvalue(&operand)?;
         let mut l = vec!["{".into(), format!("    let tmp: {wt} = ({dv}) as {wt};")];
         for x in self.store(
@@ -1846,7 +1978,14 @@ impl RRenderer {
             || is_byte_reg(&dest.to_lowercase())
             || src.starts_with("memb(")
             || is_byte_reg(&src.to_lowercase());
-        let wt = if is_byte { "u8" } else { "u16" };
+        let is_dword = op_width(&dest) == 32 || op_width(&src) == 32;
+        let wt = if is_byte {
+            "u8"
+        } else if is_dword {
+            "u32"
+        } else {
+            "u16"
+        };
         let dv = self.rvalue(&dest)?;
         let sv = self.rvalue(&src)?;
         let mut lines = vec!["{".into(), format!("    let tmp: {wt} = {dv};")];
@@ -1904,19 +2043,26 @@ impl RRenderer {
         let (w, rd, shift, sign): (i64, &str, u32, u32) = match base {
             "cmpsb" | "scasb" => (1, "memb", 7, 0x80),
             "cmpsw" | "scasw" => (2, "memw", 15, 0x8000),
+            "cmpsd" | "scasd" => (4, "memd", 31, 0x80000000),
             other => {
                 let prefix = if break_when_equal { "repne" } else { "repe" };
                 return uns(format!("{prefix} {other}"));
             }
         };
-        let rt = if w == 1 { "u8" } else { "u16" };
-        // left value: cmps reads [seg:si]; scas uses al/ax.
+        let rt = match w {
+            1 => "u8",
+            4 => "u32",
+            _ => "u16",
+        };
+        // left value: cmps reads [seg:si]; scas uses al/ax/eax.
         let left = if base.starts_with("cmp") {
             format!("{rd}({seg}(), si())")
-        } else if w == 1 {
-            "al()".into()
         } else {
-            "ax()".into()
+            match w {
+                1 => "al()".into(),
+                4 => "eax()".into(),
+                _ => "ax()".into(),
+            }
         };
         let advance_si = base.starts_with("cmp");
         let mut l = vec![
@@ -1969,7 +2115,10 @@ impl RRenderer {
     /// for the repeat to look at. MechWarrior clears a buffer with `repne stosw`,
     /// which is `rep stosw`, and refusing it was refusing a plain REP.
     fn rep_tests_zf(base: &str) -> bool {
-        matches!(base, "cmpsb" | "cmpsw" | "scasb" | "scasw")
+        matches!(
+            base,
+            "cmpsb" | "cmpsw" | "cmpsd" | "scasb" | "scasw" | "scasd"
+        )
     }
 
     /// repe/repz cmpsb/cmpsw/scasb/scasw — repeat while equal (ZF=1).
@@ -2202,12 +2351,11 @@ impl RRenderer {
     /// (is_byte, mask, sign, shift, store-cast-type, read-back-expr) for an
     /// arithmetic destination operand.
     fn dest_meta(&self, dest: &str) -> R<(u32, u32, u32, &'static str, String)> {
-        let is_byte = dest.starts_with("memb(") || is_byte_reg(&dest.to_lowercase());
         let dr = self.rvalue(dest)?;
-        if is_byte {
-            Ok((0xFF, 0x80, 7, "u8", dr))
-        } else {
-            Ok((0xFFFF, 0x8000, 15, "u16", dr))
+        match op_width(dest) {
+            8 => Ok((0xFF, 0x80, 7, "u8", dr)),
+            32 => Ok((0xFFFFFFFF, 0x80000000, 31, "u32", dr)),
+            _ => Ok((0xFFFF, 0x8000, 15, "u16", dr)),
         }
     }
 
@@ -2233,10 +2381,11 @@ impl RRenderer {
                 "wrapping_sub"
             };
             let limit = if is_inc {
-                if mask == 0xFF {
-                    0x7Fu32
-                } else {
-                    0x7FFF
+                // Overflow on inc happens stepping off the largest positive value.
+                match mask {
+                    0xFF => 0x7Fu32,
+                    0xFFFFFFFF => 0x7FFFFFFF,
+                    _ => 0x7FFF,
                 }
             } else {
                 sign
@@ -2286,7 +2435,10 @@ impl RRenderer {
                 Ok(lines)
             }
             "add" | "adc" | "sub" | "sbb" => {
-                let srcv = self.rvalue(&src)?;
+                let srcv = self.rvalue_wide(&src, op_width(&dest))?;
+                if wt == "u32" {
+                    return self.arith_add_sub_dword(&mnem, &dest, &dr, &srcv, sign, shift);
+                }
                 let mut lines = vec!["{".into(), format!("    let old: u32 = ({dr}) as u32;")];
                 match mnem.as_str() {
                     "add" => {
@@ -2335,7 +2487,7 @@ impl RRenderer {
                 Ok(lines)
             }
             "and" | "or" | "xor" => {
-                let srcv = self.rvalue(&src)?;
+                let srcv = self.rvalue_wide(&src, op_width(&dest))?;
                 let op = match mnem.as_str() {
                     "and" => '&',
                     "or" => '|',
@@ -2359,6 +2511,71 @@ impl RRenderer {
             }
             other => uns(format!("arith:{other}")),
         }
+    }
+
+    /// 32-bit add/adc/sub/sbb. Separate from the 8/16-bit path because carry can
+    /// no longer be read off a wider intermediate: a u32 sum wraps at exactly the
+    /// operand width, so `tmp > mask` is always false. Carry is taken from a u64
+    /// sum instead; SUB/SBB borrow from the u64 subtrahend so `src + CF` cannot
+    /// wrap before the comparison. OF and Z/P/S use the truncated u32 result, and
+    /// the OF subtrahend matches the CF one (SBB folds the borrow in), mirroring
+    /// the validated 8/16-bit formula.
+    fn arith_add_sub_dword(
+        &self,
+        mnem: &str,
+        dest: &str,
+        dr: &str,
+        srcv: &str,
+        sign: u32,
+        shift: u32,
+    ) -> R<Vec<String>> {
+        let mut lines = vec![
+            "{".into(),
+            format!("    let old: u32 = ({dr}) as u32;"),
+            format!("    let src: u32 = ({srcv}) as u32;"),
+        ];
+        let is_addlike = matches!(mnem, "add" | "adc");
+        match mnem {
+            "add" => {
+                lines.push("    let wide: u64 = old as u64 + src as u64;".into());
+                lines.push("    set_CF((wide > 0xFFFFFFFF) as u8);".into());
+                lines.push("    let tmp: u32 = wide as u32;".into());
+                lines.push("    let ofsub: u32 = src;".into());
+            }
+            "adc" => {
+                lines.push("    let wide: u64 = old as u64 + src as u64 + CF() as u64;".into());
+                lines.push("    set_CF((wide > 0xFFFFFFFF) as u8);".into());
+                lines.push("    let tmp: u32 = wide as u32;".into());
+                lines.push("    let ofsub: u32 = src;".into());
+            }
+            "sub" => {
+                lines.push("    set_CF((old < src) as u8);".into());
+                lines.push("    let tmp: u32 = old.wrapping_sub(src);".into());
+                lines.push("    let ofsub: u32 = src;".into());
+            }
+            _ => {
+                // sbb: subtrahend is src + borrow, computed wide to avoid a wrap.
+                lines.push("    let sub_full: u64 = src as u64 + CF() as u64;".into());
+                lines.push("    set_CF(((old as u64) < sub_full) as u8);".into());
+                lines.push("    let tmp: u32 = (old as u64).wrapping_sub(sub_full) as u32;".into());
+                lines.push("    let ofsub: u32 = sub_full as u32;".into());
+            }
+        }
+        for l in self.store(dest, "tmp")? {
+            lines.push(format!("    {l}"));
+        }
+        if is_addlike {
+            lines.push(format!(
+                "    set_OF(((!(old ^ ofsub) & (old ^ tmp) & 0x{sign:X}) != 0) as u8);"
+            ));
+        } else {
+            lines.push(format!(
+                "    set_OF((((old ^ ofsub) & (old ^ tmp) & 0x{sign:X}) != 0) as u8);"
+            ));
+        }
+        lines.push("}".into());
+        self.flags_zpf_sf(&mut lines, dr, shift);
+        Ok(lines)
     }
 
     /// Dispatch on mnemonic. Unported mnemonics -> Unsupported (fall back to C).
@@ -2388,13 +2605,18 @@ impl RRenderer {
             "nop" | "db" => Ok(Vec::new()),
             "lodsb" => self.h_lods(insn, 1, "al", "memb"),
             "lodsw" => self.h_lods(insn, 2, "ax", "memw"),
+            "lodsd" => self.h_lods(insn, 4, "eax", "memd"),
             "stosb" => self.h_stos(1, "al", "memb"),
             "stosw" => self.h_stos(2, "ax", "memw"),
+            "stosd" => self.h_stos(4, "eax", "memd"),
             "movsb" => self.h_movs(insn, 1, "memb"),
             "movsw" => self.h_movs(insn, 2, "memw"),
+            "movsd" => self.h_movs(insn, 4, "memd"),
             "cmpsb" => self.h_cmpsb(insn),
             "scasb" => self.h_cmp_str("al()", "es", 1),
             "scasw" => self.h_cmp_str("ax()", "es", 2),
+            "movzx" => self.handle_movzx(insn, false),
+            "movsx" => self.handle_movzx(insn, true),
             "insb" => self.h_ins(1),
             "insw" => self.h_ins(2),
             "outsb" => self.h_outs(insn, 1),
@@ -2449,6 +2671,8 @@ impl RRenderer {
             "ljmp" => self.handle_ljmp(insn),
             "lds" => self.handle_load_far(insn, "ds"),
             "les" => self.handle_load_far(insn, "es"),
+            "lfs" => self.handle_load_far(insn, "fs"),
+            "lgs" => self.handle_load_far(insn, "gs"),
             "in" | "out" => self.handle_io(insn),
             "pushf" => self.handle_pushf(),
             "popf" => self.handle_popf(),
@@ -2476,6 +2700,7 @@ impl RRenderer {
             "hlt" => self.simple(&["HLT_WAIT();"]),
             "cbw" => self.simple(&["set_ax(((al() as i8) as i16) as u16);"]),
             "cwd" => self.simple(&["set_dx(if (ax() & 0x8000) != 0 { 0xFFFF } else { 0 });"]),
+            m if m.starts_with("set") => self.handle_setcc(insn),
             other => uns(format!("mnemonic:{other}")),
         }
     }
@@ -2550,13 +2775,7 @@ impl RRenderer {
         let succs = |a: i64| succ.get(&a).cloned().unwrap_or_default();
         let is_last = idx == n - 1;
         let mnem = s(insn, "mnemonic").to_string();
-        let raw_op_str = s(insn, "op_str").to_string();
         let op_str = decode_variables(s(insn, "op_str"));
-
-        // Before anything is lowered: this CPU has no FS or GS to lower it to.
-        if let Some(what) = fs_gs_operand(insn, &raw_op_str) {
-            return uns(format!("{mnem} {raw_op_str}: {what}"));
-        }
 
         if is_last && insn.get("op").and_then(Value::as_str) == Some("INDIRECT_NEAR_JMP") {
             let expr = self.indirect_jump_target(insn)?;
