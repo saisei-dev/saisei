@@ -657,6 +657,17 @@ pub extern "C" fn bios_teletype_output(ch_val: u8, page: u8, attr: u8) {
 #[no_mangle]
 pub extern "C" fn bios_keyboard_impl(file: *const c_char, func: *const c_char, line: c_int) {
     log_open(file, func, line);
+    // A guest reading the keyboard while still in a text video mode is sitting at an
+    // interactive text screen: its menu IS the UI (King's Bounty's character /
+    // difficulty select, a text-mode setup). Reveal it so the pre-game hold lifts —
+    // otherwise the hold waits for a graphics frame this screen will not produce
+    // until the player, who cannot see it, has answered. Only the reads/peeks
+    // (00/01/10/11), i.e. actually waiting on a key, not a shift-flag query.
+    if matches!(ah(), 0x00 | 0x01 | 0x10 | 0x11)
+        && crate::video::is_text_mode(unsafe { (*bv()).video_mode }) != 0
+    {
+        crate::sdl::reveal_text_ui();
+    }
     match ah() {
         0x00 | 0x10 => {
             let mut ascii: u8 = 0;

@@ -624,6 +624,30 @@ fn retire_splash() {
     }
 }
 
+/// Reveal an interactive text screen, retiring the pre-game hold.
+///
+/// The hold — the logo on a cold start, a black window on a library launch —
+/// exists to cover a game's boot: the JIT's first compiles and any throwaway text
+/// it prints on the way to graphics. It lifts on the game's first *graphics* frame
+/// (`virtual_display_present` → `retire_splash`). But some games present their
+/// actual UI in *text* mode and wait there for the keyboard — King's Bounty's
+/// character/difficulty select, a text-mode setup — producing no graphics frame
+/// until the player has already answered. Behind the hold that screen is invisible,
+/// so there is nothing to answer and the game looks frozen.
+///
+/// A guest reading the BIOS keyboard while still in a text mode is exactly that
+/// case, so `bios_keyboard_impl` calls this. `retire_splash` still runs the logo
+/// out in full (its minimum hold + fade), so a cold start is never cut short — this
+/// only decides that the *next* thing the window shows is the guest's text screen
+/// rather than more hold. Idempotent: a no-op once the hold is already down (so a
+/// game that reaches graphics first, like Prince of Persia, is unaffected — it has
+/// no text screen up when it reads the keyboard).
+pub(crate) fn reveal_text_ui() {
+    if splash_is_up() {
+        retire_splash();
+    }
+}
+
 fn recreate_texture(w: c_int, h: c_int) {
     unsafe {
         if RENDERER.is_null() || w <= 0 || h <= 0 {

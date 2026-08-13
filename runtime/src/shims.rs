@@ -4372,6 +4372,25 @@ unsafe fn init_bios_data_area() {
         *seg_off(BIOS_VIDEO_PARAM_SEG, BIOS_VIDEO_PARAM_OFF + i as u16) =
             bios_video_parameter_table_mode6[i];
     }
+    // A real BIOS clears the text screen to spaces with the default attribute
+    // (0x07, light-grey on black) when it establishes the text mode at POST. A
+    // program that then writes only glyph bytes — INT 10h AH=0Ah, or straight into
+    // B800 — inherits that attribute and is legible. King's Bounty draws its
+    // character/difficulty menu that way and never sets a mode of its own, so it
+    // relies entirely on the screen the BIOS handed it. Left zeroed, every cell's
+    // attribute is 0x00 and each such write lands black-on-black: the glyphs are
+    // there in memory but invisible on screen.
+    if crate::video::is_text_mode(bios_video.video_mode) != 0 {
+        let seg = if bios_video.video_mode == 0x07 {
+            0xB000u16
+        } else {
+            0xB800u16
+        };
+        let blank = b' ' as u16 | (0x07u16 << 8); // 0x0720
+        for cell in 0..0x4000u16 {
+            memw_raw_write(seg, cell.wrapping_mul(2), blank);
+        }
+    }
 }
 
 unsafe fn find_file_mapping(addr: u32) -> *const FileMapping {
