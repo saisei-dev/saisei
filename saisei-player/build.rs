@@ -7,4 +7,29 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         println!("cargo:rustc-link-arg-bins=-rdynamic");
     }
+    if let Some(arg) = macos_host_version_min() {
+        println!("cargo:rustc-link-arg-bins={arg}");
+    }
+}
+
+/// On macOS, target the running Mac's own OS version at link time, so ld64
+/// stops warning that brew's SDL2 "was built for newer macOS version than
+/// being linked" (rustc's default deployment target is 11.0 on Apple Silicon).
+/// This machine's build is this machine's player — the host version is always
+/// right. An explicit MACOSX_DEPLOYMENT_TARGET wins; this then emits nothing.
+/// Kept in step with the same helper in runtime/build.rs and saisei-game/build.rs.
+fn macos_host_version_min() -> Option<String> {
+    println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos")
+        || std::env::var("MACOSX_DEPLOYMENT_TARGET").is_ok()
+    {
+        return None;
+    }
+    let out = std::process::Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!v.is_empty()).then(|| format!("-mmacosx-version-min={v}"))
 }

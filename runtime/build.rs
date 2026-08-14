@@ -113,6 +113,30 @@ fn sdl2_missing() -> ! {
     )
 }
 
+/// On macOS, target the running Mac's own OS version at link time. rustc's
+/// default deployment target (11.0 on Apple Silicon) is older than what brew
+/// built SDL2 for, so ld64 warns about the skew on every build — noise that
+/// reads like a real problem ("was built for newer macOS version than being
+/// linked"). The machine building Saisei is the machine playing on it (chunks
+/// are JIT-compiled here at run time; nothing is distributed), so the host's
+/// version is always the right one. An explicit MACOSX_DEPLOYMENT_TARGET still
+/// wins: rustc already honors it everywhere, and this emits nothing.
+fn macos_host_version_min() -> Option<String> {
+    println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos")
+        || std::env::var("MACOSX_DEPLOYMENT_TARGET").is_ok()
+    {
+        return None;
+    }
+    let out = Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!v.is_empty()).then(|| format!("-mmacosx-version-min={v}"))
+}
+
 fn main() {
     bake_logo();
 
@@ -125,6 +149,9 @@ fn main() {
         } else if let Some(lib) = tok.strip_prefix("-l") {
             println!("cargo:rustc-link-lib={lib}");
         }
+    }
+    if let Some(arg) = macos_host_version_min() {
+        println!("cargo:rustc-cdylib-link-arg={arg}");
     }
 
     println!("cargo:rustc-link-lib=dl");
