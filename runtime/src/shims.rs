@@ -11750,15 +11750,41 @@ unsafe fn jit_compile_or_get(seg: u16, off: u16) -> *mut JitChunk {
                         );
                         result = c;
                     } else {
+                        // Append the reason to the capture too: this failure
+                        // comes after a clean compile, so without it the crash
+                        // bundle's jit_translate.log shows only the success
+                        // protocol (SO/SYM/RANGE) and explains nothing.
+                        let err = libc::dlerror();
                         shim_log_stdout(
                             cstr!("JIT: dlsym %s failed: %s\n"),
                             sym.as_ptr() as *const c_char,
-                            libc::dlerror(),
+                            err,
                         );
+                        let n = libc::snprintf(
+                            jitcap.as_mut_ptr().add(jitcaplen) as *mut c_char,
+                            jitcap.len() - jitcaplen,
+                            cstr!("dlsym %s FAILED: %s\n"),
+                            sym.as_ptr() as *const c_char,
+                            err,
+                        );
+                        if n > 0 {
+                            jitcaplen = (jitcaplen + n as usize).min(jitcap.len() - 1);
+                        }
                         libc::dlclose(h);
                     }
                 } else {
-                    shim_log_stdout(cstr!("JIT: dlopen failed: %s\n"), libc::dlerror());
+                    let err = libc::dlerror();
+                    shim_log_stdout(cstr!("JIT: dlopen failed: %s\n"), err);
+                    let n = libc::snprintf(
+                        jitcap.as_mut_ptr().add(jitcaplen) as *mut c_char,
+                        jitcap.len() - jitcaplen,
+                        cstr!("dlopen %s FAILED: %s\n"),
+                        so.as_ptr() as *const c_char,
+                        err,
+                    );
+                    if n > 0 {
+                        jitcaplen = (jitcaplen + n as usize).min(jitcap.len() - 1);
+                    }
                 }
             } else {
                 shim_log_stdout(

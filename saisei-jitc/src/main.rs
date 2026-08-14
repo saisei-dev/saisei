@@ -351,6 +351,11 @@ fn compile_chunk(
                 // And because chunks are #![no_std], rustc adds no C library —
                 // legal for an ELF .so, but ld64 hard-errors ("dylibs must
                 // link with libSystem.dylib"), so say -lSystem ourselves.
+                // -no_fixup_chains: modern ld64 emits chained fixups, which
+                // cannot encode the resolve-at-dlopen flat-namespace lookups
+                // that -undefined dynamic_lookup promises — dyld then fails
+                // the dlopen ("symbol not found in flat namespace"). The
+                // classic opcode fixup format encodes them fine.
                 [
                     "-C",
                     "link-arg=-undefined",
@@ -358,6 +363,8 @@ fn compile_chunk(
                     "link-arg=dynamic_lookup",
                     "-C",
                     "link-arg=-lSystem",
+                    "-C",
+                    "link-arg=-Wl,-no_fixup_chains",
                 ]
                 .as_slice()
             } else {
