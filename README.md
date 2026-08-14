@@ -31,21 +31,21 @@ saisei                                     # your library
 
 <img src="docs/img/library.png" alt="The Saisei library: a grid of game covers" width="100%">
 
-**To add a game, drop its zip on the window** — or paste a link into *Add game*. Grab one from an abandonware archive like [My Abandonware](https://www.myabandonware.com/); Saisei unpacks it, asks which executable starts the game if there's more than one, and it's yours from then on. No config files, no flags to weigh.
+**To add a game, drop its zip on the window** — or paste a link into *Add game*. Grab one from an abandonware archive like [My Abandonware](https://www.myabandonware.com/); Saisei unpacks it, asks which executable starts the game if there's more than one, and it's yours from then on. No config files, no flags to weigh. Many games don't run yet — for a first spin, pick one from the [tested list](#tested-games) below.
 
 Pick a game and it plays, compiling each part of it to native code the moment control reaches it. Games you've played wear the last moment you saw them as their cover.
 
 ### While you're playing
 
-<img src="docs/img/overlay.png" alt="The in-game menu, over a paused game" width="100%">
+**Press F12** and the game freezes behind a menu: save where you are, drop back into an earlier save, or carry on exactly where you left off. Every save keeps a picture of the moment you made it.
 
-**Press F12** and the game stops dead behind a menu. Save where you are, drop back into an earlier save, or just go back and carry on exactly where you were. Every save keeps a picture of the moment you made it, so you can tell one from another at a glance.
-
-Your library is in there too — the same screens, in the same place, over the frozen frame instead of over the page. You can go and look at it, and come back, and the game will be exactly where you left it: browsing is not leaving. The only thing in there that really does end the game you paused is starting a different one, and that is the one thing the menu asks you about first.
-
-The game really is stopped — not slowed, not skipping — and it can't tell that any time passed, so nothing lurches when you come back.
+<img src="docs/img/overlay.png" alt="The in-game menu, over a paused game" width="60%">
 
 <sub>(F12 rather than something more obvious because GNOME and KDE grab most chords for themselves, and a shortcut the desktop eats is a feature that doesn't exist.)</sub>
+
+### Read the game you just played
+
+The readable Rust isn't a promise for later — it was being written while you played. Every piece of the game Saisei compiled is sitting in `build/<game>/jit/` as a plain `.rs` file: the game's own code, function by function, in the order you reached it. Open one and you're reading what just ran.
 
 ### Doing more than playing
 
@@ -72,16 +72,21 @@ Playing is the front door. The point is to make these games **open to tinker wit
 
 ## How it works
 
-At run time Saisei loads the program image, takes the entry point from the MZ header, and JIT-compiles each code segment the first time control reaches it: decode → lossless IR → Rust → rustc → `dlopen`. Nothing is decoded ahead of time, and compiled chunks are keyed by the bytes that are actually live — so a decompressed or overlaid region is recompiled from whatever is really there. The full design is in the [architecture overview](docs/architecture.md).
+At run time Saisei loads the program image, takes the entry point from the MZ header, and JIT-compiles each code segment the first time control reaches it: decode → lossless IR → Rust → rustc → `dlopen`. Nothing is decoded ahead of time, and compiled chunks are keyed by the bytes that are actually live — so a decompressed or overlaid region is recompiled from whatever is really there. The game's *code* runs native, with no interpreter underneath; the *machine* around it — DOS, the BIOS, the video and sound hardware — is Saisei's own model, and it's that model whose coverage decides which games run today. The full design is in the [architecture overview](docs/architecture.md).
 
 ## Tested games
 
 Saisei's x86, BIOS, and DOS emulation is **still being built out, and many games do not work yet** — they hang, glitch, or stop on something we haven't implemented. These are the ones known to play:
 
-- **Zeliard**
-- **Prince of Persia**
-- **Dungeon Master**
 - **Alley Cat**
+- **Dune II: The Building of a Dynasty**
+- **Dungeon Master**
+- **MechWarrior**
+- **Might and Magic: Swords of Xeen**
+- **Popcorn**
+- **Prince of Persia**
+- **The Elder Scrolls: Arena**
+- **Zeliard**
 
 Every game you try is a test case, so please tell us either way: if one works, report it and we'll add it to this list; if one breaks, [open an issue](https://github.com/saisei-dev/saisei/issues) with the game and how far it got. A game that stops on an unimplemented port or an unfaithful instruction is exactly the signal that pushes the emulation forward.
 

@@ -30,11 +30,12 @@ Start with the [architecture overview](docs/architecture.md), then the
 scheme that makes unpacked and overlaid code dispatchable is the idea most worth
 understanding before you change anything.
 
-The workspace is four crates: `saisei-jitc/` (the translator and JIT),
+The workspace is six crates: `saisei-jitc/` (the translator and JIT),
 `runtime/` (the runtime — shims, DOS/BIOS/hardware emulation, video, audio),
-`saisei/` (the launcher), and `saisei-game/` (the thin per-game binary). Most
-translation bugs live in `saisei-jitc/src/codegen.rs`; most fidelity bugs live in
-`runtime/src/`.
+`saisei-player/` (the `saisei` player app), `saisei-ui/` (its interface, a pure
+software compositor), `saisei/` (the `saisei-cli` launcher), and `saisei-game/`
+(the thin per-game binary for the future freeze). Most translation bugs live in
+`saisei-jitc/src/codegen.rs`; most fidelity bugs live in `runtime/src/`.
 
 ## The prime directive: emulate faithfully
 

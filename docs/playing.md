@@ -46,7 +46,7 @@ Run from the repo root so the pipeline can find the bundle under
 ## The stdin control protocol
 
 All bytes you write to the FIFO are interpreted by the shim's stdin reader
-(`runtime/core/shims.c`, the `safe_point_impl` keyboard block). The opcodes:
+(`runtime/src/shims.rs`, the `safe_point_impl` keyboard block). The opcodes:
 
 | Bytes | Meaning |
 |-------|---------|
@@ -167,7 +167,7 @@ section below.
 
 ## WATCHW: catching memory corruption
 
-The shim has a per-address write watchlist (`write_watches[]` in `shims.c`).
+The shim has a per-address write watchlist (`write_watches[]` in `runtime/src/shims.rs`).
 When any code writes to a watched range, a `WATCHW` line lands in
 `lifecycle.log` recording the writer's `cs:ip`, value, source location, and a
 few registers. Each entry is a `{lo, hi, "name"}` linear-address range — for

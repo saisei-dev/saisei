@@ -74,12 +74,15 @@ one chunk `.rs` exporting `<name>_dispatch`:
   carries no dispatch table and no entry symbol — the runtime takes the entry
   `cs:ip` from the MZ header and JITs from there.
 
-Every chunk `include!`s the prelude **`saisei-jitc/rt/saisei_rt.rs`** — the
-Rust view of the runtime ABI: it binds the shared `cpu` global, the
+Every chunk links the prelude **`saisei-jitc/rt/saisei_rt.rs`** — the Rust
+view of the runtime ABI: it binds the shared `cpu` global, the
 `memb`/`memw`/shim call surface, and faithful inline helpers (`parity8`,
-`xor8`/`xor16`, `linear_addr`). The prelude's `#[repr(C)]` layouts and the
-runtime's struct definitions must be edited together; the prelude is embedded
-in the `saisei-jitc` binary, so the toolchain hash covers it.
+`xor8`/`xor16`, `linear_addr`). It is compiled **once per toolchain** into a
+`saisei_rt` rlib beside the chunks and linked via `--extern` rather than
+`include!`d into each chunk — reparsing it per chunk was most of a small
+chunk's rustc time. The prelude's `#[repr(C)]` layouts and the runtime's
+struct definitions must be edited together; the prelude is embedded in the
+`saisei-jitc` binary, so the toolchain hash covers it.
 
 ## The runtime (`runtime/`, crate `saisei-runtime`)
 
