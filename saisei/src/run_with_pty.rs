@@ -112,7 +112,16 @@ pub fn main(_root: &Path, args: &[String]) -> ! {
     };
 
     let mut master_fd: libc::c_int = -1;
-    let pid = unsafe { libc::forkpty(&mut master_fd, ptr::null_mut(), ptr::null(), ptr::null()) };
+    // null_mut, not null: glibc declares forkpty's termios/winsize params
+    // *const, macOS *mut — a *mut null coerces to both.
+    let pid = unsafe {
+        libc::forkpty(
+            &mut master_fd,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
     if pid < 0 {
         if restore {
             unsafe { libc::tcsetattr(STDIN_FILENO, libc::TCSAFLUSH, &saved) };
