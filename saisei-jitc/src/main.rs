@@ -348,7 +348,18 @@ fn compile_chunk(
                 // that the chunk's undefined symbols (cpu, the shim surface)
                 // resolve from the host at dlopen: ELF allows that silently,
                 // ld64 errors at link time without -undefined dynamic_lookup.
-                ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"].as_slice()
+                // And because chunks are #![no_std], rustc adds no C library —
+                // legal for an ELF .so, but ld64 hard-errors ("dylibs must
+                // link with libSystem.dylib"), so say -lSystem ourselves.
+                [
+                    "-C",
+                    "link-arg=-undefined",
+                    "-C",
+                    "link-arg=dynamic_lookup",
+                    "-C",
+                    "link-arg=-lSystem",
+                ]
+                .as_slice()
             } else {
                 // Each chunk defines `#[no_mangle] saisei_site_name()` (the
                 // chunk's own name, read back by rt::site() in the shared rlib
