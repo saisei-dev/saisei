@@ -30,8 +30,11 @@ macro_rules! cstr {
 
 // ---- glibc stdio stream globals (not exported by the libc crate) ----
 extern "C" {
+    #[cfg_attr(target_os = "macos", link_name = "__stdinp")]
     static mut stdin: *mut FILE;
+    #[cfg_attr(target_os = "macos", link_name = "__stdoutp")]
     static mut stdout: *mut FILE;
+    #[cfg_attr(target_os = "macos", link_name = "__stderrp")]
     static mut stderr: *mut FILE;
     fn vsnprintf(s: *mut c_char, n: usize, fmt: *const c_char, ap: VaList) -> c_int;
     fn vfprintf(stream: *mut FILE, fmt: *const c_char, ap: VaList) -> c_int;

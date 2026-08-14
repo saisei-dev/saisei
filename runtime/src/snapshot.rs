@@ -110,6 +110,7 @@ extern "C" {
     static SHIM_MEMORY_SIZE: usize;
     static lcall_depth: u8;
     static isr_depth: u8;
+    #[cfg_attr(target_os = "macos", link_name = "__stderrp")]
     static mut stderr: *mut libc::FILE;
 
     fn shim_stdout_logging_enabled() -> c_int;

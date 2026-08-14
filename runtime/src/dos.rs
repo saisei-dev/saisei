@@ -105,7 +105,9 @@ extern "C" {
     fn shim_idle_wait();
     fn save_manager_sr_log(fmt: *const c_char, ...);
     // C stdio stream globals (not exposed by the libc crate; glibc exports them).
+    #[cfg_attr(target_os = "macos", link_name = "__stdoutp")]
     static mut stdout: *mut libc::FILE;
+    #[cfg_attr(target_os = "macos", link_name = "__stderrp")]
     static mut stderr: *mut libc::FILE;
 }
 

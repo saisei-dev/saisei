@@ -30,6 +30,7 @@ use core::ffi::{c_char, c_int, c_uint, c_ulonglong, c_void};
 extern "C" {
     static lcall_depth: u8;
     static isr_depth: u8;
+    #[cfg_attr(target_os = "macos", link_name = "__stderrp")]
     static mut stderr: *mut libc::FILE;
 
     fn shim_pc_is_case_key(module: *const c_char, file_off: u32) -> c_int;
