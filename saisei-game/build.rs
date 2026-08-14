@@ -21,9 +21,13 @@ fn main() {
     }
     // JIT chunk .so files resolve cpu/virtual_memory/every shim from the host
     // binary at dlopen — its dynamic symbol table must carry them all.
-    // -rdynamic is the ELF spelling; a Mach-O executable exports its global
-    // symbols to dlopen'd images by default, so macOS needs (and has) no flag.
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+    // -rdynamic is the ELF spelling. On macOS the equivalent is
+    // -export_dynamic, and it is NOT optional: Xcode 15's linker stopped
+    // exporting a main executable's symbols by default, so without it the
+    // first chunk dlopen dies with "symbol not found" on a host global.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo:rustc-link-arg-bins=-Wl,-export_dynamic");
+    } else {
         println!("cargo:rustc-link-arg-bins=-rdynamic");
     }
     if let Some(arg) = macos_host_version_min() {
