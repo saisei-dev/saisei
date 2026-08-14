@@ -616,9 +616,15 @@ fn find_latest_slot_dir(out: *mut c_char, cap: usize) -> c_int {
 pub unsafe fn exec_self(argv: *const *const c_char) {
     #[cfg(target_os = "macos")]
     {
+        // Declared here rather than through a crate: it is a one-function,
+        // decades-stable dyld API (<mach-o/dyld.h>), and the libc crate
+        // deprecated its binding in favor of pulling in all of mach2.
+        extern "C" {
+            fn _NSGetExecutablePath(buf: *mut c_char, bufsize: *mut u32) -> c_int;
+        }
         let mut buf = [0u8; 4096];
         let mut len = buf.len() as u32;
-        if libc::_NSGetExecutablePath(buf.as_mut_ptr() as *mut c_char, &mut len) == 0 {
+        if _NSGetExecutablePath(buf.as_mut_ptr() as *mut c_char, &mut len) == 0 {
             libc::execv(buf.as_ptr() as *const c_char, argv);
         }
     }
