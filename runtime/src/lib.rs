@@ -20,6 +20,19 @@
 // declarations legitimately clash — silence the cosmetic cross-module lint here.
 #![allow(clashing_extern_declarations)]
 
+/// Where C keeps `errno`: glibc spells the accessor `__errno_location`, macOS
+/// spells it `__error`. Every module reads and writes errno through this name.
+#[cfg(target_os = "macos")]
+#[inline(always)]
+pub fn errno_loc() -> *mut core::ffi::c_int {
+    unsafe { libc::__error() }
+}
+#[cfg(not(target_os = "macos"))]
+#[inline(always)]
+pub fn errno_loc() -> *mut core::ffi::c_int {
+    unsafe { libc::__errno_location() }
+}
+
 pub mod audio;
 pub mod bios;
 pub mod cpu;

@@ -939,7 +939,8 @@ extern "C" fn opl2_register() {
 
 // Run opl2_register at process start (the C `__attribute__((constructor))`).
 #[used]
-#[link_section = ".init_array"]
+#[cfg_attr(not(target_os = "macos"), link_section = ".init_array")]
+#[cfg_attr(target_os = "macos", link_section = "__DATA,__mod_init_func")]
 static OPL2_CTOR: extern "C" fn() = opl2_register;
 
 #[cfg(test)]

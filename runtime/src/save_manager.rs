@@ -65,7 +65,7 @@ static mut INITIAL_CASCADE_PENDING: c_int = 0; /* one-shot shift on first save *
 
 #[inline(always)]
 fn errno() -> c_int {
-    unsafe { *libc::__errno_location() }
+    unsafe { *crate::errno_loc() }
 }
 
 #[inline(always)]
@@ -606,6 +606,28 @@ fn find_latest_slot_dir(out: *mut c_char, cap: usize) -> c_int {
     -1
 }
 
+/// Exec the running image with `argv`. On Linux that is the `/proc/self/exe`
+/// magic link — the *inode* we are running, immune to the binary having been
+/// rebuilt underneath us (cargo unlinks and recreates it, so any *path* can
+/// name a different file by now). macOS has no such link: the closest it
+/// offers is the path the kernel recorded at launch (`_NSGetExecutablePath`),
+/// which after a rebuild names the new file — accepted as the best available.
+/// Returns only on failure, exactly like execv.
+pub unsafe fn exec_self(argv: *const *const c_char) {
+    #[cfg(target_os = "macos")]
+    {
+        let mut buf = [0u8; 4096];
+        let mut len = buf.len() as u32;
+        if libc::_NSGetExecutablePath(buf.as_mut_ptr() as *mut c_char, &mut len) == 0 {
+            libc::execv(buf.as_ptr() as *const c_char, argv);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        libc::execv(c"/proc/self/exe".as_ptr(), argv);
+    }
+}
+
 /* Slurp /proc/self/cmdline (NUL-separated argv) into a heap array.
  * Caller frees both the strings and the returned argv. */
 // The argv a re-exec should use, when the host has supplied one. Loading a save
@@ -805,7 +827,7 @@ pub extern "C" fn save_manager_request_load_latest() {
     }
 
     sr_log!(
-        c"load REQUEST OK bundle=%s (Cmd+F2 re-exec /proc/self/exe argc=%d)".as_ptr(),
+        c"load REQUEST OK bundle=%s (Cmd+F2 re-exec self argc=%d)".as_ptr(),
         abs_dir.as_ptr(),
         n
     );
@@ -817,7 +839,7 @@ pub extern "C" fn save_manager_request_load_latest() {
         );
         libc::fflush(stderr);
 
-        libc::execv(c"/proc/self/exe".as_ptr(), new_argv as *const *const c_char);
+        exec_self(new_argv as *const *const c_char);
         /* execv only returns on failure. */
         let err = errno();
         sr_log!(

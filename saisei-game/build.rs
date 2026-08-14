@@ -21,5 +21,9 @@ fn main() {
     }
     // JIT chunk .so files resolve cpu/virtual_memory/every shim from the host
     // binary at dlopen — its dynamic symbol table must carry them all.
-    println!("cargo:rustc-link-arg-bins=-rdynamic");
+    // -rdynamic is the ELF spelling; a Mach-O executable exports its global
+    // symbols to dlopen'd images by default, so macOS needs (and has) no flag.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+        println!("cargo:rustc-link-arg-bins=-rdynamic");
+    }
 }

@@ -339,6 +339,17 @@ fn compile_chunk(
                 "debug-assertions=off",
                 "-C",
                 "panic=abort",
+            ])
+            .args(if cfg!(target_os = "macos") {
+                // Mach-O two-level namespace already binds each dylib's
+                // internal calls to its own symbols, so the ELF interposition
+                // hazard below cannot arise — and ld64 has no
+                // -Bsymbolic-functions. What macOS *does* need spelled out is
+                // that the chunk's undefined symbols (cpu, the shim surface)
+                // resolve from the host at dlopen: ELF allows that silently,
+                // ld64 errors at link time without -undefined dynamic_lookup.
+                ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"].as_slice()
+            } else {
                 // Each chunk defines `#[no_mangle] saisei_site_name()` (the
                 // chunk's own name, read back by rt::site() in the shared rlib
                 // for the cross-binary-write tripwire). That symbol is global,
@@ -348,10 +359,9 @@ fn compile_chunk(
                 // tripwire the moment any other binary (e.g. Zeliard's AdLib
                 // driver in its ISR) writes its own region. -Bsymbolic-functions
                 // binds each .so's site() call to its own saisei_site_name.
-                "-C",
-                "link-arg=-Wl,-Bsymbolic-functions",
-                "-o",
-            ])
+                ["-C", "link-arg=-Wl,-Bsymbolic-functions"].as_slice()
+            })
+            .args(["-o"])
             .arg(&so_tmp)
             .arg("--extern")
             .arg(format!("saisei_rt={}", rlib.display()))

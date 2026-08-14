@@ -89,7 +89,11 @@ fn cached_so() -> &'static PathBuf {
     static SO: OnceLock<PathBuf> = OnceLock::new();
     SO.get_or_init(|| {
         let root = repo_root();
-        let so = root.join("target/release/libsaisei_runtime.so");
+        // Cargo names the cdylib per platform: .so on Linux, .dylib on macOS.
+        let so = root.join(format!(
+            "target/release/libsaisei_runtime{}",
+            std::env::consts::DLL_SUFFIX
+        ));
         if !so.exists() {
             let st = std::process::Command::new("cargo")
                 .current_dir(&root)

@@ -148,7 +148,7 @@ extern "C" {
 
 #[inline(always)]
 fn errno() -> c_int {
-    unsafe { *libc::__errno_location() }
+    unsafe { *crate::errno_loc() }
 }
 #[inline(always)]
 fn shim_mem_size() -> usize {

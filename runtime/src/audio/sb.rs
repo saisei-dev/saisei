@@ -432,7 +432,8 @@ extern "C" fn sb_register() {
 }
 
 #[used]
-#[link_section = ".init_array"]
+#[cfg_attr(not(target_os = "macos"), link_section = ".init_array")]
+#[cfg_attr(target_os = "macos", link_section = "__DATA,__mod_init_func")]
 static SB_CTOR: extern "C" fn() = sb_register;
 
 // ---- rendering ---------------------------------------------------------------

@@ -353,5 +353,6 @@ extern "C" fn dma_register() {
 }
 
 #[used]
-#[link_section = ".init_array"]
+#[cfg_attr(not(target_os = "macos"), link_section = ".init_array")]
+#[cfg_attr(target_os = "macos", link_section = "__DATA,__mod_init_func")]
 static DMA_CTOR: extern "C" fn() = dma_register;

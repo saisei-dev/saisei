@@ -766,7 +766,7 @@ unsafe fn emit_crash_marker(fd: c_int, signum: c_int, name: *const c_char) {
             (n as isize - off) as usize,
         );
         if w < 0 {
-            if *libc::__errno_location() == libc::EINTR {
+            if *crate::errno_loc() == libc::EINTR {
                 continue;
             }
             break;
@@ -1120,7 +1120,8 @@ unsafe extern "C" fn init_shim_logs() {
 }
 
 #[used]
-#[link_section = ".init_array"]
+#[cfg_attr(not(target_os = "macos"), link_section = ".init_array")]
+#[cfg_attr(target_os = "macos", link_section = "__DATA,__mod_init_func")]
 static INIT_SHIM_LOGS_CTOR: unsafe extern "C" fn() = init_shim_logs;
 
 // ============================================================================
@@ -1163,7 +1164,7 @@ unsafe fn trace_ring_dump(fd: c_int) {
         while off < len {
             let w = libc::write(fd, buf.add(off) as *const c_void, len - off);
             if w < 0 {
-                if *libc::__errno_location() == libc::EINTR {
+                if *crate::errno_loc() == libc::EINTR {
                     continue;
                 }
                 break;
@@ -1270,7 +1271,7 @@ unsafe fn lifecycle_fp_open_if_requested() {
             stderr,
             cstr!("--lifecycle-file: cannot open %s: %s\n"),
             p,
-            libc::strerror(*libc::__errno_location()),
+            libc::strerror(*crate::errno_loc()),
         );
         return;
     }
@@ -1379,7 +1380,7 @@ unsafe fn lifecycle_dump_to_dir(dir: *const c_char) {
         while off < len {
             let w = libc::write(fd, line.add(off) as *const c_void, len - off);
             if w < 0 {
-                if *libc::__errno_location() == libc::EINTR {
+                if *crate::errno_loc() == libc::EINTR {
                     continue;
                 }
                 break;
@@ -1623,7 +1624,7 @@ unsafe fn trace_file_open_if_requested() {
             stderr,
             cstr!("--trace-file: cannot open %s: %s\n"),
             p,
-            libc::strerror(*libc::__errno_location()),
+            libc::strerror(*crate::errno_loc()),
         );
         return;
     }
@@ -2348,10 +2349,10 @@ unsafe fn session_log_init() {
         return;
     }
     let dir = cstr!("sessions");
-    if libc::mkdir(dir, 0o755) != 0 && *libc::__errno_location() != libc::EEXIST {
+    if libc::mkdir(dir, 0o755) != 0 && *crate::errno_loc() != libc::EEXIST {
         shim_log_stdout(
             cstr!("[SESSION] mkdir sessions: %s\n"),
-            libc::strerror(*libc::__errno_location()),
+            libc::strerror(*crate::errno_loc()),
         );
         return;
     }
@@ -2366,7 +2367,7 @@ unsafe fn session_log_init() {
         shim_log_stdout(
             cstr!("[SESSION] fopen %s: %s\n"),
             ptr::addr_of!(session_log_path) as *const c_char,
-            libc::strerror(*libc::__errno_location()),
+            libc::strerror(*crate::errno_loc()),
         );
         return;
     }
@@ -2698,10 +2699,12 @@ unsafe extern "C" fn cleanup_keyboard() {
 }
 
 #[used]
-#[link_section = ".init_array"]
+#[cfg_attr(not(target_os = "macos"), link_section = ".init_array")]
+#[cfg_attr(target_os = "macos", link_section = "__DATA,__mod_init_func")]
 static INIT_KEYBOARD_CTOR: unsafe extern "C" fn() = init_keyboard;
 #[used]
-#[link_section = ".fini_array"]
+#[cfg_attr(not(target_os = "macos"), link_section = ".fini_array")]
+#[cfg_attr(target_os = "macos", link_section = "__DATA,__mod_term_func")]
 static CLEANUP_KEYBOARD_DTOR: unsafe extern "C" fn() = cleanup_keyboard;
 
 // ============================================================================
@@ -3642,7 +3645,9 @@ pub unsafe extern "C" fn safe_point_impl(_file: *const c_char, func: *const c_ch
             if r == 1 {
                 // fall through to byte-processing below
             } else if r == 0 {
-                let newfd = libc::open(cstr!("/proc/self/fd/0"), libc::O_RDONLY | libc::O_NONBLOCK);
+                // /dev/fd/0, not /proc/self/fd/0: same file on Linux, and macOS
+                // has no /proc at all.
+                let newfd = libc::open(cstr!("/dev/fd/0"), libc::O_RDONLY | libc::O_NONBLOCK);
                 if newfd >= 0 && newfd != keyboard_fd {
                     libc::dup2(newfd, keyboard_fd);
                     libc::close(newfd);
@@ -6315,17 +6320,17 @@ pub unsafe extern "C" fn fopen_case_insensitive(
     if !f.is_null() {
         return f;
     }
-    let saved_errno = *libc::__errno_location();
+    let saved_errno = *crate::errno_loc();
     if saved_errno != libc::ENOENT {
         return ptr::null_mut();
     }
     let mut resolved = [0u8; PATH_MAX];
     if !resolve_case_insensitive_path(path, resolved.as_mut_ptr() as *mut c_char, resolved.len()) {
-        *libc::__errno_location() = saved_errno;
+        *crate::errno_loc() = saved_errno;
         return ptr::null_mut();
     }
     if libc::strcmp(resolved.as_ptr() as *const c_char, path) == 0 {
-        *libc::__errno_location() = saved_errno;
+        *crate::errno_loc() = saved_errno;
         return ptr::null_mut();
     }
     let retry = libc::fopen(resolved.as_ptr() as *const c_char, mode);
@@ -6337,8 +6342,8 @@ pub unsafe extern "C" fn fopen_case_insensitive(
         );
         return retry;
     }
-    if *libc::__errno_location() == libc::ENOENT {
-        *libc::__errno_location() = saved_errno;
+    if *crate::errno_loc() == libc::ENOENT {
+        *crate::errno_loc() = saved_errno;
     }
     ptr::null_mut()
 }
@@ -7178,7 +7183,7 @@ unsafe fn bookend_dump_snapshot(path: *const c_char) {
         shim_log_stderr(
             cstr!("Bookend: failed to open %s: %s\n"),
             path,
-            libc::strerror(*libc::__errno_location()),
+            libc::strerror(*crate::errno_loc()),
         );
         return;
     }
@@ -7215,7 +7220,7 @@ pub unsafe extern "C" fn shim_bookend_start() {
     } else {
         shim_log_stderr(
             cstr!("Bookend: failed to open /tmp/zbookend.log: %s\n"),
-            libc::strerror(*libc::__errno_location()),
+            libc::strerror(*crate::errno_loc()),
         );
     }
     bookend_writes_logged = 0;
@@ -8411,7 +8416,8 @@ unsafe extern "C" fn init_memory() {
 }
 
 #[used]
-#[link_section = ".init_array"]
+#[cfg_attr(not(target_os = "macos"), link_section = ".init_array")]
+#[cfg_attr(target_os = "macos", link_section = "__DATA,__mod_init_func")]
 static INIT_MEMORY_CTOR: unsafe extern "C" fn() = init_memory;
 
 /// PPI port B: bit 0 = channel-2 gate, bit 1 = speaker data enable. Read by the
@@ -8557,7 +8563,8 @@ unsafe extern "C" fn init_a20() {
 }
 
 #[used]
-#[link_section = ".init_array"]
+#[cfg_attr(not(target_os = "macos"), link_section = ".init_array")]
+#[cfg_attr(target_os = "macos", link_section = "__DATA,__mod_init_func")]
 static INIT_A20_CTOR: unsafe extern "C" fn() = init_a20;
 
 unsafe fn pit_state_for_channel(channel: u8) -> *mut PITState {
@@ -10283,7 +10290,7 @@ unsafe fn crash_bundle_mkdir_parents(dir: *const c_char) -> c_int {
             let saved = buf[i];
             buf[i] = 0;
             if libc::mkdir(buf.as_ptr() as *const c_char, 0o755) != 0
-                && *libc::__errno_location() != libc::EEXIST
+                && *crate::errno_loc() != libc::EEXIST
             {
                 return -1;
             }
@@ -10356,7 +10363,7 @@ unsafe fn crash_bundle_write_file(
     while off < len {
         let w = libc::write(fd, contents.add(off) as *const c_void, len - off);
         if w < 0 {
-            if *libc::__errno_location() == libc::EINTR {
+            if *crate::errno_loc() == libc::EINTR {
                 continue;
             }
             break;
@@ -10935,7 +10942,7 @@ unsafe fn report_unmapped(
                 (n - off) as usize,
             );
             if w < 0 {
-                if *libc::__errno_location() == libc::EINTR {
+                if *crate::errno_loc() == libc::EINTR {
                     continue;
                 }
                 break;
@@ -12750,7 +12757,7 @@ static mut ram_snapshot_counter: c_int = 1;
 
 unsafe fn shim_dump_ram_snapshot() {
     let dir = cstr!("snapshots");
-    if libc::mkdir(dir, 0o755) != 0 && *libc::__errno_location() != libc::EEXIST {
+    if libc::mkdir(dir, 0o755) != 0 && *crate::errno_loc() != libc::EEXIST {
         libc::perror(cstr!("mkdir snapshots"));
         return;
     }
@@ -12803,7 +12810,7 @@ unsafe fn shim_read_memory_to_sidecar(addr: u32, len: u8) {
         return;
     }
     let dir = cstr!("snapshots");
-    if libc::mkdir(dir, 0o755) != 0 && *libc::__errno_location() != libc::EEXIST {
+    if libc::mkdir(dir, 0o755) != 0 && *crate::errno_loc() != libc::EEXIST {
         libc::perror(cstr!("mkdir snapshots"));
         return;
     }
@@ -12841,7 +12848,7 @@ unsafe fn shim_read_memory_to_sidecar(addr: u32, len: u8) {
 #[no_mangle]
 pub unsafe extern "C" fn shim_save_video_memory() {
     let dir = cstr!("screenshots");
-    if libc::mkdir(dir, 0o755) != 0 && *libc::__errno_location() != libc::EEXIST {
+    if libc::mkdir(dir, 0o755) != 0 && *crate::errno_loc() != libc::EEXIST {
         libc::perror(cstr!("mkdir"));
         return;
     }
