@@ -19,7 +19,8 @@ Two things to install — SDL2, for the window, and Rust. Then build once, and r
 ```bash
 # Debian/Ubuntu:  sudo apt install build-essential libsdl2-dev
 # macOS:          xcode-select --install && brew install sdl2
-# Rust:           https://rustup.rs
+# Rust:           https://rustup.rs  (rustup specifically — brew's rust
+#                 can't follow the pinned toolchain and fails the build)
 
 cargo build --release                      # fetches the pinned toolchain itself
 export PATH="$PWD/target/release:$PATH"    # or run ./target/release/saisei directly
@@ -41,7 +42,7 @@ Pick a game and it plays, compiling each part of it to native code the moment co
 
 <img src="docs/img/overlay.png" alt="The in-game menu, over a paused game" width="60%">
 
-<sub>(F12 rather than something more obvious because GNOME and KDE grab most chords for themselves, and a shortcut the desktop eats is a feature that doesn't exist.)</sub>
+<sub>(F12 rather than something more obvious because GNOME and KDE grab most chords for themselves, and a shortcut the desktop eats is a feature that doesn't exist. On a Mac keyboard, press Fn+F12 — plain F12 is the volume key.)</sub>
 
 ### Read the game you just played
 
